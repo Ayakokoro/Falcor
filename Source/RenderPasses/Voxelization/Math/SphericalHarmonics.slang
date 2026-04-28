@@ -9,30 +9,76 @@ BEGIN_NAMESPACE_FALCOR
 
 inline float calcSH(uint idx, float3 p)
 {
+    const float x = p.x;
+    const float y = p.y;
+    const float z = p.z;
+
+    const float x2 = x * x;
+    const float y2 = y * y;
+    const float z2 = z * z;
+
     switch (idx)
     {
     // l = 0
-    case 0: return 1.f / (2.f * SQRTPI);                // m = 0
+    case 0:
+        return 1.f / (2.f * SQRTPI); // m = 0
+
     // l = 1
-    case 1: return p.y * sqrt(3.f) / (2.f * SQRTPI);            // m =-1
-    case 2: return p.z * sqrt(3.f) / (2.f * SQRTPI);            // m = 0
-    case 3: return p.x * sqrt(3.f) / (2.f * SQRTPI);            // m = 1
+    case 1:
+        return y * sqrt(3.f) / (2.f * SQRTPI); // m = -1
+    case 2:
+        return z * sqrt(3.f) / (2.f * SQRTPI); // m =  0
+    case 3:
+        return x * sqrt(3.f) / (2.f * SQRTPI); // m =  1
+
     // l = 2
-    case 4: return p.x * p.y * sqrt(15.f) / (2.f * SQRTPI);                 // m =-2
-    case 5: return p.y * p.z * sqrt(15.f) / (2.f * SQRTPI);                 // m =-1
-    case 6: return (3.f * p.z * p.z - 1.f) * sqrt(5.f) / (4.f * SQRTPI);    // m = 0
-    case 7: return p.x * p.z * sqrt(15.f) / (2.f * SQRTPI);                 // m = 1
-    case 8: return (p.x * p.x - p.y * p.y) * sqrt(15.f) / (4.f * SQRTPI);   // m = 2
+    case 4:
+        return x * y * sqrt(15.f) / (2.f * SQRTPI); // m = -2
+    case 5:
+        return y * z * sqrt(15.f) / (2.f * SQRTPI); // m = -1
+    case 6:
+        return (3.f * z2 - 1.f) * sqrt(5.f) / (4.f * SQRTPI); // m =  0
+    case 7:
+        return x * z * sqrt(15.f) / (2.f * SQRTPI); // m =  1
+    case 8:
+        return (x2 - y2) * sqrt(15.f) / (4.f * SQRTPI); // m =  2
+
     // l = 3
-    case 9:  return p.y * (3.f * p.x * p.x - p.y * p.y) * sqrt(70.f) / (8.f * SQRTPI);  // m =-3
-    case 10: return p.x * p.y * p.z * sqrt(105.f) / (2.f * SQRTPI);                     // m =-2
-    case 11: return p.y * (5.f * p.z * p.z - 1.f) * sqrt(42.f) / (8.f * SQRTPI);        // m =-1
-    case 12: return p.z * (5.f * p.z * p.z - 3.f) * sqrt(7.f) / (4.f * SQRTPI);         // m = 0
-    case 13: return p.x * (5.f * p.z * p.z - 1.f) * sqrt(42.f) / (8.f * SQRTPI);        // m = 1
-    case 14: return p.z * (p.x * p.x - p.y * p.y) * sqrt(105.f) / (4.f * SQRTPI);       // m = 2
-    case 15: return p.x * (p.x * p.x - 3.f * p.y * p.y) * sqrt(70.f) / (8.f * SQRTPI);  // m = 3
+    case 9:
+        return y * (3.f * x2 - y2) * sqrt(70.f) / (8.f * SQRTPI); // m = -3
+    case 10:
+        return x * y * z * sqrt(105.f) / (2.f * SQRTPI); // m = -2
+    case 11:
+        return y * (5.f * z2 - 1.f) * sqrt(42.f) / (8.f * SQRTPI); // m = -1
+    case 12:
+        return z * (5.f * z2 - 3.f) * sqrt(7.f) / (4.f * SQRTPI); // m =  0
+    case 13:
+        return x * (5.f * z2 - 1.f) * sqrt(42.f) / (8.f * SQRTPI); // m =  1
+    case 14:
+        return z * (x2 - y2) * sqrt(105.f) / (4.f * SQRTPI); // m =  2
+    case 15:
+        return x * (x2 - 3.f * y2) * sqrt(70.f) / (8.f * SQRTPI); // m =  3
+
+    // l = 4
+    case 16:
+        return x * y * (x2 - y2) * 3.f * sqrt(35.f) / (4.f * SQRTPI); // m = -4
+    case 17:
+        return y * z * (3.f * x2 - y2) * 3.f * sqrt(70.f) / (8.f * SQRTPI); // m = -3
+    case 18:
+        return x * y * (7.f * z2 - 1.f) * 3.f * sqrt(5.f) / (4.f * SQRTPI); // m = -2
+    case 19:
+        return y * z * (7.f * z2 - 3.f) * 3.f * sqrt(10.f) / (8.f * SQRTPI); // m = -1
+    case 20:
+        return (35.f * z2 * z2 - 30.f * z2 + 3.f) * 3.f / (16.f * SQRTPI); // m =  0
+    case 21:
+        return x * z * (7.f * z2 - 3.f) * 3.f * sqrt(10.f) / (8.f * SQRTPI); // m =  1
+    case 22:
+        return (x2 - y2) * (7.f * z2 - 1.f) * 3.f * sqrt(5.f) / (8.f * SQRTPI); // m =  2
+    case 23:
+        return x * z * (x2 - 3.f * y2) * 3.f * sqrt(70.f) / (8.f * SQRTPI); // m =  3
+    case 24:
+        return (x2 * (x2 - 3.f * y2) - y2 * (3.f * x2 - y2)) * 3.f * sqrt(35.f) / (16.f * SQRTPI); // m =  4
     }
-    // clang-format on
     return 0.f;
 }
 
@@ -43,7 +89,7 @@ struct SphericalHarmonics
     MUTATING
     void init()
     {
-        for (int i = 0; i < SH_COUNT;i++)
+        for (int i = 0; i < SH_COUNT; i++)
         {
             coefficients[i] = 0;
         }
@@ -93,18 +139,53 @@ struct SphericalHarmonics
 
 inline float calcEvenSH(uint idx, float3 p)
 {
+    const float x = p.x;
+    const float y = p.y;
+    const float z = p.z;
+
+    const float x2 = x * x;
+    const float y2 = y * y;
+    const float z2 = z * z;
+
     switch (idx)
     {
     // l = 0
-    case 0: return 1.f / (2.f * SQRTPI); // m = 0
+    case 0:
+        return 1.f / (2.f * SQRTPI); // m = 0
+
     // l = 2
-    case 1: return p.x * p.y * sqrt(15.f) / (2.f * SQRTPI); // m =-2
-    case 2: return p.y * p.z * sqrt(15.f) / (2.f * SQRTPI); // m =-1
-    case 3: return (3.f * p.z * p.z - 1.f) * sqrt(5.f) / (4.f * SQRTPI); // m = 0
-    case 4: return p.x * p.z * sqrt(15.f) / (2.f * SQRTPI); // m = 1
-    case 5: return (p.x * p.x - p.y * p.y) * sqrt(15.f) / (4.f * SQRTPI); // m = 2
+    case 1:
+        return x * y * sqrt(15.f) / (2.f * SQRTPI); // m = -2
+    case 2:
+        return y * z * sqrt(15.f) / (2.f * SQRTPI); // m = -1
+    case 3:
+        return (3.f * z2 - 1.f) * sqrt(5.f) / (4.f * SQRTPI); // m =  0
+    case 4:
+        return x * z * sqrt(15.f) / (2.f * SQRTPI); // m =  1
+    case 5:
+        return (x2 - y2) * sqrt(15.f) / (4.f * SQRTPI); // m =  2
+
+    // l = 4
+    case 6:
+        return x * y * (x2 - y2) * 3.f * sqrt(35.f) / (4.f * SQRTPI); // m = -4
+    case 7:
+        return y * z * (3.f * x2 - y2) * 3.f * sqrt(70.f) / (8.f * SQRTPI); // m = -3
+    case 8:
+        return x * y * (7.f * z2 - 1.f) * 3.f * sqrt(5.f) / (4.f * SQRTPI); // m = -2
+    case 9:
+        return y * z * (7.f * z2 - 3.f) * 3.f * sqrt(10.f) / (8.f * SQRTPI); // m = -1
+    case 10:
+        return (35.f * z2 * z2 - 30.f * z2 + 3.f) * 3.f / (16.f * SQRTPI); // m =  0
+    case 11:
+        return x * z * (7.f * z2 - 3.f) * 3.f * sqrt(10.f) / (8.f * SQRTPI); // m =  1
+    case 12:
+        return (x2 - y2) * (7.f * z2 - 1.f) * 3.f * sqrt(5.f) / (8.f * SQRTPI); // m =  2
+    case 13:
+        return x * z * (x2 - 3.f * y2) * 3.f * sqrt(70.f) / (8.f * SQRTPI); // m =  3
+    case 14:
+        return (x2 * (x2 - 3.f * y2) - y2 * (3.f * x2 - y2)) * 3.f * sqrt(35.f) / (16.f * SQRTPI); // m =  4
     }
-    // clang-format on
+
     return 0.f;
 }
 
