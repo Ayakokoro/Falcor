@@ -386,7 +386,6 @@ struct DeltaBTDF
 };
 #endif
 
-// 单看BSDF，并不体现对称性；要将BSDF和图元形状合起来看才能体现对称性
 struct PrimitiveBSDF
 {
     SurfaceBRDF surface;

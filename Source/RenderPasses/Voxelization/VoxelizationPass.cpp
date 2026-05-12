@@ -89,7 +89,7 @@ void VoxelizationPass::compile(RenderContext* pRenderContext, const CompileData&
 
 void VoxelizationPass::renderUI(Gui::Widgets& widget)
 {
-    static const uint resolutions[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1000, 1024};
+    static const uint resolutions[] = {1, 4, 16, 64, 128, 256, 512, 1000, 1024, 1200, 1300, 1400, 1500};
     {
         Gui::DropdownList list;
         for (uint32_t i = 0; i < sizeof(resolutions) / sizeof(uint); i++)
@@ -132,8 +132,6 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         widget.dropdown("Polygon Per Frame", list, polygonGroup.maxPolygonCount);
     }
 
-    widget.checkbox("LerpNormal", mLerpNormal);
-
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
@@ -168,8 +166,6 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
         defines.add(mpSampleGenerator->getDefines());
         mAnalyzePolygonPass = ComputePass::create(mpDevice, desc, defines, true);
     }
-
-    mAnalyzePolygonPass->addDefine("LERP_NORMAL", mLerpNormal ? "1" : "0");
 
     ShaderVar var = mAnalyzePolygonPass->getRootVar();
     mpScene->bindShaderData(var["gScene"]);

@@ -45,5 +45,4 @@ protected:
     bool mSamplingComplete;
     bool mVoxelizationComplete;
     uint mCompleteTimes;
-    bool mLerpNormal;
 };

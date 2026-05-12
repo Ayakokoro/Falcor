@@ -99,9 +99,7 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
     {
         tri.vertices[i] = (vertices[i].position - gridMin) / voxelSize; // 体素是等大立方体，因此世界空间坐标到网格的坐标不影响TBN计算
         tri.uvs[i] = vertices[i].texCrd;
-#if LERP_NORMAL
         tri.normals[i] = vertices[i].normal;
-#endif
     }
     tri.buildTBN();
     for (uint i = 0; i < polygon.count; i++)
@@ -125,15 +123,18 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
     float3 baseColor = sampleTextureArea(data.texBaseColor, center, area, data.baseColor).rgb;
     float4 spec = sampleTextureArea(data.texSpecular, center, area, data.specular);
     float3 normal;
-#if LERP_NORMAL
-    float dummy;
-    float3 centroid = polygon.calcCentroid(dummy);
-    normal = tri.lerpNormal(centroid);
-#else
-    normal = sampleTextureArea(data.texNormalMap, center, area, float4(0, 0, 1, 0)).rgb;
-    normal = normal * 2.f - 1.f;
-    normal = calcShadingNormal(tri.TBN, normal);
-#endif
+    if (data.texNormalMap.getMode() == TextureHandle::Mode::Texture)
+    {
+        normal = sampleTextureArea(data.texNormalMap, center, area, float4(0, 0, 1, 0)).rgb;
+        normal = normal * 2.f - 1.f;
+        normal = calcShadingNormal(tri.TBN, normal);
+    }
+    else
+    {
+        float dummy;
+        float3 centroid = polygon.calcCentroid(dummy);
+        normal = tri.lerpNormal(centroid);
+    }
 
     ABSDFInput input = { baseColor, spec, normal, polygon.calcArea() };
     ABSDF.accumulate(input);
