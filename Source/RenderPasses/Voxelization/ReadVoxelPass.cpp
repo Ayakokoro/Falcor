@@ -43,7 +43,7 @@ RenderPassReflection ReadVoxelPass::reflect(const CompileData& compileData)
     reflector.addOutput(kBlockMap, kBlockMap)
         .bindFlags(ResourceBindFlags::None)
         .format(ResourceFormat::RGBA32Uint)
-        .texture2D(gridData.blockCount().x, gridData.blockCount().y);
+        .texture2D(gridData.blockCount2D().x, gridData.blockCount2D().y);
 
     return reflector;
 }
@@ -94,9 +94,9 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
     pRenderContext->submit(true);
 
     ref<Texture> pBlockMap = renderData.getTexture(kBlockMap);
-    uint4* blockMap = new uint4[gridData.totalBlockCount()];
-    tryRead(f, offset, gridData.totalBlockCount() * sizeof(uint4), blockMap, fileSize);
-    pBlockMap->setSubresourceBlob(0, blockMap, gridData.totalBlockCount() * sizeof(uint4));
+    uint4* blockMap = new uint4[gridData.blockTextureCount()];
+    tryRead(f, offset, gridData.blockTextureCount() * sizeof(uint4), blockMap, fileSize);
+    pBlockMap->setSubresourceBlob(0, blockMap, gridData.blockTextureCount() * sizeof(uint4));
 
     // VoxelData将拆分成PrimitiveBSDF和Ellipsoid
     ref<Buffer> pGBuffer = renderData.getResource(kGBuffer)->asBuffer();

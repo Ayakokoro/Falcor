@@ -148,17 +148,19 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         if (pEnvMap)
             mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
 
-        var[kVBuffer] = renderData.getTexture(kVBuffer);
         var[kGBuffer] = renderData.getResource(kGBuffer)->asBuffer();
         var[kPBuffer] = renderData.getResource(kPBuffer)->asBuffer();
-        var[kBlockMap] = renderData.getTexture(kBlockMap);
         var["selectedVoxel"] = mSelectedVoxel;
 
         auto cb_GridData = var["GridData"];
         cb_GridData["gridMin"] = gridData.gridMin;
         cb_GridData["voxelSize"] = gridData.voxelSize;
         cb_GridData["voxelCount"] = gridData.voxelCount;
-        cb_GridData["solidVoxelCount"] = (uint)gridData.solidVoxelCount;
+
+        auto om = var["OM"];
+        om["solidVoxelCount"] = (uint)gridData.solidVoxelCount;
+        om[kVBuffer] = renderData.getTexture(kVBuffer);
+        om[kBlockMap] = renderData.getTexture(kBlockMap);
 
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;

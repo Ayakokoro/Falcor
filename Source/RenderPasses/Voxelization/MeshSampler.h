@@ -1,6 +1,5 @@
 #pragma once
 #include "VoxelizationBase.h"
-#include "Image/ImageLoader.h"
 #include "Profiler.h"
 #include "Math/Polygon.slang"
 #include "Math/Triangle.slang"
@@ -20,9 +19,7 @@ public:
     std::vector<std::vector<Polygon>> polygonArrays;
     std::vector<PolygonRange> polygonRangeBuffer;
 
-    PolygonGenerator() : gridData(VoxelizationBase::GlobalGridData)
-    {
-    }
+    PolygonGenerator() : gridData(VoxelizationBase::GlobalGridData) {}
 
     void reset()
     {
@@ -55,7 +52,7 @@ public:
         return vBuffer[index];
     }
 
-    void clip(const MeshHeader& mesh,uint triangleID, Triangle& tri)
+    void clip(const MeshHeader& mesh, uint triangleID, Triangle& tri)
     {
         AABBInt aabb = tri.calcAABBInt();
         for (int i = 0; i < aabb.count(); i++)
@@ -63,10 +60,10 @@ public:
             int3 cellInt = aabb.indexToCell(i);
             float3 minPoint = float3(cellInt);
             Polygon polygon = VoxelizationUtility::BoxClipTriangle(minPoint, minPoint + 1.f, tri); // 多边形与三角形顶点顺序一致
-            polygon.normal = tri.TBN.getCol(2); // 几何法线
+            polygon.normal = tri.TBN.getCol(2);                                                    // 几何法线
             if (polygon.count >= 3)
             {
-                //sampleArea(tri, polygon, cellInt);
+                // sampleArea(tri, polygon, cellInt);
                 polygon.triRef.meshID = mesh.meshID;
                 polygon.triRef.triangleID = triangleID;
                 polygon.triRef.materialID = mesh.materialID;
