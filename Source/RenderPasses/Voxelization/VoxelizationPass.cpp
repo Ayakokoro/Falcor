@@ -1,5 +1,4 @@
 #include "VoxelizationPass.h"
-#include "Image/ImageLoader.h"
 #include <fstream>
 
 namespace
@@ -51,7 +50,7 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
         voxelize(pRenderContext, renderData);
         mVoxelizationComplete = true;
 
-        blockMap = mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.totalBlockCount(), ResourceBindFlags::UnorderedAccess);
+        blockMap = mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.blockTextureCount(), ResourceBindFlags::UnorderedAccess);
         pRenderContext->clearUAV(blockMap->getUAV().get(), uint4(0));
     }
     else
@@ -135,7 +134,6 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
-        ImageLoader::Instance().setSceneName(mSceneName);
         mVoxelizationComplete = false;
         mSamplingComplete = false;
         mCompleteTimes = 0;
@@ -180,7 +178,7 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
     cb["groupVoxelCount"] = groupVoxelCount;
     cb["sampleFrequency"] = mSampleFrequency;
     cb["gBufferOffset"] = polygonGroup.getVoxelOffset(mCompleteTimes);
-    cb["blockCount"] = gridData.blockCount();
+    cb["blockCount"] = gridData.blockTextureCount();
 
     auto cb_grid = var["GridData"];
     cb_grid["gridMin"] = gridData.gridMin;
@@ -190,7 +188,7 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
     mAnalyzePolygonPass->execute(pRenderContext, uint3(groupVoxelCount, 1, 1)); // 每个体素执行一次，没有同步问题
 }
 
-std::string trim_non_alnum_ends(std::string s)
+static std::string trim_non_alnum_ends(std::string s)
 {
     auto is_alnum = [](unsigned char c) { return std::isalnum(c) != 0; };
 
@@ -229,7 +227,7 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer, void* pVBuffe
 
     f.write(reinterpret_cast<const char*>(pVBuffer), gridData.totalVoxelCount() * sizeof(int));
     f.write(reinterpret_cast<const char*>(pGBuffer), gridData.solidVoxelCount * sizeof(VoxelData));
-    f.write(reinterpret_cast<const char*>(pBlockMap), gridData.totalBlockCount() * sizeof(uint4));
+    f.write(reinterpret_cast<const char*>(pBlockMap), gridData.blockTextureCount() * sizeof(uint4));
 
     f.close();
     VoxelizationBase::FileUpdated = true;

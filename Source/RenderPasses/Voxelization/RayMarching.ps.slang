@@ -10,18 +10,18 @@ import Utils.Sampling.UniformSampleGenerator;
 #define MAX_BOUNCE 3
 #endif
 
-Texture3D<int> vBuffer;
 StructuredBuffer<PrimitiveBSDF> gBuffer;
 StructuredBuffer<Ellipsoid> pBuffer;
-Texture2D<uint4> blockMap;
+
 RWStructuredBuffer<float4> selectedVoxel;
+
+ParameterBlock<OccupancyMap> OM;
 
 cbuffer GridData
 {
     float3 gridMin;
     float3 voxelSize;
     uint3 voxelCount;
-    uint solidVoxelCount;
 }
 
 cbuffer CB
@@ -34,7 +34,7 @@ cbuffer CB
     uint sampleStrategy;
     uint frameIndex;
     float minPdf;
-    float trasmittanceThreshold;
+    float transmittanceThreshold;
     bool renderBackGround;
     float4 clearColor;
     uint2 selectedPixel;
@@ -52,44 +52,13 @@ struct PsOut
     float4 color : SV_Target0;
 };
 
-bool isSolidVoxel(int3 cellInt, out int offset)
-{
-    offset = vBuffer[cellInt];
-    if (offset < 0 || offset > solidVoxelCount)
-        return false;
-    return gBuffer[offset].area > 0;
-}
-
-bool isSolidBlock(int3 blockInt)
-{
-    int component = blockInt.z / 32;
-    uint value = 1 << blockInt.z % 32;
-    uint4 zMap = blockMap[blockInt.xy];
-    switch (component)
-    {
-    case 0:
-        value &= zMap.x;
-        break;
-    case 1:
-        value &= zMap.y;
-        break;
-    case 2:
-        value &= zMap.z;
-        break;
-    case 3:
-        value &= zMap.w;
-        break;
-    }
-    return value != 0;
-}
-
 bool outsideGrid(float3 cell)
 {
     return any(cell < float3(0)) || any(cell >= (float3)voxelCount);
 }
 
 // 先后用体素和椭球裁剪线段
-HitResult rayHitPrimitive(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
+HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
 {
     float3 from = cell - cellInt;
     int3 directions = int3(sign(direction));
@@ -112,14 +81,14 @@ HitResult rayHitPrimitive(Ellipsoid ellipsoid, float3 cell, float3 direction, in
 HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt)
 {
     int offset;
-    if (isSolidVoxel(cellInt, offset))
+    if (OM.isSolidVoxel(cellInt, offset))
     {
 #if !CHECK_ELLIPSOID
         HitResult hit = { true, cellInt, cellInt + 0.5f };
         return hit;
 #else
         Ellipsoid ellipsoid = pBuffer[offset];
-        HitResult hit = rayHitPrimitive(ellipsoid, cell, direction, cellInt);
+        HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt);
         if (hit.hit)
             return hit;
 #endif
@@ -173,8 +142,8 @@ HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, b
         if (maxDistance > 0 && distance > maxDistance)
             break;
 
-        int3 blockInt = cellInt / BLOCK_TO_VOXEL;
-        if (!isSolidBlock(blockInt))
+        int3 blockInt = cellInt >> MIPMAP_SHRINK;
+        if (!OM.isSolidBlock(blockInt))
         {
             distance += leaveBlock(cell, cellInt, directions, direction, reciprocal_direction);
             continue;
@@ -228,7 +197,7 @@ float3 coverageTest(HitResult hit, uint offset, float3 direction)
     {
         PrimitiveBSDF bsdf = gBuffer[offset];
         coverage += (1 - coverage) * bsdf.calcCoverage(direction);
-        if (coverage >= 1 - trasmittanceThreshold)
+        if (coverage >= 1 - transmittanceThreshold)
         {
             coverage = 1;
             break;
@@ -236,7 +205,7 @@ float3 coverageTest(HitResult hit, uint offset, float3 direction)
         hit = rayMarching(hit.cell, direction, -1, true);
         if (!hit.hit)
             break;
-        offset = vBuffer[hit.cellInt];
+        offset = OM.vBuffer[hit.cellInt];
         times--;
     }
     return valueToColor(coverage);
@@ -285,7 +254,7 @@ float3 debugShading(HitResult hit, uint offset, float3 v)
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
     PrimitiveBSDF BSDF = gBuffer[offset];
-    BSDF.updateCoverage(v, trasmittanceThreshold);
+    BSDF.updateCoverage(v, transmittanceThreshold);
     return lightColor * BSDF.eval(l, v, h);
 }
 
@@ -322,10 +291,10 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
     bool leaveGrid = false;
     for (int i = 0; i < bounce; i++)
     {
-        uint offset = vBuffer[hits[i].cellInt];
+        uint offset = OM.vBuffer[hits[i].cellInt];
         PrimitiveBSDF BSDF = gBuffer[offset];
         float3 currentV = i == 0 ? v : -ls[i - 1];
-        BSDF.updateCoverage(currentV, trasmittanceThreshold);
+        BSDF.updateCoverage(currentV, transmittanceThreshold);
         BSDF.sample(currentV, ls[i], hs[i], sg);
 
         pdfs[i] = BSDF.evalPdf(ls[i], currentV, hs[i]);
@@ -349,7 +318,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
     {
         reflectLights[i] = 0;
         HitResult currentHit = hits[i];
-        uint currentOffset = vBuffer[currentHit.cellInt];
+        uint currentOffset = OM.vBuffer[currentHit.cellInt];
         float3 currentV = i == 0 ? v : -ls[i - 1];
 
         reflectLights[i] += shadingDirect(currentHit, currentOffset, currentV, sg); // 直接光照
@@ -370,7 +339,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
             HitResult nextHit = hits[i + 1];
             if (nextHit.hit)
             {
-                uint nextOffset = vBuffer[nextHit.cellInt];
+                uint nextOffset = OM.vBuffer[nextHit.cellInt];
                 float3 incidentLight = reflectLights[i + 1];
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i]; // 间接光照
             }
@@ -429,7 +398,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     {
         if (hit.hit)
         {
-            int offset = vBuffer[hit.cellInt];
+            int offset = OM.vBuffer[hit.cellInt];
             selectedVoxel[0] = float4(-direction, (float)offset);
         }
         else
@@ -441,7 +410,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     if (hit.hit)
     {
         float3 color = 0;
-        uint offset = vBuffer[hit.cellInt];
+        uint offset = OM.vBuffer[hit.cellInt];
         switch (drawMode)
         {
         case ABSDFDrawMode::Default:
@@ -464,6 +433,5 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         }
         psOut.color = float4(color, 1);
     }
-
     return psOut;
 }

@@ -97,7 +97,7 @@ void VoxelizationPass_GPU::voxelize(RenderContext* pRenderContext, const RenderD
     pRenderContext->submit(true);
 
     uint* pSolidVoxelCount = reinterpret_cast<uint*>(cpuSolidVoxelCount->map());
-    void* pVbuffer = cpuVBuffer->map();
+    void* pVBuffer = cpuVBuffer->map();
     void* pPolygonCount = cpuPolygonCountBuffer->map();
 
     gridData.solidVoxelCount = pSolidVoxelCount[0];
@@ -107,7 +107,7 @@ void VoxelizationPass_GPU::voxelize(RenderContext* pRenderContext, const RenderD
     memcpy(polygonCounts.data(), pPolygonCount, sizeof(uint) * gridData.solidVoxelCount);
 
     vBuffer_CPU.resize(gridData.totalVoxelCount());
-    memcpy(vBuffer_CPU.data(), pVbuffer, sizeof(int) * gridData.totalVoxelCount());
+    memcpy(vBuffer_CPU.data(), pVBuffer, sizeof(int) * gridData.totalVoxelCount());
     pVBuffer_CPU = vBuffer_CPU.data();
 
     std::vector<PolygonRange> polygonRanges;

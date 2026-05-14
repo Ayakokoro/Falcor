@@ -16,7 +16,7 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mpDevice = pDevice;
     mShadowBias100 = 0.01f;
     mMinPdf100 = 0.1f;
-    mTrasmittanceThreshold100 = 5.f;
+    mTransmittanceThreshold100 = 5.f;
     mUseEmissiveLight = false;
     mDebug = false;
     mCheckEllipsoid = true;
@@ -65,7 +65,7 @@ RenderPassReflection RayMarchingPass::reflect(const CompileData& compileData)
     reflector.addInput(kBlockMap, kBlockMap)
         .bindFlags(ResourceBindFlags::ShaderResource)
         .format(ResourceFormat::RGBA32Uint)
-        .texture2D(gridData.blockCount().x, gridData.blockCount().y);
+        .texture2D(gridData.blockCount2D().x, gridData.blockCount2D().y);
 
     reflector.addOutput(kOutputColor, "Color")
         .bindFlags(ResourceBindFlags::RenderTarget)
@@ -168,7 +168,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
         cb["minPdf"] = mMinPdf100 / 100;
-        cb["trasmittanceThreshold"] = mTrasmittanceThreshold100 / 100;
+        cb["transmittanceThreshold"] = mTransmittanceThreshold100 / 100;
         cb["selectedPixel"] = mSelectedPixel;
         cb["renderBackGround"] = mRenderBackGround;
         cb["clearColor"] = float4(mClearColor, 0);
@@ -224,7 +224,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.slider("Min Pdf(x100)", mMinPdf100, 0.0f, 0.2f))
         mOptionsChanged = true;
-    if (widget.slider("T Threshold(x100)", mTrasmittanceThreshold100, 0.0f, 10.0f))
+    if (widget.slider("T Threshold(x100)", mTransmittanceThreshold100, 0.0f, 10.0f))
         mOptionsChanged = true;
     if (widget.dropdown("Draw Mode", reinterpret_cast<ABSDFDrawMode&>(mDrawMode)))
         mOptionsChanged = true;

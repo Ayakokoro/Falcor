@@ -166,7 +166,12 @@ void calc(uint offset)
     data.ABSDF.normalizeSelf();
 
     if (!data.IsSolid())
+    {
+        //确保光线一定不与椭球相交
+        data.ellipsoid.center = float3(-1, -1, -1);
+        data.ellipsoid.B = make3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
         return;
+    }
 
     data.ellipsoid.fit(polygonBuffer, range);
 

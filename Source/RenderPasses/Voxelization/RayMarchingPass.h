@@ -34,7 +34,7 @@ private:
     uint mMaxBounce;
     float mShadowBias100;
     float mMinPdf100;
-    float mTrasmittanceThreshold100;
+    float mTransmittanceThreshold100;
     bool mCheckEllipsoid;
     bool mCheckVisibility;
     bool mCheckCoverage;
