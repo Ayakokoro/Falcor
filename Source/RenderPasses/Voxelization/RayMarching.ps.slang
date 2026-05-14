@@ -5,7 +5,10 @@
 import Rendering.Materials.StandardMaterial;
 import Utils.Sampling.UniformSampleGenerator;
 
-#define MAX_BOUNCE 4
+// 如果外部未定义,则取默认值3
+#ifndef MAX_BOUNCE
+#define MAX_BOUNCE 3
+#endif
 
 Texture3D<int> vBuffer;
 StructuredBuffer<PrimitiveBSDF> gBuffer;
@@ -29,7 +32,6 @@ cbuffer CB
     float shadowBias;
     uint drawMode;
     uint sampleStrategy;
-    uint maxBounce;
     uint frameIndex;
     float minPdf;
     float trasmittanceThreshold;
@@ -81,8 +83,13 @@ bool isSolidBlock(int3 blockInt)
     return value != 0;
 }
 
+bool outsideGrid(float3 cell)
+{
+    return any(cell < float3(0)) || any(cell >= (float3)voxelCount);
+}
+
 // 先后用体素和椭球裁剪线段
-HitResult checkPrimitive(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
+HitResult rayHitPrimitive(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
 {
     float3 from = cell - cellInt;
     int3 directions = int3(sign(direction));
@@ -101,40 +108,25 @@ HitResult checkPrimitive(Ellipsoid ellipsoid, float3 cell, float3 direction, int
     return result;
 }
 
-// 统一用网格坐标表示
-HitResult rayMarching_DDA(float3 from, float3 direction, bool ignoreFirst)
+// 射线命中体素，可能直接穿过，或命中椭球
+HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt)
 {
-    float3 cell = from;
-    int3 cellInt = int3(floor(from));
-
-    float3 reciprocal_direction = 1.0f / direction;
-    // 可选的前进方向
-    int3 directions = int3(sign(direction));
-    if (ignoreFirst)
-        leave(cell, cellInt, directions, direction, reciprocal_direction);
-
-    while (true)
+    int offset;
+    if (isSolidVoxel(cellInt, offset))
     {
-        if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
-            break;
-        int offset;
-        if (isSolidVoxel(cellInt, offset)) // 理论上不会出现面积为0的情况
-        {
 #if !CHECK_ELLIPSOID
-            HitResult hit = { true, cellInt, cellInt + 0.5f };
-            return hit;
+        HitResult hit = { true, cellInt, cellInt + 0.5f };
+        return hit;
 #else
-            Ellipsoid ellipsoid = pBuffer[offset];
-            HitResult hit = checkPrimitive(ellipsoid, cell, direction, cellInt);
-            if (hit.hit)
-                return hit;
+        Ellipsoid ellipsoid = pBuffer[offset];
+        HitResult hit = rayHitPrimitive(ellipsoid, cell, direction, cellInt);
+        if (hit.hit)
+            return hit;
 #endif
-        }
-        leave(cell, cellInt, directions, direction, reciprocal_direction);
     }
-    HitResult hit = { false, cellInt, cellInt + 0.5f };
-    return hit;
+    return { false, cellInt, cellInt + 0.5f };
 }
+
 // 统一用网格坐标表示
 HitResult rayMarching_DDA(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
 {
@@ -150,74 +142,14 @@ HitResult rayMarching_DDA(float3 from, float3 direction, float maxDistance, bool
 
     while (true)
     {
-        if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
+        if (outsideGrid(cellInt))
             break;
         if (maxDistance > 0 && distance > maxDistance) // 非正数表示不限制距离
             break;
-        int offset;
-        if (isSolidVoxel(cellInt, offset)) // 理论上不会出现面积为0的情况
-        {
-#if !CHECK_ELLIPSOID
-            HitResult hit = { true, cellInt, cellInt + 0.5f };
+        HitResult hit = rayHitVoxel(cell, direction, cellInt);
+        if (hit.hit)
             return hit;
-#else
-            Ellipsoid ellipsoid = pBuffer[offset];
-            HitResult hit = checkPrimitive(ellipsoid, cell, direction, cellInt);
-            if (hit.hit)
-                return hit;
-#endif
-        }
         distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
-    }
-    HitResult hit = { false, cellInt, cellInt + 0.5f };
-    return hit;
-}
-
-HitResult rayMarching_Mipmap(float3 from, float3 direction, bool ignoreFirst)
-{
-    float3 cell = from;
-    int3 cellInt = int3(floor(from));
-
-    float3 reciprocal_direction = 1.0f / direction;
-    // 可选的前进方向
-    int3 directions = int3(sign(direction));
-    if (ignoreFirst)
-        leave(cell, cellInt, directions, direction, reciprocal_direction);
-
-    while (true)
-    {
-        if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
-            break;
-
-        int3 blockInt = cellInt / BLOCK_TO_VOXEL;
-        if (isSolidBlock(blockInt))
-        {
-            int3 current = blockInt;
-            while (all(current == blockInt))
-            {
-                if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
-                    break;
-                int offset;
-                if (isSolidVoxel(cellInt, offset)) // 理论上不会出现面积为0的情况
-                {
-#if !CHECK_ELLIPSOID
-                    HitResult hit = { true, cellInt, cellInt + 0.5f };
-                    return hit;
-#else
-                    Ellipsoid ellipsoid = pBuffer[offset];
-                    HitResult hit = checkPrimitive(ellipsoid, cell, direction, cellInt);
-                    if (hit.hit)
-                        return hit;
-#endif
-                }
-                leave(cell, cellInt, directions, direction, reciprocal_direction);
-                current = cellInt / BLOCK_TO_VOXEL;
-            }
-        }
-        else
-        {
-            leaveBlock(cell, cellInt, directions, direction, reciprocal_direction);
-        }
     }
     HitResult hit = { false, cellInt, cellInt + 0.5f };
     return hit;
@@ -230,49 +162,28 @@ HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, b
     float distance = 0;
 
     float3 reciprocal_direction = 1.0f / direction;
-    // 可选的前进方向
     int3 directions = int3(sign(direction));
     if (ignoreFirst)
         distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
 
     while (true)
     {
-        if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
+        if (outsideGrid(cellInt))
             break;
-        if (distance > maxDistance) // 非正数表示不限制距离
+        if (maxDistance > 0 && distance > maxDistance)
             break;
 
         int3 blockInt = cellInt / BLOCK_TO_VOXEL;
-        if (isSolidBlock(blockInt))
-        {
-            int3 current = blockInt;
-            while (all(current == blockInt))
-            {
-                if (any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount))
-                    break;
-                if (distance > maxDistance) // 非正数表示不限制距离
-                    break;
-                int offset;
-                if (isSolidVoxel(cellInt, offset)) // 理论上不会出现面积为0的情况
-                {
-#if !CHECK_ELLIPSOID
-                    HitResult hit = { true, cellInt, cellInt + 0.5f };
-                    return hit;
-#else
-                    Ellipsoid ellipsoid = pBuffer[offset];
-                    HitResult hit = checkPrimitive(ellipsoid, cell, direction, cellInt);
-                    if (hit.hit)
-                        return hit;
-#endif
-                }
-                distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
-                current = cellInt / BLOCK_TO_VOXEL;
-            }
-        }
-        else
+        if (!isSolidBlock(blockInt))
         {
             distance += leaveBlock(cell, cellInt, directions, direction, reciprocal_direction);
+            continue;
         }
+
+        HitResult hit = rayHitVoxel(cell, direction, cellInt);
+        if (hit.hit)
+            return hit;
+        distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
     }
     HitResult hit = { false, cellInt, cellInt + 0.5f };
     return hit;
@@ -287,12 +198,8 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
         return hit;
     }
 #if USE_MIP_MAP
-    if (maxDistance > 0)
-        return rayMarching_Mipmap(from, direction, maxDistance, ignoreFirst);
-    return rayMarching_Mipmap(from, direction, ignoreFirst);
+    return rayMarching_Mipmap(from, direction, maxDistance, ignoreFirst);
 #else
-    if (maxDistance > 0)
-        return rayMarching_DDA(from, direction, maxDistance, ignoreFirst);
     return rayMarching_DDA(from, direction, maxDistance, ignoreFirst);
 #endif
 }
@@ -316,7 +223,7 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
 float3 coverageTest(HitResult hit, uint offset, float3 direction)
 {
     float coverage = 0;
-    float times = maxBounce;
+    float times = MAX_BOUNCE;
     while (times > 0)
     {
         PrimitiveBSDF bsdf = gBuffer[offset];
@@ -402,14 +309,14 @@ float3 shadingDirect(HitResult hit, uint offset, float3 v, inout UniformSampleGe
     return 0;
 }
 
-float3 shadingGlobal(HitResult hit, float3 v, uint bounce, inout UniformSampleGenerator sg)
+float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
 {
     // 非递归版本，先计算所有命中点，再倒回来统计
     HitResult[MAX_BOUNCE + 1] hits;
     float3[MAX_BOUNCE + 1] ls; // 第i个采样方向即第i个体素指向第i+1个体素的方向
     float3[MAX_BOUNCE + 1] hs;
     float[MAX_BOUNCE + 1] pdfs; // 第i个pdf即对第i个体素的BSDF采样得到的权重
-    bounce = min(bounce, MAX_BOUNCE);
+    uint bounce = MAX_BOUNCE;
     uint shadingPointCount = bounce + 1; // 要着色的点的个数，未中断时为primary hit + bounce
     hits[0] = hit;
     bool leaveGrid = false;
@@ -546,7 +453,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
                 return psOut; // 命中自发光面片时中止后续计算
             }
 #endif
-            color = shadingGlobal(hit, -direction, maxBounce, sg);
+            color = shadingGlobal(hit, -direction, sg);
             break;
         case ABSDFDrawMode::Coverage:
             color = coverageTest(hit, offset, direction);

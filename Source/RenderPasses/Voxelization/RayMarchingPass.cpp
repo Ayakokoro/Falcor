@@ -117,6 +117,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mpFullScreenPass->addDefine("CHECK_COVERAGE", mCheckCoverage ? "1" : "0");
         mpFullScreenPass->addDefine("USE_MIP_MAP", mUseMipmap ? "1" : "0");
         mpFullScreenPass->addDefine("DEBUG", mDebug ? "1" : "0");
+        mpFullScreenPass->addDefine("MAX_BOUNCE", std::to_string(mMaxBounce));
 
         ref<EnvMap> pEnvMap = mpScene->getEnvMap();
         mpFullScreenPass->addDefine("USE_ENV_MAP", pEnvMap ? "1" : "0");
@@ -165,7 +166,6 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["invVP"] = math::inverse(pCamera->getViewProjMatrixNoJitter());
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
         cb["drawMode"] = mDrawMode;
-        cb["maxBounce"] = mMaxBounce;
         cb["frameIndex"] = mFrameIndex;
         cb["minPdf"] = mMinPdf100 / 100;
         cb["trasmittanceThreshold"] = mTrasmittanceThreshold100 / 100;

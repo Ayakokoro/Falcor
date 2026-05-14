@@ -89,7 +89,7 @@ void VoxelizationPass::compile(RenderContext* pRenderContext, const CompileData&
 
 void VoxelizationPass::renderUI(Gui::Widgets& widget)
 {
-    static const uint resolutions[] = {1, 4, 16, 64, 128, 256, 512, 1000, 1024, 1200, 1300, 1400, 1500};
+    static const uint resolutions[] = {64, 128, 256, 512, 960, 1024, 1280, 1344, 1408, 1472, 1536};
     {
         Gui::DropdownList list;
         for (uint32_t i = 0; i < sizeof(resolutions) / sizeof(uint); i++)
