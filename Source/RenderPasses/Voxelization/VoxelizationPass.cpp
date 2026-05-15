@@ -10,7 +10,6 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice), polygonGroup(pDevice, VoxelizationBase::GlobalGridData), gridData(VoxelizationBase::GlobalGridData)
 {
     mSceneNameIndex = 0;
-    mSceneName = "Auto";
     mVoxelizationComplete = true;
     mSamplingComplete = true;
     mCompleteTimes = 0;
@@ -104,20 +103,6 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         }
         widget.dropdown("Voxel Resolution", list, mVoxelResolution);
     }
-
-    static const std::string sceneNames[] = {"Auto", "Arcade", "Azalea", "BoxBunny", "Box", "Chandelier", "Colosseum"};
-    {
-        Gui::DropdownList list;
-        for (uint32_t i = 0; i < sizeof(sceneNames) / sizeof(std::string); i++)
-        {
-            list.push_back({i, sceneNames[i]});
-        }
-        if (widget.dropdown("Scene Name", list, mSceneNameIndex))
-        {
-            mSceneName = sceneNames[mSceneNameIndex];
-        }
-    }
-
     static const uint sampleFrequencies[] = {0, 64, 256, 512, 1024, 2048, 4096};
     {
         Gui::DropdownList list;
@@ -215,10 +200,7 @@ static std::string trim_non_alnum_ends(std::string s)
 std::string VoxelizationPass::getFileName()
 {
     std::ostringstream oss;
-    if (mSceneName == "Auto")
-        oss << trim_non_alnum_ends(mpScene->getPath().stem().string());
-    else
-        oss << mSceneName;
+    oss << trim_non_alnum_ends(mpScene->getPath().stem().string());
     oss << "_";
     oss << ToString((int3)gridData.voxelCount);
     oss << "_";

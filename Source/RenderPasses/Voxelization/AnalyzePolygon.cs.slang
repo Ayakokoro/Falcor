@@ -14,7 +14,7 @@ import Scene.Material.BasicMaterialData;
 StructuredBuffer<Polygon> polygonBuffer; // 局部缓冲区
 StructuredBuffer<PolygonRange> polygonRangeBuffer;
 RWStructuredBuffer<VoxelData> gBuffer;
-RWStructuredBuffer<uint> blockMap; // 逻辑上是Texture2D<uint4>
+RWStructuredBuffer<uint> blockMap;      // 逻辑上是Texture2D<uint4>
 RWStructuredBuffer<uint> hyperBlockMap; // 逻辑上是Texture2D<uint4>，存储hyper block occupancy
 SamplerState sampler;
 
@@ -154,8 +154,8 @@ void updateBlockMap(int3 cellInt)
 
 void updateHyperBlockMap(int3 cellInt)
 {
-    int3 blockInt = cellInt >> MIPMAP_SHRINK_BIT;  // First shrink to block level
-    int3 hyperBlockInt = blockInt >> MIPMAP_SHRINK_BIT;  // Then shrink to hyper block level
+    int3 blockInt = cellInt >> MIPMAP_SHRINK_BIT;       // First shrink to block level
+    int3 hyperBlockInt = blockInt >> MIPMAP_SHRINK_BIT; // Then shrink to hyper block level
     int component = hyperBlockInt.z >> 5;
     uint value = 1 << (hyperBlockInt.z & 31);
     uint index = hyperBlockInt.x + hyperBlockInt.y * hyperBlockCount.x;
@@ -179,12 +179,7 @@ void calc(uint offset)
     data.ABSDF.normalizeSelf();
 
     if (!data.IsSolid())
-    {
-        // 确保光线一定不与椭球相交
-        data.ellipsoid.center = float3(-1, -1, -1);
-        data.ellipsoid.B = make3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
         return;
-    }
 
     data.ellipsoid.fit(polygonBuffer, range);
 

@@ -57,6 +57,11 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
+bool isSolidVoxel(int3 cellInt, inout int offset)
+{
+    return OM.isSolidVoxel(cellInt, offset) && gBuffer[offset].area > 0;
+}
+
 // 先后用体素和椭球裁剪线段
 HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
 {
@@ -81,7 +86,7 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
 HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt)
 {
     int offset;
-    if (OM.isSolidVoxel(cellInt, offset))
+    if (isSolidVoxel(cellInt, offset))
     {
 #if !CHECK_ELLIPSOID
         HitResult hit = { true, cellInt, cellInt + 0.5f };
