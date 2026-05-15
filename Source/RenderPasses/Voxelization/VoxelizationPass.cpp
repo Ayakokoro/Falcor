@@ -178,7 +178,7 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
     cb["groupVoxelCount"] = groupVoxelCount;
     cb["sampleFrequency"] = mSampleFrequency;
     cb["gBufferOffset"] = polygonGroup.getVoxelOffset(mCompleteTimes);
-    cb["blockCount"] = gridData.blockTextureCount();
+    cb["blockCount"] = gridData.blockCount2D();
 
     auto cb_grid = var["GridData"];
     cb_grid["gridMin"] = gridData.gridMin;

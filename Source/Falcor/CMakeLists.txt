@@ -1018,6 +1018,8 @@ target_include_directories(Falcor
 set_target_properties(Falcor PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${FALCOR_RUNTIME_OUTPUT_DIRECTORY}
     LIBRARY_OUTPUT_DIRECTORY ${FALCOR_LIBRARY_OUTPUT_DIRECTORY}
+    VS_GLOBAL_VcpkgEnabled false
+    VS_GLOBAL_VCPkgLocalAppDataDisabled true
 )
 
 add_dependencies(Falcor packman_dependencies)

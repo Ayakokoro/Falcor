@@ -20,6 +20,7 @@
 
 # User files.
 /CMakeUserPresets.json
+/.workbuddy/
 
 # File types.
 *.user

@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.15)
 
+# Disable vcpkg toolchain to avoid conflicts with Falcor's pre-built dependencies.
+# The system vcpkg (D:/vcpkg) has OpenVDB v12, but Falcor's deps use v9.
+# vcpkg MSBuild integration injects v12 headers via vcpkg.user.targets,
+# causing ABI mismatch (v12_0 symbols vs v9_0 at link/runtime).
+set(CMAKE_TOOLCHAIN_FILE "" CACHE STRING "Disabled vcpkg toolchain" FORCE)
+set(VCPKG_MANIFEST_MODE OFF CACHE BOOL "Disabled vcpkg manifest mode" FORCE)
+
 cmake_policy(SET CMP0077 NEW)
 cmake_policy(SET CMP0091 NEW)
 cmake_policy(SET CMP0104 NEW)
@@ -10,6 +17,13 @@ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
 project(Falcor
     DESCRIPTION "Falcor Realtime Rendering Framework"
     LANGUAGES CXX C
+)
+
+# Disable vcpkg MSBuild integration for all targets in this project.
+# This prevents vcpkg.user.targets from injecting vcpkg include/lib paths.
+set(CMAKE_VS_GLOBALS
+    "VcpkgEnabled=false"
+    "VCPkgLocalAppDataDisabled=true"
 )
 
 # -----------------------------------------------------------------------------
@@ -292,9 +306,12 @@ function(add_falcor_executable target)
 
     target_link_libraries(${target} PRIVATE Falcor)
 
-    set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${FALCOR_RUNTIME_OUTPUT_DIRECTORY})
-
-    set_target_properties(${target} PROPERTIES VS_DEBUGGER_ENVIRONMENT "FALCOR_DEVMODE=1")
+    set_target_properties(${target} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${FALCOR_RUNTIME_OUTPUT_DIRECTORY}
+        VS_DEBUGGER_ENVIRONMENT "FALCOR_DEVMODE=1"
+        VS_GLOBAL_VcpkgEnabled false
+        VS_GLOBAL_VCPkgLocalAppDataDisabled true
+    )
 endfunction()
 
 # -----------------------------------------------------------------------------
@@ -315,6 +332,8 @@ function(add_plugin target)
         RUNTIME_OUTPUT_DIRECTORY ${FALCOR_PLUGIN_OUTPUT_DIRECTORY}
         LIBRARY_OUTPUT_DIRECTORY ${FALCOR_PLUGIN_OUTPUT_DIRECTORY}
         INSTALL_RPATH "\$ORIGIN/../"
+        VS_GLOBAL_VcpkgEnabled false
+        VS_GLOBAL_VCPkgLocalAppDataDisabled true
     )
 
     # Add target to global plugin target list.

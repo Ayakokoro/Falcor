@@ -57,7 +57,7 @@ inline int3 IndexToCell(int index, uint3 size)
 
 struct OccupancyMap
 {
-    size_t solidVoxelCount;
+    uint solidVoxelCount;
     Texture3D<int> vBuffer;
     Texture2D<uint4> blockMap;
     // Texture2D<uint4> hyperBlockMap;

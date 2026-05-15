@@ -142,9 +142,9 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
 
 void updateBlockMap(int3 cellInt)
 {
-    int3 blockInt = cellInt / BLOCK_TO_VOXEL;
-    int component = blockInt.z / 32;
-    uint value = 1 << blockInt.z % 32;
+    int3 blockInt = cellInt >> MIPMAP_SHRINK;
+    int component = blockInt.z >> MIPMAP_SHRINK >> 2;
+    uint value = 1 << (blockInt.z & 31);
     uint index = blockInt.x + blockInt.y * blockCount.x;
     index = 4 * index + component; // 4个分量一组
     InterlockedOr(blockMap[index], value);
@@ -167,7 +167,7 @@ void calc(uint offset)
 
     if (!data.IsSolid())
     {
-        //确保光线一定不与椭球相交
+        // 确保光线一定不与椭球相交
         data.ellipsoid.center = float3(-1, -1, -1);
         data.ellipsoid.B = make3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
         return;
