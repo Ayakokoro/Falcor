@@ -38,6 +38,29 @@ struct GridData
         uint2 temp = blockCount2D();
         return temp.x * temp.y;
     }
+
+    // Hyper Block (Mip Level 2): MIPMAP_SHRINK blocks per dimension
+    uint3 hyperBlockCount3D()
+    {
+        uint3 blockCount = blockCount3D();
+        return uint3(
+            (blockCount.x + MIPMAP_SHRINK - 1) >> MIPMAP_SHRINK_BIT,
+            (blockCount.y + MIPMAP_SHRINK - 1) >> MIPMAP_SHRINK_BIT,
+            (blockCount.z + MIPMAP_SHRINK - 1) >> MIPMAP_SHRINK_BIT
+        );
+    }
+
+    uint2 hyperBlockCount2D()
+    {
+        uint3 hbCount = hyperBlockCount3D();
+        return uint2(hbCount.x, hbCount.y);
+    }
+
+    uint hyperBlockTextureCount()
+    {
+        uint2 temp = hyperBlockCount2D();
+        return temp.x * temp.y;
+    }
 };
 
 inline int CellToIndex(int3 cell, uint3 size)
@@ -60,7 +83,7 @@ struct OccupancyMap
     uint solidVoxelCount;
     Texture3D<int> vBuffer;
     Texture2D<uint4> blockMap;
-    // Texture2D<uint4> hyperBlockMap;
+    Texture2D<uint4> hyperBlockMap;
 
     bool isSolidVoxel(int3 cellInt, out int offset)
     {
@@ -68,11 +91,21 @@ struct OccupancyMap
         return offset >= 0 && offset < solidVoxelCount;
     }
 
-    bool isSolidBlock(int3 blockInt)
+    bool isSolidBlock(int3 cellInt)
     {
-        int component = blockInt.z >> MIPMAP_SHRINK >> 2; // 当前格的Z分量对应uint4中的哪一个int
-        uint mask = 1 << (blockInt.z & 31);               // 当前格的Z分量对应int中的哪一位
+        int3 blockInt = cellInt >> MIPMAP_SHRINK_BIT;
+        int component = blockInt.z >> 5;    // 当前格的Z分量对应uint4中的哪一个int
+        uint mask = 1 << (blockInt.z & 31); // 当前格的Z分量对应int中的哪一位
         uint4 zMap = blockMap[blockInt.xy];
+        return (zMap[component] & mask) != 0;
+    }
+
+    bool isSolidHyperBlock(int3 cellInt)
+    {
+        int3 hyperBlockInt = cellInt >> MIPMAP_SHRINK_BIT >> MIPMAP_SHRINK_BIT;
+        int component = hyperBlockInt.z >> 5;    // 当前格的Z分量对应uint4中的哪一个int
+        uint mask = 1 << (hyperBlockInt.z & 31); // 当前格的Z分量对应int中的哪一位
+        uint4 zMap = hyperBlockMap[hyperBlockInt.xy];
         return (zMap[component] & mask) != 0;
     }
 };
@@ -124,6 +157,31 @@ inline float leaveBlock(inout float3 cell, inout int3 cellInt, int3 directions, 
     t = leaveBlockFace(cell.y, cellInt.y, reciprocal_direction.y);
     tMin = min(t, tMin);
     t = leaveBlockFace(cell.z, cellInt.z, reciprocal_direction.z);
+    tMin = min(t, tMin);
+    cell += tMin * direction;
+    cellInt = int3(cell + direction * 1e-3);
+    return tMin;
+}
+
+inline float leaveHyperBlockFace(float c, int cInt, float reciprocal)
+{
+    int temp = cInt % (MIPMAP_SHRINK * MIPMAP_SHRINK);
+    float t = -1;
+    if (reciprocal < 0)
+        t = (cInt - temp - c) * reciprocal;
+    if (reciprocal > 0)
+        t = (cInt - temp + MIPMAP_SHRINK * MIPMAP_SHRINK - c) * reciprocal;
+    return t > 0 ? t : 1e30;
+}
+
+inline float leaveHyperBlock(inout float3 cell, inout int3 cellInt, int3 directions, float3 direction, float3 reciprocal_direction)
+{
+    float tMin = 2 * MIPMAP_SHRINK * MIPMAP_SHRINK;
+    float t = leaveHyperBlockFace(cell.x, cellInt.x, reciprocal_direction.x);
+    tMin = min(t, tMin);
+    t = leaveHyperBlockFace(cell.y, cellInt.y, reciprocal_direction.y);
+    tMin = min(t, tMin);
+    t = leaveHyperBlockFace(cell.z, cellInt.z, reciprocal_direction.z);
     tMin = min(t, tMin);
     cell += tMin * direction;
     cellInt = int3(cell + direction * 1e-3);

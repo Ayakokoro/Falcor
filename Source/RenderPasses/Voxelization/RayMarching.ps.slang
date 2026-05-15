@@ -10,7 +10,7 @@ import Utils.Sampling.UniformSampleGenerator;
 #define MAX_BOUNCE 3
 #endif
 
-StructuredBuffer<PrimitiveBSDF> gBuffer;
+StructuredBuffer<TEBSDF> gBuffer;
 StructuredBuffer<Ellipsoid> pBuffer;
 
 RWStructuredBuffer<float4> selectedVoxel;
@@ -52,9 +52,9 @@ struct PsOut
     float4 color : SV_Target0;
 };
 
-bool outsideGrid(float3 cell)
+bool outsideGrid(int3 cellInt)
 {
-    return any(cell < float3(0)) || any(cell >= (float3)voxelCount);
+    return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
 // 先后用体素和椭球裁剪线段
@@ -142,13 +142,21 @@ HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, b
         if (maxDistance > 0 && distance > maxDistance)
             break;
 
-        int3 blockInt = cellInt >> MIPMAP_SHRINK;
-        if (!OM.isSolidBlock(blockInt))
+        // Mip Level 2: Hyper Block
+        if (!OM.isSolidHyperBlock(cellInt))
+        {
+            distance += leaveHyperBlock(cell, cellInt, directions, direction, reciprocal_direction);
+            continue;
+        }
+
+        // Mip Level 1: Block
+        if (!OM.isSolidBlock(cellInt))
         {
             distance += leaveBlock(cell, cellInt, directions, direction, reciprocal_direction);
             continue;
         }
 
+        // Mip Level 0: Voxel
         HitResult hit = rayHitVoxel(cell, direction, cellInt);
         if (hit.hit)
             return hit;
@@ -195,7 +203,7 @@ float3 coverageTest(HitResult hit, uint offset, float3 direction)
     float times = MAX_BOUNCE;
     while (times > 0)
     {
-        PrimitiveBSDF bsdf = gBuffer[offset];
+        TEBSDF bsdf = gBuffer[offset];
         coverage += (1 - coverage) * bsdf.calcCoverage(direction);
         if (coverage >= 1 - transmittanceThreshold)
         {
@@ -213,7 +221,7 @@ float3 coverageTest(HitResult hit, uint offset, float3 direction)
 
 float3 debugShading(HitResult hit, uint offset, float3 v)
 {
-    PrimitiveBSDF bsdf = gBuffer[offset];
+    TEBSDF bsdf = gBuffer[offset];
     Ellipsoid e = pBuffer[offset];
     float result = 0;
     switch (drawMode)
@@ -253,7 +261,7 @@ float3 debugShading(HitResult hit, uint offset, float3 v)
 
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
-    PrimitiveBSDF BSDF = gBuffer[offset];
+    TEBSDF BSDF = gBuffer[offset];
     BSDF.updateCoverage(v, transmittanceThreshold);
     return lightColor * BSDF.eval(l, v, h);
 }
@@ -261,7 +269,7 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 // 随机采样方向，不确定光源是否可见
 float3 shadingDirect(HitResult hit, uint offset, float3 v, inout UniformSampleGenerator sg)
 {
-    PrimitiveBSDF BSDF = gBuffer[offset];
+    TEBSDF BSDF = gBuffer[offset];
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -292,7 +300,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
     for (int i = 0; i < bounce; i++)
     {
         uint offset = OM.vBuffer[hits[i].cellInt];
-        PrimitiveBSDF BSDF = gBuffer[offset];
+        TEBSDF BSDF = gBuffer[offset];
         float3 currentV = i == 0 ? v : -ls[i - 1];
         BSDF.updateCoverage(currentV, transmittanceThreshold);
         BSDF.sample(currentV, ls[i], hs[i], sg);

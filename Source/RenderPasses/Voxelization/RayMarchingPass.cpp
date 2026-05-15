@@ -55,7 +55,7 @@ RenderPassReflection RayMarchingPass::reflect(const CompileData& compileData)
     reflector.addInput(kGBuffer, kGBuffer)
         .bindFlags(ResourceBindFlags::ShaderResource)
         .format(ResourceFormat::Unknown)
-        .rawBuffer(gridData.solidVoxelCount * sizeof(PrimitiveBSDF));
+        .rawBuffer(gridData.solidVoxelCount * sizeof(TEBSDF));
 
     reflector.addInput(kPBuffer, kPBuffer)
         .bindFlags(ResourceBindFlags::ShaderResource)
@@ -66,6 +66,11 @@ RenderPassReflection RayMarchingPass::reflect(const CompileData& compileData)
         .bindFlags(ResourceBindFlags::ShaderResource)
         .format(ResourceFormat::RGBA32Uint)
         .texture2D(gridData.blockCount2D().x, gridData.blockCount2D().y);
+
+    reflector.addInput(kHyperBlockMap, kHyperBlockMap)
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::RGBA32Uint)
+        .texture2D(gridData.hyperBlockCount2D().x, gridData.hyperBlockCount2D().y);
 
     reflector.addOutput(kOutputColor, "Color")
         .bindFlags(ResourceBindFlags::RenderTarget)
@@ -161,6 +166,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         om["solidVoxelCount"] = (uint)gridData.solidVoxelCount;
         om[kVBuffer] = renderData.getTexture(kVBuffer);
         om[kBlockMap] = renderData.getTexture(kBlockMap);
+        om[kHyperBlockMap] = renderData.getTexture(kHyperBlockMap);
 
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;

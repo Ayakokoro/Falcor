@@ -1,7 +1,7 @@
 #include "Shading.slang"
 
 StructuredBuffer<VoxelData> voxelDataBuffer;
-RWStructuredBuffer<PrimitiveBSDF> gBuffer;
+RWStructuredBuffer<TEBSDF> gBuffer;
 RWStructuredBuffer<Ellipsoid> pBuffer;
 
 cbuffer CB

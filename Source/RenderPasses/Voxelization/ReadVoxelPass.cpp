@@ -33,7 +33,7 @@ RenderPassReflection ReadVoxelPass::reflect(const CompileData& compileData)
     reflector.addOutput(kGBuffer, kGBuffer)
         .bindFlags(ResourceBindFlags::UnorderedAccess)
         .format(ResourceFormat::Unknown)
-        .rawBuffer(gridData.solidVoxelCount * sizeof(PrimitiveBSDF));
+        .rawBuffer(gridData.solidVoxelCount * sizeof(TEBSDF));
 
     reflector.addOutput(kPBuffer, kPBuffer)
         .bindFlags(ResourceBindFlags::UnorderedAccess)
@@ -44,6 +44,11 @@ RenderPassReflection ReadVoxelPass::reflect(const CompileData& compileData)
         .bindFlags(ResourceBindFlags::None)
         .format(ResourceFormat::RGBA32Uint)
         .texture2D(gridData.blockCount2D().x, gridData.blockCount2D().y);
+
+    reflector.addOutput(kHyperBlockMap, kHyperBlockMap)
+        .bindFlags(ResourceBindFlags::ShaderResource)
+        .format(ResourceFormat::RGBA32Uint)
+        .texture2D(gridData.hyperBlockCount2D().x, gridData.hyperBlockCount2D().y);
 
     return reflector;
 }
@@ -97,6 +102,11 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
     uint4* blockMap = new uint4[gridData.blockTextureCount()];
     tryRead(f, offset, gridData.blockTextureCount() * sizeof(uint4), blockMap, fileSize);
     pBlockMap->setSubresourceBlob(0, blockMap, gridData.blockTextureCount() * sizeof(uint4));
+
+    ref<Texture> pHyperBlockMap = renderData.getTexture(kHyperBlockMap);
+    uint4* hyperBlockMap = new uint4[gridData.hyperBlockTextureCount()];
+    tryRead(f, offset, gridData.hyperBlockTextureCount() * sizeof(uint4), hyperBlockMap, fileSize);
+    pHyperBlockMap->setSubresourceBlob(0, hyperBlockMap, gridData.hyperBlockTextureCount() * sizeof(uint4));
 
     // VoxelData将拆分成PrimitiveBSDF和Ellipsoid
     ref<Buffer> pGBuffer = renderData.getResource(kGBuffer)->asBuffer();
@@ -160,6 +170,7 @@ void ReadVoxelPass::renderUI(Gui::Widgets& widget)
     widget.text("Voxel Size: " + ToString(data.voxelSize));
     widget.text("Voxel Count: " + ToString((int3)data.voxelCount));
     widget.text("Block Count: " + ToString((int3)data.blockCount3D()));
+    widget.text("Hyper Block Count: " + ToString((int3)data.hyperBlockCount3D()));
     widget.text("Grid Min: " + ToString(data.gridMin));
     widget.text("Solid Voxel Count: " + std::to_string(data.solidVoxelCount));
     widget.text("Solid Rate: " + std::to_string(data.solidVoxelCount / (float)data.totalVoxelCount()));

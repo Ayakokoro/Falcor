@@ -52,6 +52,10 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
 
         blockMap = mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.blockTextureCount(), ResourceBindFlags::UnorderedAccess);
         pRenderContext->clearUAV(blockMap->getUAV().get(), uint4(0));
+
+        hyperBlockMap =
+            mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.hyperBlockTextureCount(), ResourceBindFlags::UnorderedAccess);
+        pRenderContext->clearUAV(hyperBlockMap->getUAV().get(), uint4(0));
     }
     else
     {
@@ -70,12 +74,15 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
             Tools::Profiler::BeginSample("Write File");
             ref<Buffer> cpuGBuffer = copyToCpu(mpDevice, pRenderContext, gBuffer);
             ref<Buffer> cpuBlockMap = copyToCpu(mpDevice, pRenderContext, blockMap);
+            ref<Buffer> cpuHyperBlockMap = copyToCpu(mpDevice, pRenderContext, hyperBlockMap);
             pRenderContext->submit(true);
             void* pGBuffer_CPU = cpuGBuffer->map();
             void* pBlockMap_CPU = cpuBlockMap->map();
-            write(getFileName(), pGBuffer_CPU, pVBuffer_CPU, pBlockMap_CPU);
+            void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
+            write(getFileName(), pGBuffer_CPU, pVBuffer_CPU, pBlockMap_CPU, pHyperBlockMap_CPU);
             cpuGBuffer->unmap();
             cpuBlockMap->unmap();
+            cpuHyperBlockMap->unmap();
             mSamplingComplete = true;
             Tools::Profiler::EndSample("Write File");
             Tools::Profiler::Print();
@@ -172,6 +179,7 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
     var[kPolygonRangeBuffer] = polygonRangeBuffer;
     var[kPolygonBuffer] = polygonGroup.get(mCompleteTimes);
     var[kBlockMap] = blockMap;
+    var[kHyperBlockMap] = hyperBlockMap;
 
     uint groupVoxelCount = polygonGroup.getVoxelCount(mCompleteTimes);
     auto cb = var["CB"];
@@ -179,6 +187,7 @@ void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& r
     cb["sampleFrequency"] = mSampleFrequency;
     cb["gBufferOffset"] = polygonGroup.getVoxelOffset(mCompleteTimes);
     cb["blockCount"] = gridData.blockCount2D();
+    cb["hyperBlockCount"] = gridData.hyperBlockCount2D();
 
     auto cb_grid = var["GridData"];
     cb_grid["gridMin"] = gridData.gridMin;
@@ -218,7 +227,7 @@ std::string VoxelizationPass::getFileName()
     return oss.str();
 }
 
-void VoxelizationPass::write(std::string fileName, void* pGBuffer, void* pVBuffer, void* pBlockMap)
+void VoxelizationPass::write(std::string fileName, void* pGBuffer, void* pVBuffer, void* pBlockMap, void* pHyperBlockMap)
 {
     std::ofstream f;
     std::string s = VoxelizationBase::ResourceFolder + fileName;
@@ -228,6 +237,7 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer, void* pVBuffe
     f.write(reinterpret_cast<const char*>(pVBuffer), gridData.totalVoxelCount() * sizeof(int));
     f.write(reinterpret_cast<const char*>(pGBuffer), gridData.solidVoxelCount * sizeof(VoxelData));
     f.write(reinterpret_cast<const char*>(pBlockMap), gridData.blockTextureCount() * sizeof(uint4));
+    f.write(reinterpret_cast<const char*>(pHyperBlockMap), gridData.hyperBlockTextureCount() * sizeof(uint4));
 
     f.close();
     VoxelizationBase::FileUpdated = true;

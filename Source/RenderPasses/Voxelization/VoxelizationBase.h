@@ -31,23 +31,13 @@ inline std::string ToString(int3 v)
     return oss.str();
 }
 
-struct BufferDesc
-{
-    std::string name;
-    std::string texname; // 如果不直接对应着色器资源，设为空字符串
-    std::string desc;
-    bool serialized;
-    bool isInputOrOutut;
-    size_t bytesPerElement;
-};
-using BufferlList = std::vector<BufferDesc>;
-
 inline std::string kGBuffer = "gBuffer";
 inline std::string kVBuffer = "vBuffer";
 inline std::string kPBuffer = "pBuffer";
 inline std::string kPolygonBuffer = "polygonBuffer";
 inline std::string kPolygonRangeBuffer = "polygonRangeBuffer";
 inline std::string kBlockMap = "blockMap";
+inline std::string kHyperBlockMap = "hyperBlockMap";
 
 class VoxelizationBase
 {

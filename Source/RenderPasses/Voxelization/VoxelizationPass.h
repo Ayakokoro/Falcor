@@ -21,7 +21,7 @@ public:
     virtual std::string getFileName();
 
 protected:
-    void write(std::string fileName, void* gBuffer, void* vBuffer, void* pBlockMap);
+    void write(std::string fileName, void* gBuffer, void* vBuffer, void* pBlockMap, void* pHyperBlockMap);
     ref<ComputePass> mAnalyzePolygonPass;
 
     ref<Device> mpDevice;
@@ -33,6 +33,7 @@ protected:
     ref<Buffer> polygonRangeBuffer;
     PolygonBufferGroup polygonGroup;
     ref<Buffer> blockMap;
+    ref<Buffer> hyperBlockMap;
 
     void* pVBuffer_CPU;
 

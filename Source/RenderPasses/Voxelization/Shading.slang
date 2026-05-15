@@ -386,7 +386,7 @@ struct DeltaBTDF
 };
 #endif
 
-struct PrimitiveBSDF
+struct TEBSDF
 {
     SurfaceBRDF surface;
 #if !defined(HOST_CODE)

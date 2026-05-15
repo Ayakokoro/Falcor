@@ -22,6 +22,7 @@ def render_graph_Pass():
     g.addEdge("ReadVoxelPass.gBuffer","RayMarchingPass.gBuffer")
     g.addEdge("ReadVoxelPass.pBuffer","RayMarchingPass.pBuffer")
     g.addEdge("ReadVoxelPass.blockMap","RayMarchingPass.blockMap")
+    g.addEdge("ReadVoxelPass.hyperBlockMap","RayMarchingPass.hyperBlockMap")
 
     g.addEdge("RayMarchingPass.color","RenderToViewportPass.input")
     g.addEdge("RenderToViewportPass.output","AccumulatePass.input")
