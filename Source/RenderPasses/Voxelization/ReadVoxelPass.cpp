@@ -88,25 +88,25 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
     tryRead(f, offset, sizeof(GridData), nullptr, fileSize);
 
     ref<Texture> pVBuffer = renderData.getTexture(kVBuffer);
-    uint* vBuffer = new uint[gridData.totalVoxelCount()];
-    tryRead(f, offset, gridData.totalVoxelCount() * sizeof(uint), vBuffer, fileSize);
-    pVBuffer->setSubresourceBlob(0, vBuffer, gridData.totalVoxelCount() * sizeof(uint));
+    std::vector<uint> vBuffer(gridData.totalVoxelCount());
+    tryRead(f, offset, gridData.totalVoxelCount() * sizeof(uint), vBuffer.data(), fileSize);
+    pVBuffer->setSubresourceBlob(0, vBuffer.data(), gridData.totalVoxelCount() * sizeof(uint));
 
     mpVoxelDataBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), gridData.solidVoxelCount, ResourceBindFlags::ShaderResource);
-    VoxelData* voxelDataBuffer = new VoxelData[gridData.solidVoxelCount];
-    tryRead(f, offset, gridData.solidVoxelCount * sizeof(VoxelData), voxelDataBuffer, fileSize);
-    mpVoxelDataBuffer->setBlob(voxelDataBuffer, 0, gridData.solidVoxelCount * sizeof(VoxelData));
+    std::vector<VoxelData> voxelDataBuffer(gridData.solidVoxelCount);
+    tryRead(f, offset, gridData.solidVoxelCount * sizeof(VoxelData), voxelDataBuffer.data(), fileSize);
+    mpVoxelDataBuffer->setBlob(voxelDataBuffer.data(), 0, gridData.solidVoxelCount * sizeof(VoxelData));
     pRenderContext->submit(true);
 
     ref<Texture> pBlockMap = renderData.getTexture(kBlockMap);
-    uint4* blockMap = new uint4[gridData.blockTextureCount()];
-    tryRead(f, offset, gridData.blockTextureCount() * sizeof(uint4), blockMap, fileSize);
-    pBlockMap->setSubresourceBlob(0, blockMap, gridData.blockTextureCount() * sizeof(uint4));
+    std::vector<uint4> blockMap(gridData.blockTextureCount());
+    tryRead(f, offset, gridData.blockTextureCount() * sizeof(uint4), blockMap.data(), fileSize);
+    pBlockMap->setSubresourceBlob(0, blockMap.data(), gridData.blockTextureCount() * sizeof(uint4));
 
     ref<Texture> pHyperBlockMap = renderData.getTexture(kHyperBlockMap);
-    uint4* hyperBlockMap = new uint4[gridData.hyperBlockTextureCount()];
-    tryRead(f, offset, gridData.hyperBlockTextureCount() * sizeof(uint4), hyperBlockMap, fileSize);
-    pHyperBlockMap->setSubresourceBlob(0, hyperBlockMap, gridData.hyperBlockTextureCount() * sizeof(uint4));
+    std::vector<uint4> hyperBlockMap(gridData.hyperBlockTextureCount());
+    tryRead(f, offset, gridData.hyperBlockTextureCount() * sizeof(uint4), hyperBlockMap.data(), fileSize);
+    pHyperBlockMap->setSubresourceBlob(0, hyperBlockMap.data(), gridData.hyperBlockTextureCount() * sizeof(uint4));
 
     // VoxelData将拆分成PrimitiveBSDF和Ellipsoid
     ref<Buffer> pGBuffer = renderData.getResource(kGBuffer)->asBuffer();

@@ -96,36 +96,15 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt)
     return { false, cellInt, cellInt + 0.5f };
 }
 
-// 统一用网格坐标表示
-HitResult rayMarching_DDA(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
 {
-    float3 cell = from;
-    int3 cellInt = int3(floor(from));
-    float distance = 0;
-
-    float3 reciprocal_direction = 1.0f / direction;
-    // 可选的前进方向
-    int3 directions = int3(sign(direction));
-    if (ignoreFirst)
-        distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
-
-    while (true)
+    direction = normalizeSafe(direction);
+    if (all(direction == float3(0)))
     {
-        if (outsideGrid(cellInt))
-            break;
-        if (maxDistance > 0 && distance > maxDistance) // 非正数表示不限制距离
-            break;
-        HitResult hit = rayHitVoxel(cell, direction, cellInt);
-        if (hit.hit)
-            return hit;
-        distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
+        HitResult hit = { false, int3(from), from };
+        return hit;
     }
-    HitResult hit = { false, cellInt, cellInt + 0.5f };
-    return hit;
-}
 
-HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
-{
     float3 cell = from;
     int3 cellInt = int3(floor(from));
     float distance = 0;
@@ -141,14 +120,14 @@ HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, b
             break;
         if (maxDistance > 0 && distance > maxDistance)
             break;
-
+#if USE_MIPMAP
         // Mip Level 2: Hyper Block
         if (!OM.isSolidHyperBlock(cellInt))
         {
             distance += leaveHyperBlock(cell, cellInt, directions, direction, reciprocal_direction);
             continue;
         }
-
+#endif
         // Mip Level 1: Block
         if (!OM.isSolidBlock(cellInt))
         {
@@ -164,21 +143,6 @@ HitResult rayMarching_Mipmap(float3 from, float3 direction, float maxDistance, b
     }
     HitResult hit = { false, cellInt, cellInt + 0.5f };
     return hit;
-}
-
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
-{
-    direction = normalizeSafe(direction);
-    if (all(direction == float3(0)))
-    {
-        HitResult hit = { false, int3(from), from };
-        return hit;
-    }
-#if USE_MIP_MAP
-    return rayMarching_Mipmap(from, direction, maxDistance, ignoreFirst);
-#else
-    return rayMarching_DDA(from, direction, maxDistance, ignoreFirst);
-#endif
 }
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction)
