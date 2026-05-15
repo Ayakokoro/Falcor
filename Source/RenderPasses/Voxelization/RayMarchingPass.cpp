@@ -120,7 +120,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mpFullScreenPass->addDefine("CHECK_ELLIPSOID", mCheckEllipsoid ? "1" : "0");
         mpFullScreenPass->addDefine("CHECK_VISIBILITY", mCheckVisibility ? "1" : "0");
         mpFullScreenPass->addDefine("CHECK_COVERAGE", mCheckCoverage ? "1" : "0");
-        mpFullScreenPass->addDefine("USE_MIP_MAP", mUseMipmap ? "1" : "0");
+        mpFullScreenPass->addDefine("USE_MIPMAP", mUseMipmap ? "1" : "0");
         mpFullScreenPass->addDefine("DEBUG", mDebug ? "1" : "0");
         mpFullScreenPass->addDefine("MAX_BOUNCE", std::to_string(mMaxBounce));
 
