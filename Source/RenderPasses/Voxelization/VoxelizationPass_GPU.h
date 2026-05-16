@@ -15,21 +15,32 @@ public:
     }
 
     VoxelizationPass_GPU(ref<Device> pDevice, const Properties& props);
+    virtual ~VoxelizationPass_GPU() = default;
 
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
-    virtual void voxelize(RenderContext* pRenderContext, const RenderData& renderData) override;
-    virtual void sample(RenderContext* pRenderContext, const RenderData& renderData) override;
+    virtual void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData) override;
+    virtual void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData) override;
     virtual void renderUI(Gui::Widgets& widget) override;
     virtual std::string getFileName() override;
 
 private:
     uint maxSolidVoxelCount;
-    ref<ComputePass> mSampleMeshPass;
-    ref<ComputePass> mClipPolygonPass;
+    ref<ComputePass> mLoadMeshPass;         // LoadMesh.cs.slang (flat buffers)
+    ref<ComputePass> mClipTrianglePass;       // ClipTriangle.cs.slang (two-pass GPU clipping)
 
-    ref<Buffer> vBuffer; // GPU上的vBuffer对于CPU管线来说不需要
-    ref<Buffer> polygonCountBuffer;
+    ref<Buffer> vBuffer;                     // int per voxel: cell -> gBuffer offset
+    ref<Buffer> polygonCountBuffer;           // uint per solid voxel: polygon count
+    ref<Buffer> solidVoxelCount;             // single-element: total solid voxel count
+    ref<Buffer> mPolygonBuffer;               // GPU polygon buffer (ClipTriangle Pass 2 writes here)
+    ref<Buffer> mPolygonRangeBufferGPU;       // polygonRangeBuffer GPU 版本
+
+    // Flat buffers for LoadMesh.cs.slang
+    ref<Buffer> positions;
+    ref<Buffer> normals;
+    ref<Buffer> texCoords;
+    ref<Buffer> triangles;
+
     std::vector<uint> vBuffer_CPU;
     double mSolidRate;
 };

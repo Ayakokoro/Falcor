@@ -5,9 +5,7 @@ namespace
 const std::string kLoadMeshProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/LoadMesh.cs.slang";
 }; // namespace
 
-VoxelizationPass_CPU::VoxelizationPass_CPU(ref<Device> pDevice, const Properties& props) : VoxelizationPass(pDevice, props)
-{
-}
+VoxelizationPass_CPU::VoxelizationPass_CPU(ref<Device> pDevice, const Properties& props) : VoxelizationPass(pDevice, props) {}
 
 void VoxelizationPass_CPU::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
@@ -15,7 +13,7 @@ void VoxelizationPass_CPU::setScene(RenderContext* pRenderContext, const ref<Sce
     mLoadMeshPass = nullptr;
 }
 
-void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderData& renderData)
+void VoxelizationPass_CPU::clipPolygon(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (!mLoadMeshPass)
     {
@@ -33,7 +31,7 @@ void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderD
     uint meshCount = mpScene->getMeshCount();
     uint vertexCount = 0;
     uint triangleCount = 0;
-    for (MeshID meshID{ 0 }; meshID.get() < meshCount; ++meshID)
+    for (MeshID meshID{0}; meshID.get() < meshCount; ++meshID)
     {
         MeshDesc meshDesc = mpScene->getMesh(meshID);
         vertexCount += meshDesc.vertexCount;
@@ -54,10 +52,10 @@ void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderD
     var["texCoords"] = texCoords;
     var["triangles"] = triangles;
     uint triangleOffset = 0;
-    for (MeshID meshID{ 0 }; meshID.get() < meshCount; ++meshID)
+    for (MeshID meshID{0}; meshID.get() < meshCount; ++meshID)
     {
         MeshDesc meshDesc = mpScene->getMesh(meshID);
-        MeshHeader mesh = { meshID.get(), meshDesc.materialID, meshDesc.vertexCount, meshDesc.getTriangleCount(), triangleOffset};
+        MeshHeader mesh = {meshID.get(), meshDesc.materialID, meshDesc.vertexCount, meshDesc.getTriangleCount(), triangleOffset};
         meshList.push_back(mesh);
 
         auto meshData = mLoadMeshPass->getRootVar()["MeshData"];
@@ -82,7 +80,7 @@ void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderD
     float3* pNormal = reinterpret_cast<float3*>(cpuNormals->map());
     float2* pUV = reinterpret_cast<float2*>(cpuTexCoords->map());
     uint3* pTri = reinterpret_cast<uint3*>(cpuTriangles->map());
-    SceneHeader header = { meshCount, vertexCount, triangleCount };
+    SceneHeader header = {meshCount, vertexCount, triangleCount};
 
     Tools::Profiler::BeginSample("Clip");
     polygonGenerator.reset();
@@ -99,9 +97,7 @@ void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderD
     gBuffer->setBlob(polygonGenerator.gBuffer.data(), 0, gridData.solidVoxelCount * sizeof(VoxelData));
 
     polygonRangeBuffer = mpDevice->createStructuredBuffer(
-        sizeof(PolygonRange),
-        gridData.solidVoxelCount,
-        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+        sizeof(PolygonRange), gridData.solidVoxelCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
     polygonRangeBuffer->setBlob(polygonGenerator.polygonRangeBuffer.data(), 0, gridData.solidVoxelCount * sizeof(PolygonRange));
 
@@ -110,9 +106,9 @@ void VoxelizationPass_CPU::voxelize(RenderContext* pRenderContext, const RenderD
     pRenderContext->submit(true);
 }
 
-void VoxelizationPass_CPU::sample(RenderContext* pRenderContext, const RenderData& renderData)
+void VoxelizationPass_CPU::analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    VoxelizationPass::sample(pRenderContext, renderData);
+    VoxelizationPass::analyzePolygon(pRenderContext, renderData);
 }
 
 void VoxelizationPass_CPU::renderUI(Gui::Widgets& widget)

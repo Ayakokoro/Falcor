@@ -16,8 +16,8 @@ public:
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
-    virtual void voxelize(RenderContext* pRenderContext, const RenderData& renderData);
-    virtual void sample(RenderContext* pRenderContext, const RenderData& renderData);
+    virtual void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
+    virtual void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
     virtual std::string getFileName();
 
 protected:

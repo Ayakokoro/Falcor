@@ -221,31 +221,28 @@ public:
         flushCurrent();
     }
 
-    // 预分配空间，用于GPU上裁剪之前
-    void reserve(std::vector<uint>& polygonCountBuffer, std::vector<PolygonRange>& polygonRangeBuffer)
+    // From GPU ClipTriangle Pass 2 buffer initialization (no repacking)
+    // polygonRanges filled by caller after Pass 1: localHead/count/cellInt
+    void adoptBuffer(ref<Buffer> polygonBufferGPU, std::vector<PolygonRange>& polygonRanges, uint solidVoxelCount)
     {
-        FALCOR_ASSERT(polygonRangeBuffer.size() == polygonCountBuffer.size());
         reset();
-        for (size_t v = 0; v < polygonRangeBuffer.size(); ++v)
+        gBufferOffsets.push_back(0);
+        voxelCount.push_back(solidVoxelCount);
+        polygonCount.push_back(0);
+        mBuffers.push_back(polygonBufferGPU);
+    }
+
+    // Set localHead/count for each solid voxel based on polygonCounts
+    // polygonRanges[voxelOffset].localHead = local polygon start index
+    // polygonRanges[voxelOffset].count = number of polygons in this voxel
+    void reserve(const std::vector<uint>& polygonCounts, std::vector<PolygonRange>& polygonRanges)
+    {
+        uint localHead = 0;
+        for (size_t i = 0; i < polygonCounts.size(); ++i)
         {
-            const uint n = polygonCountBuffer[v]; // GPU上第一遍仅统计个数
-
-            FALCOR_ASSERT(n > 0 && n <= maxPolygonCount);
-
-            if (currentPolygonCount + n > maxPolygonCount)
-            {
-                flushCurrent();
-            }
-
-            polygonRangeBuffer[v].count = n;
-            polygonRangeBuffer[v].localHead = currentPolygonCount;
-            gridData.maxPolygonCount = max(gridData.maxPolygonCount, n);
-            gridData.totalPolygonCount += n;
-
-            currentPolygonCount += n;
-            currentVoxelCount++;
+            polygonRanges[i].localHead = localHead;
+            polygonRanges[i].count = polygonCounts[i];
+            localHead += polygonCounts[i];
         }
-
-        flushCurrent();
     }
 };

@@ -27,16 +27,14 @@ void loadTriangle(uint triangleId)
         return;
 
     uint3 triangle = gScene.getLocalIndices(ibOffset, triangleId, use16BitIndices);
-    triangle += vbOffset;
+    triangle += vbOffset; // adjust to flat buffer index space
     triangles[triangleId + triOffset] = triangle;
-    uint indices[3] = { triangle.x, triangle.y, triangle.z };
     for (uint i = 0; i < 3; i++)
     {
-        uint index = indices[i];
-        StaticVertexData vertex = gScene.getVertex(index);
-        positions[index] = vertex.position;
-        texCoords[index] = vertex.texCrd;
-        normals[index] = vertex.normal;
+        StaticVertexData vertex = gScene.getVertex(triangle[i]);
+        positions[triangle[i]] = vertex.position;
+        texCoords[triangle[i]] = vertex.texCrd;
+        normals[triangle[i]] = vertex.normal;
     }
 }
 

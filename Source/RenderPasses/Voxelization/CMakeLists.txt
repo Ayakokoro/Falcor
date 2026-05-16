@@ -32,13 +32,12 @@ target_sources(Voxelization PRIVATE
 
     VoxelizationPass_CPU.cpp
     VoxelizationPass_CPU.h
-    MeshSampler.h
+    PolygonGenerator.h
     LoadMesh.cs.slang
 
     VoxelizationPass_GPU.cpp
     VoxelizationPass_GPU.h
-    SampleMesh.cs.slang
-    ClipMesh.cs.slang
+    ClipTriangle.cs.slang
 
     RayMarchingPass.cpp
     RayMarchingPass.h

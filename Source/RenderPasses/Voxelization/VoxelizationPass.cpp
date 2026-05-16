@@ -46,7 +46,7 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
 
     if (!mVoxelizationComplete)
     {
-        voxelize(pRenderContext, renderData);
+        clipPolygon(pRenderContext, renderData);
         mVoxelizationComplete = true;
 
         blockMap = mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.blockTextureCount(), ResourceBindFlags::UnorderedAccess);
@@ -58,11 +58,36 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
     }
     else
     {
-        if (mCompleteTimes < polygonGroup.size())
+        std::cout << "[execute] mCompleteTimes=" << mCompleteTimes
+                  << " polygonGroup.size=" << polygonGroup.size()
+                  << " groupVoxelCount=" << (polygonGroup.size() > 0 ? polygonGroup.getVoxelCount(mCompleteTimes) : 0) << std::endl;
+        if (polygonGroup.size() == 0)
+        {
+            // No polygons to analyze (e.g. empty scene or no solid voxels) - skip directly to Write File
+            pRenderContext->submit(true);
+
+            Tools::Profiler::BeginSample("Write File");
+            ref<Buffer> cpuGBuffer = copyToCpu(mpDevice, pRenderContext, gBuffer);
+            ref<Buffer> cpuBlockMap = copyToCpu(mpDevice, pRenderContext, blockMap);
+            ref<Buffer> cpuHyperBlockMap = copyToCpu(mpDevice, pRenderContext, hyperBlockMap);
+            pRenderContext->submit(true);
+            void* pGBuffer_CPU = cpuGBuffer->map();
+            void* pBlockMap_CPU = cpuBlockMap->map();
+            void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
+            write(getFileName(), pGBuffer_CPU, pVBuffer_CPU, pBlockMap_CPU, pHyperBlockMap_CPU);
+            cpuGBuffer->unmap();
+            cpuBlockMap->unmap();
+            cpuHyperBlockMap->unmap();
+            mSamplingComplete = true;
+            Tools::Profiler::EndSample("Write File");
+            Tools::Profiler::Print();
+            Tools::Profiler::Reset();
+        }
+        else if (mCompleteTimes < polygonGroup.size())
         {
             if (mCompleteTimes == 0)
                 Tools::Profiler::BeginSample("Analyze Polygon");
-            sample(pRenderContext, renderData);
+            analyzePolygon(pRenderContext, renderData);
             mCompleteTimes++;
         }
         else
@@ -140,9 +165,9 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
 }
 
-void VoxelizationPass::voxelize(RenderContext* pRenderContext, const RenderData& renderData) {}
+void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderData& renderData) {}
 
-void VoxelizationPass::sample(RenderContext* pRenderContext, const RenderData& renderData)
+void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData)
 {
     if (!mAnalyzePolygonPass)
     {
