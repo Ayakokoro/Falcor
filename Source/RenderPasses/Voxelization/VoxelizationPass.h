@@ -19,6 +19,7 @@ public:
     virtual void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
     virtual void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
     virtual std::string getFileName();
+    virtual void* getVBufferCPU() const = 0;
 
 protected:
     void write(std::string fileName, void* gBuffer, void* vBuffer, void* pBlockMap, void* pHyperBlockMap);
@@ -35,9 +36,6 @@ protected:
     ref<Buffer> blockMap;
     ref<Buffer> hyperBlockMap;
 
-    void* pVBuffer_CPU;
-
-    uint mSceneNameIndex;
     uint mSampleFrequency;
     uint mVoxelResolution; // X,Y,Z三个方向中，最长的边被划分的体素数量
     GridData& gridData;

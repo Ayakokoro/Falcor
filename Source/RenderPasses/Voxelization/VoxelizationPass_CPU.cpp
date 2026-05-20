@@ -114,9 +114,24 @@ void VoxelizationPass_CPU::analyzePolygon(RenderContext* pRenderContext, const R
 void VoxelizationPass_CPU::renderUI(Gui::Widgets& widget)
 {
     VoxelizationPass::renderUI(widget);
+
+    static const uint polygonPerFrames[] = {1000, 4000, 16000, 64000, 128000, 256000, 512000, 1024000};
+    {
+        Gui::DropdownList list;
+        for (uint32_t i = 0; i < sizeof(polygonPerFrames) / sizeof(uint); i++)
+        {
+            list.push_back({polygonPerFrames[i], std::to_string(polygonPerFrames[i])});
+        }
+        widget.dropdown("Polygon Per Frame", list, polygonGroup.maxPolygonCount);
+    }
 }
 
 std::string VoxelizationPass_CPU::getFileName()
 {
     return VoxelizationPass::getFileName() + "_CPU";
+}
+
+void* VoxelizationPass_CPU::getVBufferCPU() const
+{
+    return pVBuffer_CPU;
 }

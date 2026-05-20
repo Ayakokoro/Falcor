@@ -23,8 +23,10 @@ public:
     virtual void renderUI(Gui::Widgets& widget) override;
 
     virtual std::string getFileName() override;
+    virtual void* getVBufferCPU() const override;
 
 private:
     ref<ComputePass> mLoadMeshPass;
     PolygonGenerator polygonGenerator; // TODO:释放内存
+    void* pVBuffer_CPU;
 };

@@ -23,17 +23,19 @@ public:
     virtual void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData) override;
     virtual void renderUI(Gui::Widgets& widget) override;
     virtual std::string getFileName() override;
+    virtual void* getVBufferCPU() const override;
 
 private:
     uint maxSolidVoxelCount;
-    ref<ComputePass> mLoadMeshPass;         // LoadMesh.cs.slang (flat buffers)
-    ref<ComputePass> mClipTrianglePass;       // ClipTriangle.cs.slang (two-pass GPU clipping)
+    ref<ComputePass> mLoadMeshPass;     // LoadMesh.cs.slang (flat buffers)
+    ref<ComputePass> mClipTrianglePass; // ClipTriangle.cs.slang (two-pass GPU clipping)
 
-    ref<Buffer> vBuffer;                     // int per voxel: cell -> gBuffer offset
-    ref<Buffer> polygonCountBuffer;           // uint per solid voxel: polygon count
-    ref<Buffer> solidVoxelCount;             // single-element: total solid voxel count
-    ref<Buffer> mPolygonBuffer;               // GPU polygon buffer (ClipTriangle Pass 2 writes here)
-    ref<Buffer> mPolygonRangeBufferGPU;       // polygonRangeBuffer GPU 版本
+    ref<Buffer> vBuffer;            // int per voxel: cell -> compact solid voxel offset (>=0) or -1 (empty)
+    ref<Buffer> visitedBuffer;      // uint per voxel: 0=unvisited, nonzero=visited by Pass 1 (debug/fallback)
+    ref<Buffer> rawMarkBuffer;      // uint[rawMarkCapacity]: streaming voxel-index output from Pass 1
+    ref<Buffer> rawMarkCounter;     // uint[1]: atomic counter for rawMarkBuffer (read back = only 4 bytes!)
+    ref<Buffer> polygonCountBuffer; // uint per solid voxel: actual polygon count (written by Pass 2)
+    ref<Buffer> mPolygonBuffer;     // GPU polygon buffer (conservative allocation, Pass 2 writes here)
 
     // Flat buffers for LoadMesh.cs.slang
     ref<Buffer> positions;
@@ -41,6 +43,9 @@ private:
     ref<Buffer> texCoords;
     ref<Buffer> triangles;
 
-    std::vector<uint> vBuffer_CPU;
+    std::vector<int> vBuffer_CPU; // CPU mirror of vBuffer
+    void* pVBuffer_CPU;           // CPU pointer for write file (set after clipPolygon)
+
+    std::vector<uint> polygonCounts; // per-solid-voxel polygon count (needed by analyzePolygon)
     double mSolidRate;
 };

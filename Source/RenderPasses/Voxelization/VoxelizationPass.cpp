@@ -9,11 +9,9 @@ const std::string kAnalyzePolygonProgramFile = "E:/Project/Falcor/Source/RenderP
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice), polygonGroup(pDevice, VoxelizationBase::GlobalGridData), gridData(VoxelizationBase::GlobalGridData)
 {
-    mSceneNameIndex = 0;
     mVoxelizationComplete = true;
     mSamplingComplete = true;
     mCompleteTimes = 0;
-    pVBuffer_CPU = nullptr;
 
     mSampleFrequency = 1024;
     mVoxelResolution = 512;
@@ -71,7 +69,7 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
             void* pGBuffer_CPU = cpuGBuffer->map();
             void* pBlockMap_CPU = cpuBlockMap->map();
             void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
-            write(getFileName(), pGBuffer_CPU, pVBuffer_CPU, pBlockMap_CPU, pHyperBlockMap_CPU);
+            write(getFileName(), pGBuffer_CPU, getVBufferCPU(), pBlockMap_CPU, pHyperBlockMap_CPU);
             cpuGBuffer->unmap();
             cpuBlockMap->unmap();
             cpuHyperBlockMap->unmap();
@@ -100,7 +98,7 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
             void* pGBuffer_CPU = cpuGBuffer->map();
             void* pBlockMap_CPU = cpuBlockMap->map();
             void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
-            write(getFileName(), pGBuffer_CPU, pVBuffer_CPU, pBlockMap_CPU, pHyperBlockMap_CPU);
+            write(getFileName(), pGBuffer_CPU, getVBufferCPU(), pBlockMap_CPU, pHyperBlockMap_CPU);
             cpuGBuffer->unmap();
             cpuBlockMap->unmap();
             cpuHyperBlockMap->unmap();
@@ -133,17 +131,7 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             list.push_back({sampleFrequencies[i], std::to_string(sampleFrequencies[i])});
         }
         widget.dropdown("Sample Frequency", list, mSampleFrequency);
-    }
-
-    static const uint polygonPerFrames[] = {1000, 4000, 16000, 64000, 128000, 256000, 512000, 1024000};
-    {
-        Gui::DropdownList list;
-        for (uint32_t i = 0; i < sizeof(polygonPerFrames) / sizeof(uint); i++)
-        {
-            list.push_back({polygonPerFrames[i], std::to_string(polygonPerFrames[i])});
-        }
-        widget.dropdown("Polygon Per Frame", list, polygonGroup.maxPolygonCount);
-    }
+}
 
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
