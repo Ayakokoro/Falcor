@@ -56,11 +56,8 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
             mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.hyperBlockTextureCount(), ResourceBindFlags::UnorderedAccess);
         pRenderContext->clearUAV(hyperBlockMap->getUAV().get(), uint4(0));
     }
-    else
+        else
     {
-        std::cout << "[execute] mCompleteTimes=" << mCompleteTimes
-                  << " polygonGroup.size=" << polygonGroup.size()
-                  << " groupVoxelCount=" << (polygonGroup.size() > 0 ? polygonGroup.getVoxelCount(mCompleteTimes) : 0) << std::endl;
         if (polygonGroup.size() == 0)
         {
             // No polygons to analyze (e.g. empty scene or no solid voxels) - skip directly to Write File
@@ -192,6 +189,7 @@ void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const Rende
     var[kHyperBlockMap] = hyperBlockMap;
 
     uint groupVoxelCount = polygonGroup.getVoxelCount(mCompleteTimes);
+
     auto cb = var["CB"];
     cb["groupVoxelCount"] = groupVoxelCount;
     cb["sampleFrequency"] = mSampleFrequency;
