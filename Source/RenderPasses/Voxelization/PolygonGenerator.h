@@ -16,6 +16,14 @@ private:
     GridData& gridData;
     std::mutex mtx;
 
+    struct PendingClip
+    {
+        int3 cellInt;
+        Polygon poly;
+    };
+
+    static constexpr uint kFlushBatchSize = 4096;
+
 public:
     std::vector<VoxelData> gBuffer;
     std::vector<int> vBuffer;
@@ -55,6 +63,8 @@ public:
         return vBuffer[index];
     }
 
+    // ---- 单线程路径 ----
+
     void clip(const MeshHeader& mesh, uint triangleID, Triangle& tri)
     {
         AABBInt aabb = tri.calcAABBInt();
@@ -62,19 +72,15 @@ public:
         {
             int3 cellInt = aabb.indexToCell(i);
             float3 minPoint = float3(cellInt);
-            Polygon polygon = VoxelizationUtility::BoxClipTriangle(minPoint, minPoint + 1.f, tri); // 多边形与三角形顶点顺序一致
-            polygon.normal = tri.TBN.getCol(2);                                                    // 几何法线
+            Polygon polygon = VoxelizationUtility::BoxClipTriangle(minPoint, minPoint + 1.f, tri);
+            polygon.normal = tri.TBN.getCol(2);
             if (polygon.count >= 3)
             {
-                // sampleArea(tri, polygon, cellInt);
                 polygon.triRef.meshID = mesh.meshID;
                 polygon.triRef.triangleID = triangleID;
                 polygon.triRef.materialID = mesh.materialID;
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    int offset = tryGetOffset(cellInt);
-                    polygonArrays[offset].push_back(polygon);
-                }
+                int offset = tryGetOffset(cellInt);
+                polygonArrays[offset].push_back(polygon);
             }
         }
     }
@@ -95,14 +101,76 @@ public:
             tri.normals[1] = pNormal[indices.y];
             tri.normals[2] = pNormal[indices.z];
 
-            // 世界坐标处理成网格坐标
             for (int i = 0; i < 3; i++)
-            {
                 tri.vertices[i] = (tri.vertices[i] - gridData.gridMin) / gridData.voxelSize;
-            }
             tri.buildTBN();
             clip(mesh, tid, tri);
         }
+    }
+
+    // ---- 多线程路径 ----
+
+    // 无锁裁剪：结果写入线程本地 pending buffer
+    void clipNoLock(const MeshHeader& mesh, uint triangleID, Triangle& tri, std::vector<PendingClip>& pending)
+    {
+        AABBInt aabb = tri.calcAABBInt();
+        for (int i = 0; i < aabb.count(); i++)
+        {
+            int3 cellInt = aabb.indexToCell(i);
+            float3 minPoint = float3(cellInt);
+            Polygon polygon = VoxelizationUtility::BoxClipTriangle(minPoint, minPoint + 1.f, tri);
+            polygon.normal = tri.TBN.getCol(2);
+            if (polygon.count >= 3)
+            {
+                polygon.triRef.meshID = mesh.meshID;
+                polygon.triRef.triangleID = triangleID;
+                polygon.triRef.materialID = mesh.materialID;
+                pending.push_back({cellInt, polygon});
+            }
+        }
+    }
+
+    // 批量写入全局容器（加锁一次）
+    void flushPending(std::vector<PendingClip>& pending)
+    {
+        if (pending.empty())
+            return;
+        std::lock_guard<std::mutex> lock(mtx);
+        for (auto& p : pending)
+        {
+            int offset = tryGetOffset(p.cellInt);
+            polygonArrays[offset].push_back(p.poly);
+        }
+        pending.clear();
+    }
+
+    void clipMeshThreaded(const MeshHeader& mesh, float3* pPos, float3* pNormal, float2* pUV, uint3* pIndex)
+    {
+        std::vector<PendingClip> pending;
+
+        for (uint tid = 0; tid < mesh.triangleCount; tid++)
+        {
+            Triangle tri = {};
+            uint3 indices = pIndex[tid + mesh.triangleOffset];
+            tri.vertices[0] = pPos[indices.x];
+            tri.vertices[1] = pPos[indices.y];
+            tri.vertices[2] = pPos[indices.z];
+            tri.uvs[0] = pUV[indices.x];
+            tri.uvs[1] = pUV[indices.y];
+            tri.uvs[2] = pUV[indices.z];
+            tri.normals[0] = pNormal[indices.x];
+            tri.normals[1] = pNormal[indices.y];
+            tri.normals[2] = pNormal[indices.z];
+
+            for (int i = 0; i < 3; i++)
+                tri.vertices[i] = (tri.vertices[i] - gridData.gridMin) / gridData.voxelSize;
+            tri.buildTBN();
+            clipNoLock(mesh, tid, tri, pending);
+
+            if (pending.size() >= kFlushBatchSize)
+                flushPending(pending);
+        }
+        flushPending(pending);
     }
 
     void clipAll(SceneHeader scene, std::vector<MeshHeader> meshList, float3* pPos, float3* pNormal, float2* pUV, uint3* pTri,
@@ -129,7 +197,7 @@ public:
                                             const std::vector<MeshHeader>* pMeshList,
                                             float3* pPos_, float3* pNormal_, float2* pUV_, uint3* pTri_) {
                     for (size_t i = begin_; i < end_; i++)
-                        clipMesh((*pMeshList)[i], pPos_, pNormal_, pUV_, pTri_);
+                        clipMeshThreaded((*pMeshList)[i], pPos_, pNormal_, pUV_, pTri_);
                 }, begin, end, &meshList, pPos, pNormal, pUV, pTri);
             }
 

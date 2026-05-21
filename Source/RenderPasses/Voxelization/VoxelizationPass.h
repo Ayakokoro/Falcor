@@ -55,5 +55,6 @@ protected:
 
     bool mSamplingComplete;
     bool mVoxelizationComplete;
+    bool mUseMultiThread = true;
     uint mCompleteTimes;
 };

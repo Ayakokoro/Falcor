@@ -145,6 +145,8 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         widget.dropdown("Polygon Per Frame", list, polygonGroup.maxPolygonCount);
     }
 
+    widget.checkbox("Multi-threaded Clip", mUseMultiThread);
+
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
@@ -234,7 +236,7 @@ void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderDa
 
     Tools::Profiler::BeginSample("Clip");
     polygonGenerator.reset();
-    polygonGenerator.clipAll(header, meshList, pPos, pNormal, pUV, pTri);
+    polygonGenerator.clipAll(header, meshList, pPos, pNormal, pUV, pTri, mUseMultiThread ? 0 : 1);
     Tools::Profiler::EndSample("Clip");
 
     polygonGroup.setBlob(polygonGenerator.polygonArrays, polygonGenerator.polygonRangeBuffer);
