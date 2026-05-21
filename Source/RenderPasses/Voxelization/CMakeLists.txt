@@ -29,15 +29,8 @@ target_sources(Voxelization PRIVATE
     VoxelizationPass.cpp
     VoxelizationPass.h
     AnalyzePolygon.cs.slang
-
-    VoxelizationPass_CPU.cpp
-    VoxelizationPass_CPU.h
     PolygonGenerator.h
     LoadMesh.cs.slang
-
-    VoxelizationPass_GPU.cpp
-    VoxelizationPass_GPU.h
-    ClipTriangle.cs.slang
 
     RayMarchingPass.cpp
     RayMarchingPass.h

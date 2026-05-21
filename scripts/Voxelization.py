@@ -3,7 +3,7 @@ import falcor
 def render_graph_Pass():
     g = RenderGraph("Voxelization")
 
-    voxel_pass = createPass("VoxelizationPass_GPU")
+    voxel_pass = createPass("VoxelizationPass")
     read_pass = createPass("ReadVoxelPass")
     marching_pass = createPass("RayMarchingPass")
     viewport_pass = createPass("RenderToViewportPass")
@@ -28,7 +28,7 @@ def render_graph_Pass():
     g.addEdge("RenderToViewportPass.output","AccumulatePass.input")
     g.addEdge("AccumulatePass.output", "ToneMapper.src")
     g.markOutput("ToneMapper.dst")
-    
+
     return g
 
 Graph = render_graph_Pass()

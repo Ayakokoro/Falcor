@@ -1,11 +1,19 @@
 #pragma once
 #include "VoxelizationBase.h"
+#include "PolygonGenerator.h"
 
 using namespace Falcor;
 
 class VoxelizationPass : public RenderPass
 {
 public:
+    FALCOR_PLUGIN_CLASS(VoxelizationPass, "VoxelizationPass", "Voxelization pass with CPU clipping + GPU BSDF analysis.");
+
+    static ref<VoxelizationPass> create(ref<Device> pDevice, const Properties& props)
+    {
+        return make_ref<VoxelizationPass>(pDevice, props);
+    }
+
     VoxelizationPass(ref<Device> pDevice, const Properties& props);
 
     virtual RenderPassReflection reflect(const CompileData& compileData) override;
@@ -16,14 +24,16 @@ public:
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
-    virtual void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
-    virtual void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
-    virtual std::string getFileName();
-    virtual void* getVBufferCPU() const = 0;
+    void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
+    void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
+    std::string getFileName();
+    void* getVBufferCPU() const { return pVBuffer_CPU; }
 
 protected:
     void write(std::string fileName, void* gBuffer, void* vBuffer, void* pBlockMap, void* pHyperBlockMap);
+
     ref<ComputePass> mAnalyzePolygonPass;
+    ref<ComputePass> mLoadMeshPass;
 
     ref<Device> mpDevice;
     ref<Scene> mpScene;
@@ -36,8 +46,11 @@ protected:
     ref<Buffer> blockMap;
     ref<Buffer> hyperBlockMap;
 
+    PolygonGenerator polygonGenerator;
+    void* pVBuffer_CPU;
+
     uint mSampleFrequency;
-    uint mVoxelResolution; // X,Y,Z三个方向中，最长的边被划分的体素数量
+    uint mVoxelResolution;
     GridData& gridData;
 
     bool mSamplingComplete;

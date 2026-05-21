@@ -4,6 +4,7 @@
 namespace
 {
 const std::string kAnalyzePolygonProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
+const std::string kLoadMeshProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/LoadMesh.cs.slang";
 }; // namespace
 
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
@@ -25,6 +26,8 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
         .setAddressingMode(TextureAddressingMode::Wrap, TextureAddressingMode::Wrap, TextureAddressingMode::Wrap);
     mpSampler = pDevice->createSampler(samplerDesc);
+
+    pVBuffer_CPU = nullptr;
 }
 
 RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
@@ -58,7 +61,6 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
     {
         if (polygonGroup.size() == 0)
         {
-            // No polygons to analyze (e.g. empty scene or no solid voxels) - skip directly to Write File
             pRenderContext->submit(true);
 
             Tools::Profiler::BeginSample("Write File");
@@ -131,7 +133,17 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             list.push_back({sampleFrequencies[i], std::to_string(sampleFrequencies[i])});
         }
         widget.dropdown("Sample Frequency", list, mSampleFrequency);
-}
+    }
+
+    static const uint polygonPerFrames[] = {1000, 4000, 16000, 64000, 128000, 256000, 512000, 1024000};
+    {
+        Gui::DropdownList list;
+        for (uint32_t i = 0; i < sizeof(polygonPerFrames) / sizeof(uint); i++)
+        {
+            list.push_back({polygonPerFrames[i], std::to_string(polygonPerFrames[i])});
+        }
+        widget.dropdown("Polygon Per Frame", list, polygonGroup.maxPolygonCount);
+    }
 
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
@@ -147,10 +159,102 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
 {
     mpScene = pScene;
     mAnalyzePolygonPass = nullptr;
+    mLoadMeshPass = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
 }
 
-void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderData& renderData) {}
+void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    if (!mLoadMeshPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kLoadMeshProgramFile).csEntry("main");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+
+        DefineList defines;
+        defines.add(mpScene->getSceneDefines());
+
+        mLoadMeshPass = ComputePass::create(mpDevice, desc, defines, true);
+    }
+
+    uint meshCount = mpScene->getMeshCount();
+    uint vertexCount = 0;
+    uint triangleCount = 0;
+    for (MeshID meshID{0}; meshID.get() < meshCount; ++meshID)
+    {
+        MeshDesc meshDesc = mpScene->getMesh(meshID);
+        vertexCount += meshDesc.vertexCount;
+        triangleCount += meshDesc.getTriangleCount();
+    }
+
+    ref<Buffer> positions = mpDevice->createStructuredBuffer(sizeof(float3), vertexCount, ResourceBindFlags::UnorderedAccess);
+    ref<Buffer> normals = mpDevice->createStructuredBuffer(sizeof(float3), vertexCount, ResourceBindFlags::UnorderedAccess);
+    ref<Buffer> texCoords = mpDevice->createStructuredBuffer(sizeof(float2), vertexCount, ResourceBindFlags::UnorderedAccess);
+    ref<Buffer> triangles = mpDevice->createStructuredBuffer(sizeof(uint3), triangleCount, ResourceBindFlags::UnorderedAccess);
+
+    std::vector<MeshHeader> meshList;
+
+    ShaderVar var = mLoadMeshPass->getRootVar();
+    mpScene->bindShaderData(var["gScene"]);
+    var["positions"] = positions;
+    var["normals"] = normals;
+    var["texCoords"] = texCoords;
+    var["triangles"] = triangles;
+    uint triangleOffset = 0;
+    for (MeshID meshID{0}; meshID.get() < meshCount; ++meshID)
+    {
+        MeshDesc meshDesc = mpScene->getMesh(meshID);
+        MeshHeader mesh = {meshID.get(), meshDesc.materialID, meshDesc.vertexCount, meshDesc.getTriangleCount(), triangleOffset};
+        meshList.push_back(mesh);
+
+        auto meshData = mLoadMeshPass->getRootVar()["MeshData"];
+        meshData["vertexCount"] = meshDesc.vertexCount;
+        meshData["vbOffset"] = meshDesc.vbOffset;
+        meshData["triangleCount"] = meshDesc.getTriangleCount();
+        meshData["ibOffset"] = meshDesc.ibOffset;
+        meshData["triOffset"] = triangleOffset;
+        meshData["use16BitIndices"] = meshDesc.use16BitIndices();
+        mLoadMeshPass->execute(pRenderContext, uint3(meshDesc.getTriangleCount(), 1, 1));
+
+        triangleOffset += meshDesc.getTriangleCount();
+    }
+
+    ref<Buffer> cpuPositions = copyToCpu(mpDevice, pRenderContext, positions);
+    ref<Buffer> cpuNormals = copyToCpu(mpDevice, pRenderContext, normals);
+    ref<Buffer> cpuTexCoords = copyToCpu(mpDevice, pRenderContext, texCoords);
+    ref<Buffer> cpuTriangles = copyToCpu(mpDevice, pRenderContext, triangles);
+    pRenderContext->submit(true);
+
+    float3* pPos = reinterpret_cast<float3*>(cpuPositions->map());
+    float3* pNormal = reinterpret_cast<float3*>(cpuNormals->map());
+    float2* pUV = reinterpret_cast<float2*>(cpuTexCoords->map());
+    uint3* pTri = reinterpret_cast<uint3*>(cpuTriangles->map());
+    SceneHeader header = {meshCount, vertexCount, triangleCount};
+
+    Tools::Profiler::BeginSample("Clip");
+    polygonGenerator.reset();
+    polygonGenerator.clipAll(header, meshList, pPos, pNormal, pUV, pTri);
+    Tools::Profiler::EndSample("Clip");
+
+    polygonGroup.setBlob(polygonGenerator.polygonArrays, polygonGenerator.polygonRangeBuffer);
+    cpuPositions->unmap();
+    cpuNormals->unmap();
+    cpuTexCoords->unmap();
+    cpuTriangles->unmap();
+
+    gBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), gridData.solidVoxelCount, ResourceBindFlags::UnorderedAccess);
+    gBuffer->setBlob(polygonGenerator.gBuffer.data(), 0, gridData.solidVoxelCount * sizeof(VoxelData));
+
+    polygonRangeBuffer = mpDevice->createStructuredBuffer(
+        sizeof(PolygonRange), gridData.solidVoxelCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    polygonRangeBuffer->setBlob(polygonGenerator.polygonRangeBuffer.data(), 0, gridData.solidVoxelCount * sizeof(PolygonRange));
+
+    pVBuffer_CPU = polygonGenerator.vBuffer.data();
+
+    pRenderContext->submit(true);
+}
 
 void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData)
 {
@@ -190,7 +294,7 @@ void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const Rende
     cb_grid["voxelSize"] = gridData.voxelSize;
     cb_grid["voxelCount"] = gridData.voxelCount;
 
-    mAnalyzePolygonPass->execute(pRenderContext, uint3(groupVoxelCount, 1, 1)); // 每个体素执行一次，没有同步问题
+    mAnalyzePolygonPass->execute(pRenderContext, uint3(groupVoxelCount, 1, 1));
 }
 
 static std::string trim_non_alnum_ends(std::string s)
