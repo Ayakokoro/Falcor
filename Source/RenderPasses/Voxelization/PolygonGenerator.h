@@ -5,6 +5,8 @@
 #include "Math/Triangle.slang"
 #include "Math/SphericalHarmonics.slang"
 #include <unordered_map>
+#include <mutex>
+#include <thread>
 
 using namespace Falcor;
 
@@ -12,6 +14,7 @@ class PolygonGenerator
 {
 private:
     GridData& gridData;
+    std::mutex mtx;
 
 public:
     std::vector<VoxelData> gBuffer;
@@ -67,8 +70,11 @@ public:
                 polygon.triRef.meshID = mesh.meshID;
                 polygon.triRef.triangleID = triangleID;
                 polygon.triRef.materialID = mesh.materialID;
-                int offset = tryGetOffset(cellInt);
-                polygonArrays[offset].push_back(polygon);
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    int offset = tryGetOffset(cellInt);
+                    polygonArrays[offset].push_back(polygon);
+                }
             }
         }
     }
@@ -99,12 +105,38 @@ public:
         }
     }
 
-    void clipAll(SceneHeader scene, std::vector<MeshHeader> meshList, float3* pPos, float3* pNormal, float2* pUV, uint3* pTri)
+    void clipAll(SceneHeader scene, std::vector<MeshHeader> meshList, float3* pPos, float3* pNormal, float2* pUV, uint3* pTri,
+                 uint numThreads = 0)
     {
-        for (size_t i = 0; i < meshList.size(); i++)
+        if (numThreads == 0)
+            numThreads = std::max(1u, std::thread::hardware_concurrency());
+
+        if (numThreads <= 1 || meshList.size() <= 1)
         {
-            clipMesh(meshList[i], pPos, pNormal, pUV, pTri);
+            for (size_t i = 0; i < meshList.size(); i++)
+                clipMesh(meshList[i], pPos, pNormal, pUV, pTri);
         }
+        else
+        {
+            std::vector<std::thread> threads;
+            size_t chunkSize = (meshList.size() + numThreads - 1) / numThreads;
+
+            for (uint t = 0; t < numThreads && t * chunkSize < meshList.size(); t++)
+            {
+                size_t begin = t * chunkSize;
+                size_t end = std::min(begin + chunkSize, meshList.size());
+                threads.emplace_back([this](size_t begin_, size_t end_,
+                                            const std::vector<MeshHeader>* pMeshList,
+                                            float3* pPos_, float3* pNormal_, float2* pUV_, uint3* pTri_) {
+                    for (size_t i = begin_; i < end_; i++)
+                        clipMesh((*pMeshList)[i], pPos_, pNormal_, pUV_, pTri_);
+                }, begin, end, &meshList, pPos, pNormal, pUV, pTri);
+            }
+
+            for (auto& th : threads)
+                th.join();
+        }
+
         gridData.solidVoxelCount = gBuffer.size();
     }
 };
