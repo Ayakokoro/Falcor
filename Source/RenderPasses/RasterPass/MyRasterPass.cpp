@@ -42,7 +42,7 @@ const std::string kInputEmissive = "emissive";
 const std::string kInputViewW = "viewW";
 const std::string kInputMaterial = "mtlData";
 const std::string kOutputColor = "color";
-const std::string kShaderFile = "E:/Project/Falcor/Source/RenderPasses/RasterPass/MyRasterPass.ps.slang";
+const std::string kShaderFile = "RenderPasses/RasterPass/MyRasterPass.ps.slang";
 } // namespace
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)

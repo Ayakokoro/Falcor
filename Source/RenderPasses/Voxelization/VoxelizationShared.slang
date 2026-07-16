@@ -28,4 +28,10 @@ struct VoxelData
     bool IsSolid() { return ABSDF.area > 0; }
 };
 
+struct OctreeNode
+{
+    uint childBase;   // Internal: first child index in next level. Leaf: gBuffer index.
+    uint childMask;   // Bits 0-7: valid children. 0 = leaf node (internal nodes have >=1 child).
+};
+
 END_NAMESPACE_FALCOR

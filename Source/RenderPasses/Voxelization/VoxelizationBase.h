@@ -18,6 +18,18 @@ inline std::string ToString(float3 v)
     oss << "(" << v.x << ", " << v.y << ", " << v.z << ")";
     return oss.str();
 }
+
+inline uint nextPowerOfTwo(uint v)
+{
+    if (v <= 1) return 1;
+    v--;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
 inline std::string ToString(int2 v)
 {
     std::ostringstream oss;
@@ -32,12 +44,10 @@ inline std::string ToString(int3 v)
 }
 
 inline std::string kGBuffer = "gBuffer";
-inline std::string kVBuffer = "vBuffer";
 inline std::string kPBuffer = "pBuffer";
+inline std::string kOctreeBuffer = "octreeBuffer";
 inline std::string kPolygonBuffer = "polygonBuffer";
 inline std::string kPolygonRangeBuffer = "polygonRangeBuffer";
-inline std::string kBlockMap = "blockMap";
-inline std::string kHyperBlockMap = "hyperBlockMap";
 
 class VoxelizationBase
 {
@@ -49,36 +59,45 @@ public:
     static std::string ResourceFolder;
     static bool LightChanged;
 
-    static void UpdateVoxelGrid(ref<Scene> scene, uint voxelResolution)
+    static ref<Buffer> GBuffer;
+    static ref<Buffer> PBuffer;
+
+    // Octree data
+    static ref<Buffer> OctreeBuffer;
+    static uint32_t OctreeMaxDepth;
+    static std::vector<uint32_t> OctreeNodeCounts;
+
+    static void UpdateVoxelGrid(ref<Scene> scene, uint baseVoxelResolution)
     {
         float3 diag;
-        float length;
         float3 center;
         if (scene)
         {
             AABB aabb = scene->getSceneBounds();
-            diag = aabb.maxPoint - aabb.minPoint;
-            length = std::max(diag.z, std::max(diag.x, diag.y));
+            // 获取膨胀后的场景尺寸与中心
+            diag = (aabb.maxPoint - aabb.minPoint) * 1.02f; // 引入 2% 的安全边距
             center = aabb.center();
-            diag *= 1.02f;
-            length *= 1.02f;
         }
         else
         {
-            diag = float3(1);
-            length = 1.f;
-            center = float3(0);
+            diag = float3(1.02f);
+            center = float3(0.f);
         }
 
-        GlobalGridData.voxelSize = float3(length / voxelResolution);
-        float3 temp = diag / GlobalGridData.voxelSize;
+        // 强制每个轴的体素数都为同一个 2 的幂次方
+        // 将基础分辨率对齐到最近的 2 的幂
+        uint N = nextPowerOfTwo(baseVoxelResolution);
+        GlobalGridData.voxelCount = uint3(N, N, N);
 
-        GlobalGridData.voxelCount = uint3(
-            (uint)math::ceil(temp.x / MinFactor.x) * MinFactor.x,
-            (uint)math::ceil(temp.y / MinFactor.y) * MinFactor.y,
-            (uint)math::ceil(temp.z / MinFactor.z) * MinFactor.z
-        );
-        GlobalGridData.gridMin = center - 0.5f * GlobalGridData.voxelSize * float3(GlobalGridData.voxelCount);
+        // 找到场景膨胀后的最大边长（作为正方体网格的物理边长）
+        float maxDim = std::max(diag.z, std::max(diag.x, diag.y));
+
+        // 计算单个正方体体素的物理边长
+        float s = maxDim / (float)N;
+        GlobalGridData.voxelSize = float3(s);
+
+        // 以场景中心为原点，计算体素网格的最小角起点（gridMin）
+        GlobalGridData.gridMin = center - 0.5f * s * float3(N);
         GlobalGridData.solidVoxelCount = 0;
     }
 };

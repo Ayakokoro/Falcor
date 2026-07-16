@@ -4,8 +4,7 @@
 
 namespace
 {
-const std::string kPrepareProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/PrepareShadingData.cs.slang";
-
+const std::string kPrepareProgramFile = "RenderPasses/Voxelization/PrepareShadingData.cs.slang";
 }; // namespace
 
 ReadVoxelPass::ReadVoxelPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice), gridData(VoxelizationBase::GlobalGridData)
@@ -25,30 +24,10 @@ RenderPassReflection ReadVoxelPass::reflect(const CompileData& compileData)
         .format(ResourceFormat::RGBA32Float)
         .texture2D(0, 0, 1, 1);
 
-    reflector.addOutput(kVBuffer, kVBuffer)
-        .bindFlags(ResourceBindFlags::None)
-        .format(ResourceFormat::R32Uint)
-        .texture3D(gridData.voxelCount.x, gridData.voxelCount.y, gridData.voxelCount.z, 1);
-
-    reflector.addOutput(kGBuffer, kGBuffer)
-        .bindFlags(ResourceBindFlags::UnorderedAccess)
-        .format(ResourceFormat::Unknown)
-        .rawBuffer(gridData.solidVoxelCount * sizeof(TEBSDF));
-
-    reflector.addOutput(kPBuffer, kPBuffer)
-        .bindFlags(ResourceBindFlags::UnorderedAccess)
-        .format(ResourceFormat::Unknown)
-        .rawBuffer(gridData.solidVoxelCount * sizeof(Ellipsoid));
-
-    reflector.addOutput(kBlockMap, kBlockMap)
-        .bindFlags(ResourceBindFlags::None)
-        .format(ResourceFormat::RGBA32Uint)
-        .texture2D(gridData.blockCount2D().x, gridData.blockCount2D().y);
-
-    reflector.addOutput(kHyperBlockMap, kHyperBlockMap)
-        .bindFlags(ResourceBindFlags::ShaderResource)
-        .format(ResourceFormat::RGBA32Uint)
-        .texture2D(gridData.hyperBlockCount2D().x, gridData.hyperBlockCount2D().y);
+    reflector.addOutput("dummy", "Dummy")
+        .bindFlags(ResourceBindFlags::RenderTarget)
+        .format(ResourceFormat::RGBA32Float)
+        .texture2D(0, 0, 1, 1);
 
     return reflector;
 }
@@ -78,48 +57,102 @@ void ReadVoxelPass::execute(RenderContext* pRenderContext, const RenderData& ren
         mPreparePass = ComputePass::create(mpDevice, desc, defines, true);
     }
 
-    size_t voxelCount = gridData.totalVoxelCount();
+    GridData& gd = VoxelizationBase::GlobalGridData;
 
     std::ifstream f;
+    f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
+    if (!f.is_open())
+        return;
+
+    std::cout << "Reading voxel data from: " << filePaths[selectedFile] << std::endl;
+    size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
     size_t offset = 0;
 
-    f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
-    size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
-    tryRead(f, offset, sizeof(GridData), nullptr, fileSize);
+    // Read GridData header
+    tryRead(f, offset, sizeof(GridData), &gd, fileSize);
 
-    ref<Texture> pVBuffer = renderData.getTexture(kVBuffer);
-    std::vector<uint> vBuffer(gridData.totalVoxelCount());
-    tryRead(f, offset, gridData.totalVoxelCount() * sizeof(uint), vBuffer.data(), fileSize);
-    pVBuffer->setSubresourceBlob(0, vBuffer.data(), gridData.totalVoxelCount() * sizeof(uint));
+    // Read octree header
+    uint32_t maxDepth = 0;
+    tryRead(f, offset, sizeof(uint32_t), &maxDepth, fileSize);
 
-    mpVoxelDataBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), gridData.solidVoxelCount, ResourceBindFlags::ShaderResource);
-    std::vector<VoxelData> voxelDataBuffer(gridData.solidVoxelCount);
-    tryRead(f, offset, gridData.solidVoxelCount * sizeof(VoxelData), voxelDataBuffer.data(), fileSize);
-    mpVoxelDataBuffer->setBlob(voxelDataBuffer.data(), 0, gridData.solidVoxelCount * sizeof(VoxelData));
-    pRenderContext->submit(true);
+    std::vector<uint32_t> nodeCounts(maxDepth + 1);
+    tryRead(f, offset, (maxDepth + 1) * sizeof(uint32_t), nodeCounts.data(), fileSize);
 
-    ref<Texture> pBlockMap = renderData.getTexture(kBlockMap);
-    std::vector<uint4> blockMap(gridData.blockTextureCount());
-    tryRead(f, offset, gridData.blockTextureCount() * sizeof(uint4), blockMap.data(), fileSize);
-    pBlockMap->setSubresourceBlob(0, blockMap.data(), gridData.blockTextureCount() * sizeof(uint4));
+    uint32_t totalNodes = 0;
+    for (uint32_t i = 0; i <= maxDepth; i++)
+        totalNodes += nodeCounts[i];
 
-    ref<Texture> pHyperBlockMap = renderData.getTexture(kHyperBlockMap);
-    std::vector<uint4> hyperBlockMap(gridData.hyperBlockTextureCount());
-    tryRead(f, offset, gridData.hyperBlockTextureCount() * sizeof(uint4), hyperBlockMap.data(), fileSize);
-    pHyperBlockMap->setSubresourceBlob(0, hyperBlockMap.data(), gridData.hyperBlockTextureCount() * sizeof(uint4));
+    std::cout << "Octree: maxDepth=" << maxDepth << ", totalNodes=" << totalNodes;
 
-    // VoxelData将拆分成PrimitiveBSDF和Ellipsoid
-    ref<Buffer> pGBuffer = renderData.getResource(kGBuffer)->asBuffer();
-    ref<Buffer> pPBuffer = renderData.getResource(kPBuffer)->asBuffer();
+    // Read all octree nodes
+    std::vector<OctreeNode> octreeNodes(totalNodes);
+    tryRead(f, offset, totalNodes * sizeof(OctreeNode), octreeNodes.data(), fileSize);
 
-    ShaderVar var = mPreparePass->getRootVar();
-    var["voxelDataBuffer"] = mpVoxelDataBuffer;
-    var[kGBuffer] = pGBuffer;
-    var[kPBuffer] = pPBuffer;
+    // Read VoxelData
+    std::vector<VoxelData> voxelData(gd.solidVoxelCount);
+    tryRead(f, offset, gd.solidVoxelCount * sizeof(VoxelData), voxelData.data(), fileSize);
 
-    auto cb = var["CB"];
-    cb["voxelCount"] = (uint)gridData.solidVoxelCount;
-    mPreparePass->execute(pRenderContext, uint3((uint)gridData.solidVoxelCount, 1, 1));
+    float maxArea = 0, minArea = FLT_MAX;
+    uint zeroAreaCount = 0;
+    for (auto& vd : voxelData)
+    {
+        float a = vd.ABSDF.area;
+        maxArea = max(maxArea, a);
+        minArea = min(minArea, a);
+        if (a <= 0) zeroAreaCount++;
+    }
+    std::cout << "VoxelData area: min=" << minArea << " max=" << maxArea
+            << " zeroCount=" << zeroAreaCount << "/" << voxelData.size() << std::endl;
+
+    f.close();
+
+    std::cout << ", solidVoxels=" << gd.solidVoxelCount << std::endl;
+    for (uint32_t i = 0; i <= maxDepth; i++)
+        std::cout << "  Level " << i << ": " << nodeCounts[i] << " nodes" << std::endl;
+
+    // Create GPU buffer for octree nodes
+    auto pOctreeBuffer = mpDevice->createStructuredBuffer(
+        sizeof(OctreeNode), totalNodes, ResourceBindFlags::ShaderResource
+    );
+    pOctreeBuffer->setBlob(octreeNodes.data(), 0, totalNodes * sizeof(OctreeNode));
+
+    // Create temp VoxelData buffer and upload
+    auto pVoxelDataBuffer = mpDevice->createStructuredBuffer(
+        sizeof(VoxelData), gd.solidVoxelCount, ResourceBindFlags::ShaderResource
+    );
+    pVoxelDataBuffer->setBlob(voxelData.data(), 0, gd.solidVoxelCount * sizeof(VoxelData));
+
+    // Create gBuffer/pBuffer
+    auto pGBuffer = mpDevice->createStructuredBuffer(
+        sizeof(TEBSDF), gd.solidVoxelCount,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    auto pPBuffer = mpDevice->createStructuredBuffer(
+        sizeof(Ellipsoid), gd.solidVoxelCount,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+
+    // Prepare pass: split VoxelData into TEBSDF and Ellipsoid
+    {
+        ShaderVar var = mPreparePass->getRootVar();
+        var["voxelDataBuffer"] = pVoxelDataBuffer;
+        var[kGBuffer] = pGBuffer;
+        var[kPBuffer] = pPBuffer;
+
+        auto cb = var["CB"];
+        cb["voxelCount"] = (uint)gd.solidVoxelCount;
+
+        uint dispatchX = (gd.solidVoxelCount + 255) / 256;
+        if (dispatchX > 0)
+            mPreparePass->execute(pRenderContext, uint3(dispatchX, 1, 1));
+    }
+    // Store in statics
+    VoxelizationBase::GBuffer = pGBuffer;
+    VoxelizationBase::PBuffer = pPBuffer;
+    VoxelizationBase::OctreeBuffer = pOctreeBuffer;
+    VoxelizationBase::OctreeMaxDepth = maxDepth;
+    VoxelizationBase::OctreeNodeCounts = std::move(nodeCounts);
+
     pRenderContext->submit(true);
     mComplete = true;
 }
@@ -149,16 +182,15 @@ void ReadVoxelPass::renderUI(Gui::Widgets& widget)
 
     if (mpScene && widget.button("Read"))
     {
+        // Read GridData header from the selected file
         std::ifstream f;
-        size_t offset = 0;
-
         f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
         if (!f.is_open())
             return;
 
         size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
+        size_t offset = 0;
         tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
-
         f.close();
 
         requestRecompile();
@@ -166,16 +198,24 @@ void ReadVoxelPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     }
 
-    GridData& data = VoxelizationBase::GlobalGridData;
-    widget.text("Voxel Size: " + ToString(data.voxelSize));
-    widget.text("Voxel Count: " + ToString((int3)data.voxelCount));
-    widget.text("Block Count: " + ToString((int3)data.blockCount3D()));
-    widget.text("Hyper Block Count: " + ToString((int3)data.hyperBlockCount3D()));
-    widget.text("Grid Min: " + ToString(data.gridMin));
-    widget.text("Solid Voxel Count: " + std::to_string(data.solidVoxelCount));
-    widget.text("Solid Rate: " + std::to_string(data.solidVoxelCount / (float)data.totalVoxelCount()));
-    widget.text("Max Polygon Count: " + std::to_string(data.maxPolygonCount));
-    widget.text("Total Polygon Count: " + std::to_string(data.totalPolygonCount));
+    widget.text("Voxel Size: " + ToString(gridData.voxelSize));
+    widget.text("Voxel Count: " + ToString((int3)gridData.voxelCount));
+    widget.text("Block Count: " + ToString((int3)gridData.blockCount3D()));
+    widget.text("Hyper Block Count: " + ToString((int3)gridData.hyperBlockCount3D()));
+    widget.text("Grid Min: " + ToString(gridData.gridMin));
+    widget.text("Solid Voxel Count: " + std::to_string(gridData.solidVoxelCount));
+    widget.text("Solid Rate: " + std::to_string(gridData.solidVoxelCount / (float)gridData.totalVoxelCount()));
+    widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
+    widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
+
+    if (VoxelizationBase::OctreeMaxDepth > 0)
+    {
+        widget.text("Octree Max Depth: " + std::to_string(VoxelizationBase::OctreeMaxDepth));
+        uint32_t totalNodes = 0;
+        for (auto c : VoxelizationBase::OctreeNodeCounts)
+            totalNodes += c;
+        widget.text("Octree Total Nodes: " + std::to_string(totalNodes));
+    }
 }
 
 void ReadVoxelPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)

@@ -29,7 +29,7 @@
 
 namespace
 {
-const std::string kComputePassProgramFile = "E:/Project/Falcor/Source/RenderPasses/ForwardMappingPass/ForwardMapping.cs.slang";
+const std::string kComputePassProgramFile = "RenderPasses/ForwardMappingPass/ForwardMapping.cs.slang";
 const std::string kInputInvVP = "impostorInvVP";
 const std::string kInputPackedNDO = "packedNDO";
 const std::string kInputPackedMCR = "packedMCR";

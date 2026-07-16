@@ -27,10 +27,12 @@ public:
     void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
     void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
     std::string getFileName();
-    void* getVBufferCPU() const { return pVBuffer_CPU; }
+    void buildOctree();
+
+    static uint64_t morton3(uint32_t x, uint32_t y, uint32_t z);
 
 protected:
-    void write(std::string fileName, void* gBuffer, void* vBuffer, void* pBlockMap, void* pHyperBlockMap);
+    void write(std::string fileName, void* gBuffer);
 
     ref<ComputePass> mAnalyzePolygonPass;
     ref<ComputePass> mLoadMeshPass;
@@ -43,14 +45,14 @@ protected:
     ref<Buffer> gBuffer;
     ref<Buffer> polygonRangeBuffer;
     PolygonBufferGroup polygonGroup;
-    ref<Buffer> blockMap;
-    ref<Buffer> hyperBlockMap;
 
     PolygonGenerator polygonGenerator;
-    void* pVBuffer_CPU;
+    std::vector<OctreeNode> mOctreeNodes;     // all nodes concatenated level-by-level
+    std::vector<uint32_t> mOctreeNodeCounts;  // node count per level
+    uint32_t mOctreeMaxDepth = 0;
 
     uint mSampleFrequency;
-    uint mVoxelResolution;
+    uint mMaxVoxelResolution;
     GridData& gridData;
 
     bool mSamplingComplete;

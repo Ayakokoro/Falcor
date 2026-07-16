@@ -14,8 +14,6 @@ import Scene.Material.BasicMaterialData;
 StructuredBuffer<Polygon> polygonBuffer; // 局部缓冲区
 StructuredBuffer<PolygonRange> polygonRangeBuffer;
 RWStructuredBuffer<VoxelData> gBuffer;
-RWStructuredBuffer<uint> blockMap;      // 逻辑上是Texture2D<uint4>
-RWStructuredBuffer<uint> hyperBlockMap; // 逻辑上是Texture2D<uint4>，存储hyper block occupancy
 SamplerState sampler;
 
 cbuffer GridData
@@ -30,8 +28,6 @@ cbuffer CB
     uint gBufferOffset;
     uint groupVoxelCount;
     uint sampleFrequency;
-    uint2 blockCount;
-    uint2 hyperBlockCount;
 }
 
 void Estimate(
@@ -142,27 +138,6 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
     ABSDF.accumulate(input);
 }
 
-void updateBlockMap(int3 cellInt)
-{
-    int3 blockInt = cellInt >> MIPMAP_SHRINK_BIT;
-    int component = blockInt.z >> 5;
-    uint value = 1 << (blockInt.z & 31);
-    uint index = blockInt.x + blockInt.y * blockCount.x;
-    index = 4 * index + component; // 4个分量一组
-    InterlockedOr(blockMap[index], value);
-}
-
-void updateHyperBlockMap(int3 cellInt)
-{
-    int3 blockInt = cellInt >> MIPMAP_SHRINK_BIT;       // First shrink to block level
-    int3 hyperBlockInt = blockInt >> MIPMAP_SHRINK_BIT; // Then shrink to hyper block level
-    int component = hyperBlockInt.z >> 5;
-    uint value = 1 << (hyperBlockInt.z & 31);
-    uint index = hyperBlockInt.x + hyperBlockInt.y * hyperBlockCount.x;
-    index = 4 * index + component; // 4个分量一组
-    InterlockedOr(hyperBlockMap[index], value);
-}
-
 void calc(uint offset)
 {
     if (offset >= groupVoxelCount)
@@ -194,9 +169,6 @@ void calc(uint offset)
     data.totalProjAreaFunc = totalF;
 
     gBuffer[index] = data;
-
-    updateBlockMap(range.cellInt);
-    updateHyperBlockMap(range.cellInt);
 }
 
 [numthreads(256, 1, 1)]

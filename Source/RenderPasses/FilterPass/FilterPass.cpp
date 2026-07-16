@@ -29,7 +29,7 @@
 
 namespace
 {
-const std::string kFilterShaderFile = "E:/Project/Falcor/Source/RenderPasses/FilterPass/Filter.cs.slang";
+const std::string kFilterShaderFile = "RenderPasses/FilterPass/Filter.cs.slang";
 
 const std::string kInputMappedNDO = "mappedNDO";
 const std::string kInputMappedMCR = "mappedMCR";

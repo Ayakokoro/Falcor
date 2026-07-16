@@ -187,6 +187,10 @@ inline float leaveHyperBlock(inout float3 cell, inout int3 cellInt, int3 directi
     cellInt = int3(cell + direction * 1e-3);
     return tMin;
 }
+
+
+
+
 #endif
 
 END_NAMESPACE_FALCOR

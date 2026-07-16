@@ -1,10 +1,11 @@
 #include "VoxelizationPass.h"
 #include <fstream>
+#include <algorithm>
 
 namespace
 {
-const std::string kAnalyzePolygonProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
-const std::string kLoadMeshProgramFile = "E:/Project/Falcor/Source/RenderPasses/Voxelization/LoadMesh.cs.slang";
+const std::string kAnalyzePolygonProgramFile = "RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
+const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.slang";
 }; // namespace
 
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
@@ -15,9 +16,9 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     mCompleteTimes = 0;
 
     mSampleFrequency = 1024;
-    mVoxelResolution = 512;
 
-    VoxelizationBase::UpdateVoxelGrid(nullptr, mVoxelResolution);
+    mMaxVoxelResolution = 512;
+    VoxelizationBase::UpdateVoxelGrid(nullptr, mMaxVoxelResolution);
 
     mpDevice = pDevice;
 
@@ -26,8 +27,6 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
         .setAddressingMode(TextureAddressingMode::Wrap, TextureAddressingMode::Wrap, TextureAddressingMode::Wrap);
     mpSampler = pDevice->createSampler(samplerDesc);
-
-    pVBuffer_CPU = nullptr;
 }
 
 RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
@@ -42,45 +41,17 @@ RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
 
 void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    if (!mpScene || mVoxelizationComplete && mSamplingComplete)
+    if (!mpScene)
         return;
 
     if (!mVoxelizationComplete)
     {
         clipPolygon(pRenderContext, renderData);
         mVoxelizationComplete = true;
-
-        blockMap = mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.blockTextureCount(), ResourceBindFlags::UnorderedAccess);
-        pRenderContext->clearUAV(blockMap->getUAV().get(), uint4(0));
-
-        hyperBlockMap =
-            mpDevice->createStructuredBuffer(sizeof(uint), 4 * gridData.hyperBlockTextureCount(), ResourceBindFlags::UnorderedAccess);
-        pRenderContext->clearUAV(hyperBlockMap->getUAV().get(), uint4(0));
     }
-        else
+    else if (!mSamplingComplete)
     {
-        if (polygonGroup.size() == 0)
-        {
-            pRenderContext->submit(true);
-
-            Tools::Profiler::BeginSample("Write File");
-            ref<Buffer> cpuGBuffer = copyToCpu(mpDevice, pRenderContext, gBuffer);
-            ref<Buffer> cpuBlockMap = copyToCpu(mpDevice, pRenderContext, blockMap);
-            ref<Buffer> cpuHyperBlockMap = copyToCpu(mpDevice, pRenderContext, hyperBlockMap);
-            pRenderContext->submit(true);
-            void* pGBuffer_CPU = cpuGBuffer->map();
-            void* pBlockMap_CPU = cpuBlockMap->map();
-            void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
-            write(getFileName(), pGBuffer_CPU, getVBufferCPU(), pBlockMap_CPU, pHyperBlockMap_CPU);
-            cpuGBuffer->unmap();
-            cpuBlockMap->unmap();
-            cpuHyperBlockMap->unmap();
-            mSamplingComplete = true;
-            Tools::Profiler::EndSample("Write File");
-            Tools::Profiler::Print();
-            Tools::Profiler::Reset();
-        }
-        else if (mCompleteTimes < polygonGroup.size())
+        if (mCompleteTimes < polygonGroup.size())
         {
             if (mCompleteTimes == 0)
                 Tools::Profiler::BeginSample("Analyze Polygon");
@@ -94,17 +65,13 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
 
             Tools::Profiler::BeginSample("Write File");
             ref<Buffer> cpuGBuffer = copyToCpu(mpDevice, pRenderContext, gBuffer);
-            ref<Buffer> cpuBlockMap = copyToCpu(mpDevice, pRenderContext, blockMap);
-            ref<Buffer> cpuHyperBlockMap = copyToCpu(mpDevice, pRenderContext, hyperBlockMap);
             pRenderContext->submit(true);
             void* pGBuffer_CPU = cpuGBuffer->map();
-            void* pBlockMap_CPU = cpuBlockMap->map();
-            void* pHyperBlockMap_CPU = cpuHyperBlockMap->map();
-            write(getFileName(), pGBuffer_CPU, getVBufferCPU(), pBlockMap_CPU, pHyperBlockMap_CPU);
+            write(getFileName(), pGBuffer_CPU);
             cpuGBuffer->unmap();
-            cpuBlockMap->unmap();
-            cpuHyperBlockMap->unmap();
+
             mSamplingComplete = true;
+
             Tools::Profiler::EndSample("Write File");
             Tools::Profiler::Print();
             Tools::Profiler::Reset();
@@ -116,14 +83,14 @@ void VoxelizationPass::compile(RenderContext* pRenderContext, const CompileData&
 
 void VoxelizationPass::renderUI(Gui::Widgets& widget)
 {
-    static const uint resolutions[] = {64, 128, 256, 512, 960, 1024, 1280, 1344, 1408, 1472, 1536};
+    static const uint resolutions[] = {4, 8, 16, 32, 64, 128, 256, 512, 1024, 1280, 1344, 1408, 1472, 1536};
     {
         Gui::DropdownList list;
         for (uint32_t i = 0; i < sizeof(resolutions) / sizeof(uint); i++)
         {
             list.push_back({resolutions[i], std::to_string(resolutions[i])});
         }
-        widget.dropdown("Voxel Resolution", list, mVoxelResolution);
+        widget.dropdown("Voxel Resolution", list, mMaxVoxelResolution);
     }
     static const uint sampleFrequencies[] = {0, 64, 256, 512, 1024, 2048, 4096};
     {
@@ -149,7 +116,7 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
 
     if (mpScene && mVoxelizationComplete && mSamplingComplete && widget.button("Generate"))
     {
-        VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
+        VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
         mVoxelizationComplete = false;
         mSamplingComplete = false;
         mCompleteTimes = 0;
@@ -162,7 +129,7 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mpScene = pScene;
     mAnalyzePolygonPass = nullptr;
     mLoadMeshPass = nullptr;
-    VoxelizationBase::UpdateVoxelGrid(mpScene, mVoxelResolution);
+    VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
 
 void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderData& renderData)
@@ -245,6 +212,8 @@ void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderDa
     cpuTexCoords->unmap();
     cpuTriangles->unmap();
 
+    buildOctree();
+
     gBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), gridData.solidVoxelCount, ResourceBindFlags::UnorderedAccess);
     gBuffer->setBlob(polygonGenerator.gBuffer.data(), 0, gridData.solidVoxelCount * sizeof(VoxelData));
 
@@ -252,8 +221,6 @@ void VoxelizationPass::clipPolygon(RenderContext* pRenderContext, const RenderDa
         sizeof(PolygonRange), gridData.solidVoxelCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
     polygonRangeBuffer->setBlob(polygonGenerator.polygonRangeBuffer.data(), 0, gridData.solidVoxelCount * sizeof(PolygonRange));
-
-    pVBuffer_CPU = polygonGenerator.vBuffer.data();
 
     pRenderContext->submit(true);
 }
@@ -279,8 +246,6 @@ void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const Rende
     var[kGBuffer] = gBuffer;
     var[kPolygonRangeBuffer] = polygonRangeBuffer;
     var[kPolygonBuffer] = polygonGroup.get(mCompleteTimes);
-    var[kBlockMap] = blockMap;
-    var[kHyperBlockMap] = hyperBlockMap;
 
     uint groupVoxelCount = polygonGroup.getVoxelCount(mCompleteTimes);
 
@@ -288,8 +253,6 @@ void VoxelizationPass::analyzePolygon(RenderContext* pRenderContext, const Rende
     cb["groupVoxelCount"] = groupVoxelCount;
     cb["sampleFrequency"] = mSampleFrequency;
     cb["gBufferOffset"] = polygonGroup.getVoxelOffset(mCompleteTimes);
-    cb["blockCount"] = gridData.blockCount2D();
-    cb["hyperBlockCount"] = gridData.hyperBlockCount2D();
 
     auto cb_grid = var["GridData"];
     cb_grid["gridMin"] = gridData.gridMin;
@@ -319,24 +282,204 @@ std::string VoxelizationPass::getFileName()
     std::ostringstream oss;
     oss << trim_non_alnum_ends(mpScene->getPath().stem().string());
     oss << "_";
-    oss << ToString((int3)gridData.voxelCount);
+    oss << ToString((int3)VoxelizationBase::GlobalGridData.voxelCount);
     oss << "_";
     oss << std::to_string(mSampleFrequency);
     oss << ".bin";
     return oss.str();
 }
 
-void VoxelizationPass::write(std::string fileName, void* pGBuffer, void* pVBuffer, void* pBlockMap, void* pHyperBlockMap)
+uint64_t VoxelizationPass::morton3(uint32_t x, uint32_t y, uint32_t z)
+{
+    uint64_t result = 0;
+    for (int i = 0; i < 21; i++)
+    {
+        result |= ((uint64_t)(x & 1) << (3 * i)) | ((uint64_t)(y & 1) << (3 * i + 1)) |
+                  ((uint64_t)(z & 1) << (3 * i + 2));
+        x >>= 1;
+        y >>= 1;
+        z >>= 1;
+    }
+    return result;
+}
+
+void VoxelizationPass::buildOctree()
+{
+    uint32_t resolution = std::max({gridData.voxelCount.x, gridData.voxelCount.y, gridData.voxelCount.z});
+    uint32_t maxDepth = 0;
+    while ((1u << maxDepth) < resolution)
+        maxDepth++;
+
+    uint32_t solidCount = (uint32_t)gridData.solidVoxelCount;
+    if (solidCount == 0)
+    {
+        mOctreeNodes.clear();
+        mOctreeNodeCounts.assign(maxDepth + 1, 0);
+        mOctreeMaxDepth = maxDepth;
+        return;
+    }
+
+    // Step 1: Build (morton, gBufferIndex) pairs
+    struct VoxelItem
+    {
+        uint64_t morton;
+        uint32_t gbIndex;
+    };
+    std::vector<VoxelItem> items;
+    items.reserve(solidCount);
+
+    for (uint32_t i = 0; i < solidCount; i++)
+    {
+        int3 cell = polygonGenerator.polygonRangeBuffer[i].cellInt;
+        if(cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= (int)gridData.voxelCount.x || cell.y >= (int)gridData.voxelCount.y || cell.z >= (int)gridData.voxelCount.z)
+        {
+            std::cerr << "Warning: Solid voxel at index " << i << " has out-of-bounds cell " << ToString(cell) << std::endl;
+            continue;
+        }
+        items.push_back({morton3((uint32_t)cell.x, (uint32_t)cell.y, (uint32_t)cell.z), i});
+    }
+
+    int3 minCell = int3(INT_MAX);
+    int3 maxCell = int3(INT_MIN);
+    for (auto& item : items)
+    {
+        int3 cell = polygonGenerator.polygonRangeBuffer[item.gbIndex].cellInt;
+        minCell = min(minCell, cell);
+        maxCell = max(maxCell, cell);
+    }
+    std::cout << "Solid voxel range: min=" << ToString(minCell)
+              << " max=" << ToString(maxCell)
+              << " extent=" << ToString(maxCell - minCell + 1) << std::endl;
+    std::cout << "Solid voxel count: " << solidCount
+              << " / " << gridData.totalVoxelCount()
+              << " (" << (100.f * solidCount / gridData.totalVoxelCount()) << "%)" << std::endl;
+
+    // Step 2: Sort by Morton code
+    std::sort(items.begin(), items.end(), [](const VoxelItem& a, const VoxelItem& b) { return a.morton < b.morton; });
+
+    for (int idx : {0, 1, 2, (int)items.size()-3, (int)items.size()-2, (int)items.size()-1})
+    {
+        if (idx < 0 || idx >= (int)items.size()) continue;
+        int3 cell = polygonGenerator.polygonRangeBuffer[items[idx].gbIndex].cellInt;
+        uint64_t m = morton3(cell.x, cell.y, cell.z);
+        std::cout << "  [" << idx << "] cell=" << ToString(cell)
+                  << " morton=0x" << std::hex << m << std::dec
+                  << " gbIndex=" << items[idx].gbIndex << std::endl;
+    }
+
+
+    // Step 3: Build levels bottom-up
+    std::vector<OctreeNode> allNodes;
+    allNodes.reserve(solidCount * 2);
+
+    std::vector<uint32_t> levelStarts(maxDepth + 1);
+
+    struct BuildItem
+    {
+        uint64_t morton;
+        uint32_t nodeIndex;
+    };
+    std::vector<BuildItem> curItems;
+    curItems.reserve(solidCount);
+
+    // Leaf level (maxDepth): one node per solid voxel
+    levelStarts[maxDepth] = (uint32_t)allNodes.size();
+    for (auto& item : items)
+        allNodes.push_back({item.gbIndex, 0u});
+
+    for (uint32_t k = 0; k < items.size(); k++)
+        curItems.push_back({items[k].morton, levelStarts[maxDepth] + k});
+
+    // Build internal levels bottom-up
+    for (int level = (int)maxDepth - 1; level >= 0; level--)
+    {
+        levelStarts[level] = (uint32_t)allNodes.size();
+        std::vector<BuildItem> parentItems;
+
+        size_t i = 0;
+        while (i < curItems.size())
+        {
+            uint64_t prefix = curItems[i].morton >> 3;
+            size_t j = i + 1;
+
+            while (j < curItems.size() && (curItems[j].morton >> 3) == prefix)
+                j++;
+
+            uint32_t childMask = 0;
+            for (size_t k = i; k < j; k++)
+            {
+                // 当前这3位就是子节点在父节点中的索引
+                uint32_t childIdx = curItems[k].morton & 7;
+                childMask |= (1u << childIdx);
+            }
+
+            uint32_t childBase = curItems[i].nodeIndex;
+            allNodes.push_back({childBase, childMask});
+
+            // 将 prefix 作为父节点的 morton 码传递给上一层
+            parentItems.push_back({prefix, levelStarts[level] + (uint32_t)parentItems.size()});
+            i = j;
+        }
+        curItems = std::move(parentItems);
+    }
+
+    // Step 4: Extract per-level node slices (bottom-up order in allNodes)
+    // allNodes = [leaves (L_maxDepth)] [L_(maxDepth-1)] ... [L_0 (root)]
+    // levelStarts[l] = start index of level l in allNodes (0 for leaves, larger for root)
+    std::vector<std::vector<OctreeNode>> levelNodes(maxDepth + 1);
+    for (int l = (int)maxDepth; l >= 0; l--)
+    {
+        uint32_t start = levelStarts[l];
+        uint32_t end = (l == 0) ? (uint32_t)allNodes.size() : levelStarts[l - 1];
+        levelNodes[l].assign(allNodes.begin() + start, allNodes.begin() + end);
+    }
+
+    // Compute node counts and top-down starting positions
+    mOctreeNodeCounts.resize(maxDepth + 1);
+    std::vector<uint32_t> tdStart(maxDepth + 1);
+    tdStart[0] = 0;
+    for (uint32_t l = 0; l <= maxDepth; l++)
+    {
+        mOctreeNodeCounts[l] = (uint32_t)levelNodes[l].size();
+        if (l < maxDepth)
+            tdStart[l + 1] = tdStart[l] + mOctreeNodeCounts[l];
+    }
+
+    // Step 5: Rearrange to top-down order (L0 first), remapping childBase
+    std::vector<OctreeNode> topDown;
+    topDown.reserve(allNodes.size());
+    for (uint32_t l = 0; l <= maxDepth; l++)
+    {
+        for (OctreeNode node : levelNodes[l])
+        {
+            if (node.childMask != 0 && l < maxDepth)
+            {
+                // Remap childBase from bottom-up index to top-down index.
+                // Children are at level l+1; their bottom-up start is levelStarts[l+1].
+                // Offset within that level = childBase - levelStarts[l+1].
+                // New childBase = tdStart[l+1] + offset.
+                node.childBase = tdStart[l + 1] + (node.childBase - levelStarts[l + 1]);
+            }
+            topDown.push_back(node);
+        }
+    }
+
+    mOctreeNodes = std::move(topDown);
+    mOctreeMaxDepth = maxDepth;
+}
+
+void VoxelizationPass::write(std::string fileName, void* pGBuffer)
 {
     std::ofstream f;
     std::string s = VoxelizationBase::ResourceFolder + fileName;
     f.open(s, std::ios::binary);
-    f.write(reinterpret_cast<char*>(&gridData), sizeof(GridData));
+    f.write(reinterpret_cast<const char*>(&gridData), sizeof(GridData));
 
-    f.write(reinterpret_cast<const char*>(pVBuffer), gridData.totalVoxelCount() * sizeof(int));
+    f.write(reinterpret_cast<const char*>(&mOctreeMaxDepth), sizeof(uint32_t));
+    f.write(reinterpret_cast<const char*>(mOctreeNodeCounts.data()), mOctreeNodeCounts.size() * sizeof(uint32_t));
+    f.write(reinterpret_cast<const char*>(mOctreeNodes.data()), mOctreeNodes.size() * sizeof(OctreeNode));
+
     f.write(reinterpret_cast<const char*>(pGBuffer), gridData.solidVoxelCount * sizeof(VoxelData));
-    f.write(reinterpret_cast<const char*>(pBlockMap), gridData.blockTextureCount() * sizeof(uint4));
-    f.write(reinterpret_cast<const char*>(pHyperBlockMap), gridData.hyperBlockTextureCount() * sizeof(uint4));
 
     f.close();
     VoxelizationBase::FileUpdated = true;

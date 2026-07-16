@@ -74,7 +74,7 @@ public:
             float3 minPoint = float3(cellInt);
             Polygon polygon = VoxelizationUtility::BoxClipTriangle(minPoint, minPoint + 1.f, tri);
             polygon.normal = tri.TBN.getCol(2);
-            if (polygon.count >= 3)
+            if (polygon.count >= 3 && polygon.calcArea() > 1e-8f)
             {
                 polygon.triRef.meshID = mesh.meshID;
                 polygon.triRef.triangleID = triangleID;

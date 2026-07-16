@@ -28,9 +28,9 @@
 #include "ImpostorPass.h"
 namespace
 {
-const std::string kDepthPassProgramFile = "E:/Project/Falcor/Source/RenderPasses/GBuffer/GBuffer/DepthPass.3d.slang";
-const std::string kGBufferPassProgramFile = "E:/Project/Falcor/Source/RenderPasses/GBuffer/GBuffer/ImpostorRaster.3d.slang";
-const std::string kComputePassProgramFile = "E:/Project/Falcor/Source/RenderPasses/GBuffer/GBuffer/MipmapGenerator.cs.slang";
+const std::string kDepthPassProgramFile = "RenderPasses/GBuffer/GBuffer/DepthPass.3d.slang";
+const std::string kGBufferPassProgramFile = "RenderPasses/GBuffer/GBuffer/ImpostorRaster.3d.slang";
+const std::string kComputePassProgramFile = "RenderPasses/GBuffer/GBuffer/MipmapGenerator.cs.slang";
 const RasterizerState::CullMode kDefaultCullMode = RasterizerState::CullMode::Back;
 const ChannelList kImpostorChannels = {
     {"packedNDO", "gPackedNDO", "World normal(x,y), depth, opacity", false, ResourceFormat::RGBA32Float},

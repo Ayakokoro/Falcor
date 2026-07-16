@@ -5,46 +5,58 @@
 import Rendering.Materials.StandardMaterial;
 import Utils.Sampling.UniformSampleGenerator;
 
-// 如果外部未定义,则取默认值3
 #ifndef MAX_BOUNCE
 #define MAX_BOUNCE 3
 #endif
 
+#ifndef MAX_OCTREE_DEPTH
+#define MAX_OCTREE_DEPTH 12
+#endif
+
+#define USE_BRUTE_FORCE 0  // 1 = DDA cell-by-cell, 0 = parameterized octree traversal
+
 StructuredBuffer<TEBSDF> gBuffer;
 StructuredBuffer<Ellipsoid> pBuffer;
+StructuredBuffer<OctreeNode> octreeBuffer;
 
 RWStructuredBuffer<float4> selectedVoxel;
-
-ParameterBlock<OccupancyMap> OM;
 
 cbuffer GridData
 {
     float3 gridMin;
     float3 voxelSize;
     uint3 voxelCount;
+    uint octreeMaxDepth;
 }
 
 cbuffer CB
 {
     uint2 pixelCount;
-    uint3 blockCount;
     float4x4 invVP;
     float shadowBias;
     uint drawMode;
-    uint sampleStrategy;
     uint frameIndex;
     float minPdf;
     float transmittanceThreshold;
     bool renderBackGround;
     float4 clearColor;
     uint2 selectedPixel;
+    float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
 }
+
+// Ray cone: represents the angular footprint of a ray
+// Half-angle tangent grows with BSDF roughness at each bounce
+struct RayCone
+{
+    float tanHalfAngle; // tan(θ/2), where θ is the cone's full opening angle
+};
 
 struct HitResult
 {
     bool hit;
-    int3 cellInt;
-    float3 cell;
+    int3 cellInt;    // in LOD-0 coordinate space
+    float3 cell;     // in LOD-0 coordinate space
+    uint gbIndex;    // gBuffer offset at leaf node
 };
 
 struct PsOut
@@ -57,62 +69,37 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
-bool isSolidVoxel(int3 cellInt, inout int offset)
+// Point query: descend octree from root to check if cellInt is solid.
+// Returns gbIndex if solid, 0xFFFFFFFF if empty.
+uint lookupCell(int3 cellInt)
 {
-    return OM.isSolidVoxel(cellInt, offset) && gBuffer[offset].area > 0;
-}
-
-// 先后用体素和椭球裁剪线段
-HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt)
-{
-    float3 from = cell - cellInt;
-    int3 directions = int3(sign(direction));
-    float3 border = (directions + 1) / 2;
-    float3 t = (border - from) / direction;
-    float tMin = 2.0f;
-    if (direction.x != 0 && t.x < tMin)
-        tMin = t.x;
-    if (direction.y != 0 && t.y < tMin)
-        tMin = t.y;
-    if (direction.z != 0 && t.z < tMin)
-        tMin = t.z;
-    float3 to = from + tMin * direction;
-    float2 inOut = ellipsoid.clip(from, to);
-    HitResult result = { inOut.x >= 0, cellInt, cell + inOut.x * (to - from) };
-    return result;
-}
-
-// 射线命中体素，可能直接穿过，或命中椭球
-HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt)
-{
-    int offset;
-    if (isSolidVoxel(cellInt, offset))
+    uint nodeIndex = 0;
+    for (uint level = 0; level < octreeMaxDepth; level++)
     {
-#if !CHECK_ELLIPSOID
-        HitResult hit = { true, cellInt, cellInt + 0.5f };
-        return hit;
-#else
-        Ellipsoid ellipsoid = pBuffer[offset];
-        HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt);
-        if (hit.hit)
-            return hit;
-#endif
+        OctreeNode node = octreeBuffer[nodeIndex];
+        uint childShift = octreeMaxDepth - level - 1;
+        int3 localCell = (cellInt >> childShift) & 1;
+        uint childSlot = localCell.x + localCell.y * 2 + localCell.z * 4;
+
+        if ((node.childMask & (1u << childSlot)) != 0 )
+            nodeIndex = node.childBase + countbits(node.childMask & ((1u << childSlot) - 1));
+        else
+            return 0xFFFFFFFF;
     }
-    return { false, cellInt, cellInt + 0.5f };
+    return octreeBuffer[nodeIndex].childBase;
 }
 
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst)
+// Brute-force DDA traversal: step one LOD-0 cell at a time, query octree per cell.
+// Used for A/B testing against the parameterized traversal.
+HitResult rayMarchingBruteForce(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
-    {
-        HitResult hit = { false, int3(from), from };
-        return hit;
-    }
+        return { false, int3(from), from, 0 };
 
     float3 cell = from;
     int3 cellInt = int3(floor(from));
-    float distance = 0;
+    float distance = initialDistance;
 
     float3 reciprocal_direction = 1.0f / direction;
     int3 directions = int3(sign(direction));
@@ -125,50 +112,234 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
             break;
         if (maxDistance > 0 && distance > maxDistance)
             break;
-#if USE_MIPMAP
-        // Mip Level 2: Hyper Block
-        if (!OM.isSolidHyperBlock(cellInt))
+
+        uint gbIndex = lookupCell(cellInt);
+        if (gbIndex != 0xFFFFFFFF)
         {
-            distance += leaveHyperBlock(cell, cellInt, directions, direction, reciprocal_direction);
-            continue;
-        }
-#endif
-        // Mip Level 1: Block
-        if (!OM.isSolidBlock(cellInt))
-        {
-            distance += leaveBlock(cell, cellInt, directions, direction, reciprocal_direction);
-            continue;
+            HitResult hit = rayHitVoxel(cell, direction, cellInt, gbIndex);
+            if (hit.hit)
+                return hit;
         }
 
-        // Mip Level 0: Voxel
-        HitResult hit = rayHitVoxel(cell, direction, cellInt);
-        if (hit.hit)
-            return hit;
         distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
     }
-    HitResult hit = { false, cellInt, cellInt + 0.5f };
-    return hit;
+    return { false, cellInt, cellInt + 0.5f, 0 };
 }
 
-float calcTrasmissionVisibility(HitResult hit, float3 direction)
+// Extract max roughness across all lobes of a TEBSDF at gbIndex
+float maxRoughness(uint gbIndex)
 {
-    hit = rayMarching(hit.cell, direction, -1, true);
+    TEBSDF bsdf = gBuffer[gbIndex];
+    float r = 0;
+    for (uint i = 0; i < bsdf.surface.lobeCount; i++)
+        r = max(r, bsdf.surface.lobes[i].frostBite.rough);
+    return r;
+}
+
+HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex)
+{
+    float3 from = cell - cellInt;
+    int3 directions = int3(sign(direction));
+    float3 border = (directions + 1) / 2;
+    float3 t = (border - from) / direction;
+    float tMin = 2.0f;
+    if (direction.x != 0 && t.x < tMin) tMin = t.x;
+    if (direction.y != 0 && t.y < tMin) tMin = t.y;
+    if (direction.z != 0 && t.z < tMin) tMin = t.z;
+    float3 to = from + tMin * direction;
+    float2 inOut = ellipsoid.clip(from, to);
+    HitResult result = { inOut.x >= 0, cellInt, cell + inOut.x * (to - from), gbIndex };
+    return result;
+}
+
+HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex)
+{
+#if !CHECK_ELLIPSOID
+    return { true, cellInt, cellInt + 0.5f, gbIndex };
+#else
+    Ellipsoid ellipsoid = pBuffer[gbIndex];
+    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex);
+    if (hit.hit)
+        return hit;
+#endif
+    return { false, cellInt, cellInt + 0.5f, 0 };
+}
+
+// Ray-slab AABB intersection in cell space
+// tMin is clamped to 0 (only considers what's ahead of the ray origin)
+bool intersectAABB(float3 rayOrigin, float3 reciprocal, float3 aabbMin, float3 aabbMax,
+                   out float tMin, out float tMax)
+{
+    float3 t0 = (aabbMin - rayOrigin) * reciprocal;
+    float3 t1 = (aabbMax - rayOrigin) * reciprocal;
+    float3 tNear = min(t0, t1);
+    float3 tFar = max(t0, t1);
+    tMin = max(max(tNear.x, tNear.y), max(tNear.z, 0.0f));
+    tMax = min(min(tFar.x, tFar.y), tFar.z);
+    return tMin <= tMax;
+}
+
+#define MAX_OCTREE_STACK 128
+
+struct StackEntry
+{
+    uint nodeIndex;
+    uint level;
+    int3 nodeMin; // AABB min corner in LOD-0 cell coords
+    float tMin;   // ray entry t for this node (cell-space)
+};
+
+// Parameterized octree traversal using a stack ordered by ray-t
+// Each internal node: intersect children AABBs → sort by tMin → push (far to near)
+// Leaf node: test voxel; on miss the next stack entry is already the next cell along the ray
+HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
+{
+    direction = normalizeSafe(direction);
+    if (all(direction == float3(0)))
+        return { false, int3(from), from, 0 };
+
+    float3 reciprocal = 1.0f / direction;
+    float3 rayOrigin = from;
+
+    if (ignoreFirst)
+    {
+        float3 cell = from;
+        int3 cellInt = int3(floor(from));
+        int3 dirs = int3(sign(direction));
+        leave(cell, cellInt, dirs, direction, reciprocal);
+        rayOrigin = cell + direction * 1e-4f;
+    }
+
+    // Ray must intersect the octree root AABB
+    uint rootSize = 1u << octreeMaxDepth;
+    float rootTMin, rootTMax;
+    if (!intersectAABB(rayOrigin, reciprocal, float3(0, 0, 0), float3(rootSize, rootSize, rootSize),
+                       rootTMin, rootTMax))
+        return { false, int3(rayOrigin), rayOrigin, 0 };
+
+    StackEntry stack[MAX_OCTREE_STACK];
+    uint stackTop = 0;
+    stack[stackTop++] = { 0, 0, int3(0, 0, 0), rootTMin };
+
+    while (stackTop > 0)
+    {
+        StackEntry entry = stack[--stackTop];
+
+        if (maxDistance > 0 && entry.tMin > maxDistance)
+            continue;
+
+        OctreeNode node = octreeBuffer[entry.nodeIndex];
+
+        // --- Leaf node ---
+        if (entry.level == octreeMaxDepth || node.childMask == 0)
+        {
+            uint gbIndex = node.childBase;
+            int3 cellInt = entry.nodeMin; // at leaf, nodeMin == cell coordinate
+            if (!outsideGrid(cellInt))
+            {
+                float3 hitPoint = rayOrigin + (entry.tMin + 1e-5f) * direction;
+                HitResult hit = rayHitVoxel(hitPoint, direction, cellInt, gbIndex);
+                if (hit.hit)
+                    return hit;
+            }
+            continue;
+        }
+
+        // --- Internal node: collect intersecting children ---
+        uint childLevel = entry.level + 1;
+        uint childSize = 1u << (octreeMaxDepth - childLevel);
+        int3 nodeMin = entry.nodeMin;
+
+        uint childSlots[8];
+        float childTMins[8];
+        uint childCount = 0;
+        uint mask = node.childMask;
+
+        for (uint s = 0; s < 8; s++)
+        {
+            if (!(mask & (1u << s)))
+                continue;
+
+            int3 childMin = nodeMin + int3(
+                (s & 1) ? int(childSize) : 0,
+                ((s >> 1) & 1) ? int(childSize) : 0,
+                ((s >> 2) & 1) ? int(childSize) : 0
+            );
+
+            float cTMin, cTMax;
+            if (intersectAABB(rayOrigin, reciprocal,
+                              float3(childMin), float3(childMin) + float3(float(childSize)),
+                              cTMin, cTMax))
+            {
+                childSlots[childCount] = s;
+                childTMins[childCount] = cTMin;
+                childCount++;
+            }
+        }
+
+        // Sort children by tMin ascending (insertion sort, ≤8 elements)
+        for (uint i = 1; i < childCount; i++)
+        {
+            uint slot = childSlots[i];
+            float t = childTMins[i];
+            int j = int(i) - 1;
+            while (j >= 0 && childTMins[j] > t)
+            {
+                childSlots[j + 1] = childSlots[j];
+                childTMins[j + 1] = childTMins[j];
+                j--;
+            }
+            childSlots[j + 1] = slot;
+            childTMins[j + 1] = t;
+        }
+
+        // Push children in reverse order (largest tMin first → nearest pops first)
+        for (int i = int(childCount) - 1; i >= 0; i--)
+        {
+            uint s = childSlots[i];
+            uint childIdx = node.childBase + countbits(mask & ((1u << s) - 1));
+            int3 childMin = nodeMin + int3(
+                (s & 1) ? int(childSize) : 0,
+                ((s >> 1) & 1) ? int(childSize) : 0,
+                ((s >> 2) & 1) ? int(childSize) : 0
+            );
+            stack[stackTop++] = { childIdx, childLevel, childMin, childTMins[i] };
+        }
+    }
+
+    return { false, int3(rayOrigin), rayOrigin, 0 };
+}
+
+// Dispatcher: toggle USE_BRUTE_FORCE at top of file to switch traversal modes
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
+{
+#if USE_BRUTE_FORCE
+    return rayMarchingBruteForce(from, direction, maxDistance, ignoreFirst, cone, initialDistance);
+#else
+    return rayMarchingParam(from, direction, maxDistance, ignoreFirst, cone, initialDistance);
+#endif
+}
+
+float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
+{
+    hit = rayMarching(hit.cell, direction, -1, true, cone, 0);
     return hit.hit ? 0 : 1;
 }
 
-float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, float distance)
+float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, float distance, RayCone cone)
 {
-    float ignoreDistance = 2; // 忽略光源附近的体素
+    float ignoreDistance = 2;
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, true);
+    hit = rayMarching(from, direction, distance - ignoreDistance, true, cone, 0);
     return hit.hit ? 0 : 1;
 }
 
-float3 coverageTest(HitResult hit, uint offset, float3 direction)
+float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
 {
     float coverage = 0;
+    uint offset = hit.gbIndex;
     float times = MAX_BOUNCE;
     while (times > 0)
     {
@@ -179,17 +350,18 @@ float3 coverageTest(HitResult hit, uint offset, float3 direction)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, true);
+        hit = rayMarching(hit.cell, direction, -1, true, cone, 0);
         if (!hit.hit)
             break;
-        offset = OM.vBuffer[hit.cellInt];
+        offset = hit.gbIndex;
         times--;
     }
     return valueToColor(coverage);
 }
 
-float3 debugShading(HitResult hit, uint offset, float3 v)
+float3 debugShading(HitResult hit, float3 v)
 {
+    uint offset = hit.gbIndex;
     TEBSDF bsdf = gBuffer[offset];
     Ellipsoid e = pBuffer[offset];
     float result = 0;
@@ -235,9 +407,9 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
     return lightColor * BSDF.eval(l, v, h);
 }
 
-// 随机采样方向，不确定光源是否可见
-float3 shadingDirect(HitResult hit, uint offset, float3 v, inout UniformSampleGenerator sg)
+float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
+    uint offset = hit.gbIndex;
     TEBSDF BSDF = gBuffer[offset];
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
@@ -248,27 +420,27 @@ float3 shadingDirect(HitResult hit, uint offset, float3 v, inout UniformSampleGe
 
     ls.pdf = max(ls.pdf, minPdf);
     float3 mainNormal = BSDF.surface.getMainNormal(ls.l);
-    float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x);
+    float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x, cone);
 
     if (visibility > 0)
         return visibility * shading(offset, ls.l, v, ls.h, ls.lightColor) / ls.pdf;
     return 0;
 }
 
-float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
+float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
-    // 非递归版本，先计算所有命中点，再倒回来统计
     HitResult[MAX_BOUNCE + 1] hits;
-    float3[MAX_BOUNCE + 1] ls; // 第i个采样方向即第i个体素指向第i+1个体素的方向
+    float3[MAX_BOUNCE + 1] ls;
     float3[MAX_BOUNCE + 1] hs;
-    float[MAX_BOUNCE + 1] pdfs; // 第i个pdf即对第i个体素的BSDF采样得到的权重
+    float[MAX_BOUNCE + 1] pdfs;
     uint bounce = MAX_BOUNCE;
-    uint shadingPointCount = bounce + 1; // 要着色的点的个数，未中断时为primary hit + bounce
+    uint shadingPointCount = bounce + 1;
     hits[0] = hit;
     bool leaveGrid = false;
+
     for (int i = 0; i < bounce; i++)
     {
-        uint offset = OM.vBuffer[hits[i].cellInt];
+        uint offset = hits[i].gbIndex;
         TEBSDF BSDF = gBuffer[offset];
         float3 currentV = i == 0 ? v : -ls[i - 1];
         BSDF.updateCoverage(currentV, transmittanceThreshold);
@@ -277,15 +449,21 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
         pdfs[i] = BSDF.evalPdf(ls[i], currentV, hs[i]);
         if (pdfs[i] <= 0)
         {
-            shadingPointCount = i + 1; // 0,1,...,i;第i+1个点到第i个点的间接光照无法计算，但仍要计算直接光照
+            shadingPointCount = i + 1;
             break;
         }
         pdfs[i] = max(pdfs[i], minPdf);
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, true);
+
+        // Widen cone based on BSDF roughness before next bounce
+        float rough = maxRoughness(offset);
+        float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
+        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan) };
+
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, true, nextCone, 0);
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
-            shadingPointCount = i + 1; // 0,1,...,i
+            shadingPointCount = i + 1;
             break;
         }
     }
@@ -295,17 +473,17 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
     {
         reflectLights[i] = 0;
         HitResult currentHit = hits[i];
-        uint currentOffset = OM.vBuffer[currentHit.cellInt];
+        uint currentOffset = currentHit.gbIndex;
         float3 currentV = i == 0 ? v : -ls[i - 1];
 
-        reflectLights[i] += shadingDirect(currentHit, currentOffset, currentV, sg); // 直接光照
-        if (i == shadingPointCount - 1)                                             // 最后一个着色点不计算间接光照
+        reflectLights[i] += shadingDirect(currentHit, currentV, sg, cone);
+        if (i == shadingPointCount - 1)
         {
 #if USE_ENV_MAP
             if (leaveGrid && all(hs[i] == 0))
             {
                 float3 incidentLight = gEnvMapSampler.eval(ls[i]);
-                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i]; // 透射环境光
+                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
 #endif
         }
@@ -316,9 +494,8 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg)
             HitResult nextHit = hits[i + 1];
             if (nextHit.hit)
             {
-                uint nextOffset = OM.vBuffer[nextHit.cellInt];
                 float3 incidentLight = reflectLights[i + 1];
-                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i]; // 间接光照
+                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
         }
     }
@@ -333,6 +510,7 @@ float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
     float3 cell = (posWorld.xyz - gridMin) / voxelSize;
     return cell;
 }
+
 float2 randomJitter()
 {
     UniformSampleGenerator sg = UniformSampleGenerator(0, frameIndex);
@@ -340,6 +518,7 @@ float2 randomJitter()
     jitter /= pixelCount;
     return jitter;
 }
+
 float4 renderBackground(float3 direction)
 {
 #if USE_ENV_MAP
@@ -361,51 +540,84 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     float3 from = screenCoordToCell(texCoord, 0);
     float3 to = screenCoordToCell(texCoord, 1);
     float3 delta = to - from;
-    float3 direction = normalize(delta); // 网格/世界空间下的方向相同
+    float3 direction = normalize(delta);
     psOut.color = renderBackground(direction);
+
+    if (octreeMaxDepth == 0)
+        return psOut;
 
     float2 inOut = clip(float3(0), float3(voxelCount), from, to);
     if (inOut.x < 0)
         return psOut;
 
+    // Primary ray cone: pixel footprint
+    // tan(coneHalfAngle) = tan(HalfFovY) / pixelHeight at distance=1
+    RayCone primaryCone = { tanHalfFovY / pixelCount.y };
+
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
     from = from + (inOut.x + 1e-6) * delta;
-    HitResult hit = rayMarching(from, direction, -1, false);
+    float initialDistance = (inOut.x + 1e-6) * length(delta);
+    HitResult hit = rayMarching(from, direction, -1, false, primaryCone, initialDistance);
+
     if (all(pixel == selectedPixel))
     {
         if (hit.hit)
         {
-            int offset = OM.vBuffer[hit.cellInt];
-            selectedVoxel[0] = float4(-direction, (float)offset);
+            selectedVoxel[0] = float4(-direction, (float)hit.gbIndex);
+            selectedVoxel[1] = float4(float3(hit.cellInt), 0);
         }
         else
         {
             selectedVoxel[0] = float4(-1);
+            selectedVoxel[1] = float4(-1);
         }
     }
 
     if (hit.hit)
     {
         float3 color = 0;
-        uint offset = OM.vBuffer[hit.cellInt];
         switch (drawMode)
         {
         case ABSDFDrawMode::Default:
 #if USE_EMISSIVE_LIGHTS
+        {
             float3 posW = gridMin + hit.cell * voxelSize;
             if (checkHitEmissive(posW, voxelSize.x, color))
             {
                 psOut.color = float4(color, 1);
-                return psOut; // 命中自发光面片时中止后续计算
+                return psOut;
             }
+        }
 #endif
-            color = shadingGlobal(hit, -direction, sg);
+            color = shadingGlobal(hit, -direction, sg, primaryCone);
             break;
         case ABSDFDrawMode::Coverage:
-            color = coverageTest(hit, offset, direction);
+            color = coverageTest(hit, direction, primaryCone);
+            break;
+        case ABSDFDrawMode::LODHeatmap:
+        {
+            // With octree, show depth of the leaf node as a heatmap
+            // Compute octree depth by checking cellInt relative to grid
+            uint depth = octreeMaxDepth;
+            // Simple: use voxelCount to infer approximate depth
+            float3 normalizedCell = float3(hit.cellInt) / float3(voxelCount);
+            float approxDepth = normalizedCell.x + normalizedCell.y + normalizedCell.z;
+            const float3 kDepthColors[] = {
+                float3(0.0, 1.0, 0.0), // green  — fine
+                float3(0.0, 0.8, 1.0), // cyan
+                float3(0.0, 0.0, 1.0), // blue
+                float3(0.8, 0.8, 0.0), // yellow
+                float3(1.0, 0.5, 0.0), // orange
+                float3(1.0, 0.0, 0.0), // red
+                float3(1.0, 0.0, 1.0), // magenta
+                float3(1.0, 1.0, 1.0), // white  — coarse
+            };
+            uint idx = uint(approxDepth * 8) % 8;
+            color = kDepthColors[idx];
+        }
             break;
         default:
-            color = debugShading(hit, offset, -direction);
+            color = debugShading(hit, -direction);
             break;
         }
         psOut.color = float4(color, 1);

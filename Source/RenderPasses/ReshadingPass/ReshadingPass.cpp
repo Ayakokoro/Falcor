@@ -35,7 +35,7 @@ const std::string kOutputColor = "color";
 const std::string kOutputPosW = "posW";
 const std::string kOutputMaterialID = "MaterialID";
 const std::string kOutputMaterialUV = "MaterialUV";
-const std::string kShaderFile = "E:/Project/Falcor/Source/RenderPasses/ReshadingPass/Reshading.ps.slang";
+const std::string kShaderFile = "RenderPasses/ReshadingPass/Reshading.ps.slang";
 } // namespace
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
