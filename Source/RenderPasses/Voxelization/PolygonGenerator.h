@@ -362,7 +362,10 @@ public:
         uint numThreads = 0)
     {
         if (numThreads == 0)
+        {
             numThreads = std::max(1u, std::thread::hardware_concurrency());
+            std::cout << "Availiable Thread Num = " << numThreads << "\n";
+        }
 
         mNodePolygonMap.clear();
 
@@ -477,6 +480,7 @@ public:
         };
         std::vector<BFSItem> queue;
         queue.push_back({int3(0, 0, 0), 0});
+        size_t head = 0;
 
         // Per-level tracking for node counts
         std::vector<uint32_t> levelNodeCount(maxDepth + 1, 0);
@@ -484,10 +488,10 @@ public:
         // Temporary: map nodeKey → BFS index for childBase calculation
         std::unordered_map<uint64_t, uint> keyToBFSIndex;
 
-        while (!queue.empty())
+        while (head < queue.size())
         {
-            BFSItem item = queue.front();
-            queue.erase(queue.begin());
+            BFSItem item = queue[head];
+            head++;
 
             uint64_t nodeKey = makeNodeKey(item.level, item.cellInt);
             auto it = mNodePolygonMap.find(nodeKey);

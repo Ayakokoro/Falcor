@@ -54,7 +54,7 @@ rightWall.roughness = 0.5
 
 bunny = StandardMaterial('Bunny')
 bunny.baseColor = float4(0.7, 0.7, 0.7, 1.0)
-bunny.roughness = 0.1
+bunny.roughness = 0.5
 
 # Create geometry
 

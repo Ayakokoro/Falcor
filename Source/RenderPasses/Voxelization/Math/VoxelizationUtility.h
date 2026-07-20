@@ -60,31 +60,32 @@ private:
         return math::lerp(s, e, t);
     }
 
-    static void planeClip(const std::vector<float3>& inPoly, std::vector<float3>& outPoly, int axis, float bound, bool greater)
+    static void planeClip(const float3* inData, size_t inCount, float3* outData, size_t& outCount, int axis, float bound,
+                          bool greater)
     {
         float epsilon = 0; //非0值反而导致更多体素多边形投影面积失真
-        outPoly.clear();
-        if (inPoly.empty())
+        outCount = 0;
+        if (inCount == 0)
             return;
 
-        float3 S = inPoly.back();
+        float3 S = inData[inCount - 1];
         bool Sin = greater ? S[axis] >= bound - epsilon : S[axis] <= bound + epsilon;
 
-        for (uint i = 0; i < inPoly.size(); ++i)
+        for (size_t i = 0; i < inCount; ++i)
         {
-            const float3 E = inPoly[i];
+            const float3 E = inData[i];
             const bool Ein = greater ? E[axis] >= bound - epsilon : E[axis] <= bound + epsilon;
 
             if (Ein)
             {
                 if (!Sin)
-                    outPoly.push_back(intersectAxisPlane(S, E, axis, bound));
-                outPoly.push_back(E);
+                    outData[outCount++] = intersectAxisPlane(S, E, axis, bound);
+                outData[outCount++] = E;
             }
             else
             {
                 if (Sin)
-                    outPoly.push_back(intersectAxisPlane(S, E, axis, bound));
+                    outData[outCount++] = intersectAxisPlane(S, E, axis, bound);
             }
 
             S = E;
@@ -149,31 +150,56 @@ public:
     /// </summary>
     static Polygon BoxClipTriangle(float3 minPoint, float3 maxPoint, Triangle& tri)
     {
-        std::vector<float3> vertices;
-        std::vector<float3> temp;
-        vertices.reserve(12); // 返回结果理论上不超过9个点
-        temp.reserve(12);
+        float3 vertices[12];
+        float3 temp[12];
+        size_t vertexCount = 3;
+        size_t tempCount = 0;
 
         Polygon polygon = {};
         polygon.init();
-        // 初始三角形
-        tri.addTo(vertices);
 
-        // 依次对六个面裁剪
+        vertices[0] = tri.vertices[0];
+        vertices[1] = tri.vertices[1];
+        vertices[2] = tri.vertices[2];
+
         float bounds[6] = {minPoint.x, maxPoint.x, minPoint.y, maxPoint.y, minPoint.z, maxPoint.z};
         bool greater = true;
         for (uint i = 0; i < 6; i++)
         {
-            planeClip(vertices, temp, i >> 1, bounds[i], greater);
-            vertices.swap(temp);
-            if (vertices.empty())
+            planeClip(vertices, vertexCount, temp, tempCount, i >> 1, bounds[i], greater);
+            // swap buffers
+            for (size_t j = 0; j < tempCount; j++)
+                vertices[j] = temp[j];
+            vertexCount = tempCount;
+            if (vertexCount == 0)
                 return polygon;
             greater = !greater;
         }
 
-        if (vertices.size() > 3)
-            RemoveAdjacentRepeatPoints(vertices);   //过短的边会影响相交判断
-        polygon.init(vertices);
+        if (vertexCount > 3)
+        {
+            float3 dedup[12];
+            size_t dedupCount = 0;
+            if (!approximatelyEqual(vertices[0], vertices[vertexCount - 1]))
+                dedup[dedupCount++] = vertices[0];
+            for (size_t i = 1; i < vertexCount; i++)
+            {
+                if (!approximatelyEqual(vertices[i], vertices[i - 1]))
+                    dedup[dedupCount++] = vertices[i];
+            }
+            if (dedupCount != vertexCount)
+            {
+                for (size_t i = 0; i < dedupCount; i++)
+                    vertices[i] = dedup[i];
+                vertexCount = dedupCount;
+            }
+        }
+
+        uint n = math::min(MAX_VERTEX_COUNT, (int)vertexCount);
+        polygon.count = n;
+        for (uint i = 0; i < n; i++)
+            polygon.vertices[i] = vertices[i];
+        polygon.triRef.init();
         return polygon;
     }
 };
