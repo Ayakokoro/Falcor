@@ -1,17 +1,27 @@
 
-sceneBuilder.importScene('dragon.obj')
-
 envMap = EnvMap('../EnvMap/White.exr')
 envMap.intensity = 1.0
 sceneBuilder.envMap = envMap
 
+dragon = StandardMaterial('Dragon')
+dragon.baseColor = float4(1.0, 0.7, 0.7, 1.0)
+dragon.roughness = 0.1
+
+# Create geometry
+
+dragonMesh = TriangleMesh.createFromFile('Dragon.obj', smoothNormals=True)
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Dragon', Transform(translation=float3(0.03, -0.068, 0), rotationEuler=float3(0, 0, 0), scaling=2)),
+    sceneBuilder.addTriangleMesh(dragonMesh, dragon)
+)
 
 # Add camera
 camera = Camera()
-camera.position = float3(-0.73, 0.24, 0.05)
-camera.target = float3(0.23,0, -0.11)
+camera.position = float3(0, 0.28, 1.2)
+camera.target = float3(0, 0.28, 0)
 camera.up = float3(0, 1, 0)
-camera.focalLength = 21.0
+camera.focalLength = 35.0
 sceneBuilder.addCamera(camera)
 
 # Add directional light

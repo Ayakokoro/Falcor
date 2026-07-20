@@ -213,7 +213,7 @@ struct Ellipsoid
 
         float3x3 cov = zeros();
 
-        // --- area-weighted second moment (your original code) ---
+        // --- area-weighted second moment ---
         for (size_t pi = 0; pi < range.count; ++pi)
         {
             Polygon poly = polygons[pi + range.localHead];
@@ -352,7 +352,7 @@ struct Ellipsoid
             }
         }
 
-        // Pass 3 (recommended): recompute tight radius for the final center (still guaranteed enclosing)
+        // Pass 3: recompute tight radius for the final center (still guaranteed enclosing)
         float r2 = 0.0f;
         for (size_t pi = 0; pi < range.count; ++pi)
         {
@@ -384,7 +384,6 @@ struct Ellipsoid
         B = mul(R, mul(diag3(invAxis2), transpose(R)));
         B = 0.5f * (B + transpose(B));
 
-        // keep your convention
         center -= range.cellInt;
     }
 #endif

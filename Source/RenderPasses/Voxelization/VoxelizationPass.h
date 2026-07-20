@@ -24,15 +24,17 @@ public:
     virtual bool onKeyEvent(const KeyboardEvent& keyEvent) override { return false; }
     virtual void setScene(RenderContext* pRenderContext, const ref<Scene>& pScene) override;
 
-    void clipPolygon(RenderContext* pRenderContext, const RenderData& renderData);
-    void analyzePolygon(RenderContext* pRenderContext, const RenderData& renderData);
+    void runHierarchicalClip(RenderContext* pRenderContext);
+    void uploadBuffers(RenderContext* pRenderContext);
+    void analyzeAllNodes(RenderContext* pRenderContext);
+    void readbackAndWrite(RenderContext* pRenderContext);
+    void outputDebugInfo();
     std::string getFileName();
-    void buildOctree();
 
     static uint64_t morton3(uint32_t x, uint32_t y, uint32_t z);
 
 protected:
-    void write(std::string fileName, void* gBuffer);
+    void write(std::string fileName, void* pGBuffer);
 
     ref<ComputePass> mAnalyzePolygonPass;
     ref<ComputePass> mLoadMeshPass;
@@ -43,20 +45,18 @@ protected:
     ref<Sampler> mpSampler;
 
     ref<Buffer> gBuffer;
+    ref<Buffer> pBuffer;
+    ref<Buffer> octreeBuffer;
     ref<Buffer> polygonRangeBuffer;
-    PolygonBufferGroup polygonGroup;
 
+    PolygonBufferGroup polygonGroup;
     PolygonGenerator polygonGenerator;
-    std::vector<OctreeNode> mOctreeNodes;     // all nodes concatenated level-by-level
-    std::vector<uint32_t> mOctreeNodeCounts;  // node count per level
-    uint32_t mOctreeMaxDepth = 0;
 
     uint mSampleFrequency;
     uint mMaxVoxelResolution;
     GridData& gridData;
 
-    bool mSamplingComplete;
-    bool mVoxelizationComplete;
     bool mUseMultiThread = true;
-    uint mCompleteTimes;
+    bool mEnableDebug = false;
+    bool mVoxelizationDirty = false;
 };

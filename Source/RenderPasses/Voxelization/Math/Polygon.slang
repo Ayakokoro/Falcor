@@ -30,7 +30,7 @@ struct TriangleRef
 struct Polygon
 {
     TriangleRef triRef;
-    float3 vertices[MAX_VERTEX_COUNT];
+    float3 vertices[MAX_VERTEX_COUNT]; // 存的是该多边形所在层级体素的坐标系下的坐标
     uint count;
     float3 normal;
 
@@ -123,6 +123,7 @@ struct PolygonRange
     uint localHead;
     uint count;
     int3 cellInt;
+    float nodeScale;   // size of this node in leaf voxels (2^(maxDepth - level))
 
     MUTATING
     void init(int3 c)
@@ -130,6 +131,7 @@ struct PolygonRange
         localHead = 0;
         count = 0;
         cellInt = c;
+        nodeScale = 1.0f;
     }
 
 #if !defined(HOST_CODE)

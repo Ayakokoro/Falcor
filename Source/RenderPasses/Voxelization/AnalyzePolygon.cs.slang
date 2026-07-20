@@ -11,9 +11,11 @@ import Utils.Math.MathHelpers;
 import Rendering.Materials.TexLODHelpers;
 import Scene.Material.BasicMaterialData;
 
-StructuredBuffer<Polygon> polygonBuffer; // 局部缓冲区
+StructuredBuffer<Polygon> polygonBuffer;
 StructuredBuffer<PolygonRange> polygonRangeBuffer;
+StructuredBuffer<OctreeNode> octreeBuffer;
 RWStructuredBuffer<VoxelData> gBuffer;
+RWStructuredBuffer<Ellipsoid> pBuffer;
 SamplerState sampler;
 
 cbuffer GridData
@@ -52,18 +54,18 @@ void Estimate(
             float3 from = ray.origin;
             float3 to = from + 2 * ray.direction;
             float2 inOut = clip(cellMin, cellMin + 1.f, from, to);
-            if (inOut.x >= 0) // 命中体素
+            if (inOut.x >= 0)
             {
                 float3 v = to - from;
                 to = from + inOut.y * v - cellMin;
                 from = from + inOut.x * v - cellMin;
                 inOut = e.clip(from, to);
-                if (inOut.x >= 0) // 命中图元
+                if (inOut.x >= 0)
                     hitCount++;
             }
         }
 
-        float weight = 8 * PI * sample.weight; // 正反方向的采样结果总是相同,只统计其中一个方向,则权重翻倍
+        float weight = 8 * PI * sample.weight;
         float primitiveProjArea = PROJECT_CIRCLE_AREA * hitCount / (float)sampleFrequency;
         primitiveFunc.accumulate(weight * primitiveProjArea, direction);
 
@@ -84,7 +86,7 @@ float4 sampleTextureArea(TextureHandle handle, float2 uv, float uvArea, float4 u
     return ms.sampleTexture(handle, sampler, uv, uniformValue, lod);
 }
 
-void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
+void sampleTexture(Polygon polygon, int3 cellInt, float nodeScale, int offset, inout ABSDF ABSDF)
 {
     TriangleRef triRef = polygon.triRef;
     MaterialSystem ms = gScene.materials;
@@ -95,14 +97,15 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
     StaticVertexData[3] vertices = { gScene.getVertex(vtxIndices.x), gScene.getVertex(vtxIndices.y), gScene.getVertex(vtxIndices.z) };
     for (int i = 0; i < 3; i++)
     {
-        tri.vertices[i] = (vertices[i].position - gridMin) / voxelSize; // 体素是等大立方体，因此世界空间坐标到网格的坐标不影响TBN计算
+        tri.vertices[i] = (vertices[i].position - gridMin) / voxelSize;
         tri.uvs[i] = vertices[i].texCrd;
         tri.normals[i] = vertices[i].normal;
     }
     tri.buildTBN();
     for (uint i = 0; i < polygon.count; i++)
     {
-        float2 uv = tri.lerpUV(polygon.vertices[i]);
+        float3 leafVertex = polygon.vertices[i] * nodeScale;
+        float2 uv = tri.lerpUV(leafVertex);
         uvs[i] = uv;
     }
     float area = 0;
@@ -131,7 +134,8 @@ void sampleTexture(Polygon polygon, int3 cellInt, int offset, inout ABSDF ABSDF)
     {
         float dummy;
         float3 centroid = polygon.calcCentroid(dummy);
-        normal = tri.lerpNormal(centroid);
+        float3 leafCentroid = centroid * nodeScale + float3(cellInt) * nodeScale;
+        normal = tri.lerpNormal(leafCentroid);
     }
 
     ABSDFInput input = { baseColor, spec, normal, polygon.calcArea() };
@@ -146,10 +150,13 @@ void calc(uint offset)
     uint index = offset + gBufferOffset;
     VoxelData data = gBuffer[index];
     PolygonRange range = polygonRangeBuffer[index];
+
+    // Each node independently: sample textures, fit ellipsoid, estimate SH
+    // Same path for all levels (root, internal, leaf)
     for (uint i = range.localHead; i < range.localHead + range.count; i++)
     {
         Polygon polygon = polygonBuffer[i];
-        sampleTexture(polygon, range.cellInt, index, data.ABSDF);
+        sampleTexture(polygon, range.cellInt, range.nodeScale, index, data.ABSDF);
     }
     data.ABSDF.normalizeSelf();
 
@@ -169,6 +176,7 @@ void calc(uint offset)
     data.totalProjAreaFunc = totalF;
 
     gBuffer[index] = data;
+    pBuffer[index] = data.ellipsoid;  // Per-node ellipsoid output
 }
 
 [numthreads(256, 1, 1)]

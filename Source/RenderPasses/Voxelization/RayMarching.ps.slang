@@ -42,6 +42,7 @@ cbuffer CB
     float4 clearColor;
     uint2 selectedPixel;
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
+    int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -71,12 +72,18 @@ bool outsideGrid(int3 cellInt)
 
 // Point query: descend octree from root to check if cellInt is solid.
 // Returns gbIndex if solid, 0xFFFFFFFF if empty.
+// When forcedLOD > 0, stops at the target LOD level instead of descending to leaf.
 uint lookupCell(int3 cellInt)
 {
+    uint targetLevel = (forcedLOD > 0) ? (octreeMaxDepth - (uint)forcedLOD) : octreeMaxDepth;
     uint nodeIndex = 0;
     for (uint level = 0; level < octreeMaxDepth; level++)
     {
         OctreeNode node = octreeBuffer[nodeIndex];
+
+        if (node.childMask == 0 || level == targetLevel)
+            return node.dataIndex;
+
         uint childShift = octreeMaxDepth - level - 1;
         int3 localCell = (cellInt >> childShift) & 1;
         uint childSlot = localCell.x + localCell.y * 2 + localCell.z * 4;
@@ -86,7 +93,7 @@ uint lookupCell(int3 cellInt)
         else
             return 0xFFFFFFFF;
     }
-    return octreeBuffer[nodeIndex].childBase;
+    return octreeBuffer[nodeIndex].dataIndex;
 }
 
 // Brute-force DDA traversal: step one LOD-0 cell at a time, query octree per cell.
@@ -116,7 +123,42 @@ HitResult rayMarchingBruteForce(float3 from, float3 direction, float maxDistance
         uint gbIndex = lookupCell(cellInt);
         if (gbIndex != 0xFFFFFFFF)
         {
-            HitResult hit = rayHitVoxel(cell, direction, cellInt, gbIndex);
+            HitResult hit;
+            if (forcedLOD > 0)
+            {
+                // Convert to node-normalized space for coarser-LOD ellipsoid test
+                uint nodeSize = 1u << (uint)forcedLOD;
+                int3 nodeMin = (cellInt >> (uint)forcedLOD) << (uint)forcedLOD;
+                float3 localHit = (cell - float3(nodeMin)) / float(nodeSize);
+#if CHECK_ELLIPSOID
+                Ellipsoid e = pBuffer[gbIndex];
+                float3 fr = localHit;
+                int3 sgn = int3(sign(direction));
+                float3 bdr = float3(sgn + 1) * 0.5f;
+                float3 tBdr = (bdr - fr) / direction;
+                float tMinLoc = 2.0f;
+                if (direction.x != 0 && tBdr.x < tMinLoc) tMinLoc = tBdr.x;
+                if (direction.y != 0 && tBdr.y < tMinLoc) tMinLoc = tBdr.y;
+                if (direction.z != 0 && tBdr.z < tMinLoc) tMinLoc = tBdr.z;
+                if (tMinLoc < 0) tMinLoc = 0;
+                float3 to = fr + tMinLoc * direction;
+                float2 inOut = e.clip(fr, to);
+                if (inOut.x >= 0)
+                {
+                    float3 hitLocal = fr + inOut.x * (to - fr);
+                    float3 hitCell = float3(nodeMin) + hitLocal * float(nodeSize);
+                    hit = { true, int3(floor(hitCell)), hitCell, gbIndex };
+                }
+                else
+                    hit = { false, int3(cell), cell, 0 };
+#else
+                hit = { true, nodeMin, float3(nodeMin) + localHit * float(nodeSize), gbIndex };
+#endif
+            }
+            else
+            {
+                hit = rayHitVoxel(cell, direction, cellInt, gbIndex);
+            }
             if (hit.hit)
                 return hit;
         }
@@ -233,8 +275,8 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
         // --- Leaf node ---
         if (entry.level == octreeMaxDepth || node.childMask == 0)
         {
-            uint gbIndex = node.childBase;
-            int3 cellInt = entry.nodeMin; // at leaf, nodeMin == cell coordinate
+            uint gbIndex = node.dataIndex;
+            int3 cellInt = entry.nodeMin;
             if (!outsideGrid(cellInt))
             {
                 float3 hitPoint = rayOrigin + (entry.tMin + 1e-5f) * direction;
@@ -243,6 +285,41 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
                     return hit;
             }
             continue;
+        }
+
+        // --- Forced LOD stop: treat coarser node as a "voxel" ---
+        uint nodeLOD = octreeMaxDepth - entry.level;
+        if (forcedLOD > 0 && (int)nodeLOD == forcedLOD)
+        {
+            uint gbIndex = node.dataIndex;
+            uint nodeSize = 1u << (octreeMaxDepth - entry.level);
+            float3 hitPoint = rayOrigin + (entry.tMin + 1e-5f) * direction;
+
+            // Convert to node-normalized space [0,1]^3
+            // nodeMin is in leaf-voxel space; node spans [nodeMin, nodeMin+nodeSize]
+            float3 localHit = (hitPoint - float3(entry.nodeMin)) / float(nodeSize);
+
+#if CHECK_ELLIPSOID
+            Ellipsoid e = pBuffer[gbIndex];
+            float3 from = localHit;
+            int3 signs = int3(sign(direction));
+            float3 border = float3(signs + 1) * 0.5f;
+            float3 tToBorder = (border - from) / direction;
+            float tMinLocal = 2.0f;
+            if (direction.x != 0 && tToBorder.x < tMinLocal) tMinLocal = tToBorder.x;
+            if (direction.y != 0 && tToBorder.y < tMinLocal) tMinLocal = tToBorder.y;
+            if (direction.z != 0 && tToBorder.z < tMinLocal) tMinLocal = tToBorder.z;
+            if (tMinLocal < 0) tMinLocal = 0;
+            float3 to = from + tMinLocal * direction;
+            float2 inOut = e.clip(from, to);
+            if (inOut.x < 0)
+                continue; // ellipsoid miss at this LOD
+            float3 hitLocal = from + inOut.x * (to - from);
+#else
+            float3 hitLocal = localHit;
+#endif
+            float3 hitCell = float3(entry.nodeMin) + hitLocal * float(nodeSize);
+            return { true, int3(floor(hitCell)), hitCell, gbIndex };
         }
 
         // --- Internal node: collect intersecting children ---

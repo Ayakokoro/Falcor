@@ -274,6 +274,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["renderBackGround"] = mRenderBackGround;
         cb["clearColor"] = float4(mClearColor, 0);
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
+        cb["forcedLOD"] = mForcedLOD;
         mFrameIndex++;
 
         mpFbo->attachColorTarget(pOutputColor, 0);
@@ -391,6 +392,14 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     // ---- Ray marching controls (original) ----
     if (widget.checkbox("Debug", mDebug))
         mOptionsChanged = true;
+    {
+        int maxLOD = (int)VoxelizationBase::OctreeMaxDepth;
+        if (widget.slider("Forced LOD", mForcedLOD, -1, maxLOD))
+            mOptionsChanged = true;
+        if (mForcedLOD >= 0)
+            widget.text("LOD " + std::to_string(mForcedLOD) + ": node size = " +
+                        std::to_string(1 << (maxLOD - mForcedLOD)) + " leaf voxels");
+    }
     if (widget.checkbox("Use Emissive Light", mUseEmissiveLight))
         mOptionsChanged = true;
     if (widget.checkbox("Check Ellipsoid", mCheckEllipsoid))

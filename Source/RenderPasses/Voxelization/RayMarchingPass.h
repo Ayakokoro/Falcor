@@ -56,6 +56,7 @@ private:
     bool mDebug;
     bool mRenderBackGround;
     bool mComplete;
+    int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     float3 mClearColor;
 
     bool mDisplayNDF;
