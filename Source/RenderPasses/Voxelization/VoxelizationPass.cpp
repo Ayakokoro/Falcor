@@ -1,11 +1,13 @@
 #include "VoxelizationPass.h"
 #include <fstream>
 #include <algorithm>
+#include <iomanip>
 
 namespace
 {
 const std::string kAnalyzePolygonProgramFile = "RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
 const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.slang";
+const std::string kValidationProgramFile = "RenderPasses/Voxelization/ValidateProjection.cs.slang";
 }; // namespace
 
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
@@ -36,28 +38,49 @@ RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
 
 void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    if (!mpScene || !mVoxelizationDirty)
+    if (!mpScene)
         return;
 
-    // ===== Phase 1: Load mesh + hierarchical clip (CPU) =====
-    runHierarchicalClip(pRenderContext);
+    if (mVoxelizationDirty)
+    {
+        // ===== Phase 1: Load mesh + hierarchical clip (CPU) =====
+        runHierarchicalClip(pRenderContext);
 
-    // ===== Phase 2: Upload buffers to GPU =====
-    uploadBuffers(pRenderContext);
+        // ===== Phase 2: Upload buffers to GPU =====
+        uploadBuffers(pRenderContext);
 
-    // ===== Phase 3: GPU analyze all nodes =====
-    analyzeAllNodes(pRenderContext);
+        // ===== Phase 3: GPU analyze all nodes =====
+        analyzeAllNodes(pRenderContext);
 
-    // ===== Phase 4: Readback + write file =====
-    readbackAndWrite(pRenderContext);
+        // ===== Phase 4: Readback + write file =====
+        readbackAndWrite(pRenderContext);
 
-    // ===== Phase 5: Debug output =====
-    if (mEnableDebug)
-        outputDebugInfo();
+        // ===== Phase 5: Debug output =====
+        if (mEnableDebug)
+            outputDebugInfo();
 
-    Tools::Profiler::Print();
-    Tools::Profiler::Reset();
-    mVoxelizationDirty = false;
+        Tools::Profiler::Print();
+        Tools::Profiler::Reset();
+        mVoxelizationDirty = false;
+    }
+
+    // ===== Phase 6: Validate SH fitting (on demand, independent of voxelization) =====
+    if (mValidationRequested && gBuffer && polygonGroup.size() > 0)
+    {
+        std::vector<float3> dirs;
+        dirs.push_back(normalize(float3(1, 0, 0)));
+        dirs.push_back(normalize(float3(0, 1, 0)));
+        dirs.push_back(normalize(float3(0, 0, 1)));
+        dirs.push_back(normalize(float3(1, 1, 0)));
+        dirs.push_back(normalize(float3(1, 0, 1)));
+        dirs.push_back(normalize(float3(0, 1, 1)));
+        dirs.push_back(normalize(float3(-1, 1, 0.5f)));
+        dirs.push_back(normalize(float3(0.3f, 0.7f, -0.5f)));
+        dirs.push_back(normalize(float3(1, 1, 1)));
+        dirs.push_back(normalize(float3(0.5f, -0.3f, 0.8f)));
+        validateProjection(pRenderContext, mValidationLOD, mValidationCellInt, dirs);
+        mValidationRequested = false;
+    }
 }
 
 void VoxelizationPass::compile(RenderContext* pRenderContext, const CompileData& compileData) {}
@@ -96,6 +119,26 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
     widget.checkbox("Multi-threaded Clip", mUseMultiThread);
     widget.checkbox("Debug Output", mEnableDebug);
 
+    // ---- SH Validation ----
+    if (polygonGenerator.mOctreeMaxDepth > 0)
+    {
+        widget.text("--- SH Validation ---");
+        int lodMax = (int)polygonGenerator.mOctreeMaxDepth;
+        widget.var("LOD Level", (int&)mValidationLOD, 0, lodMax);
+
+        int maxCoord = (1 << mValidationLOD) - 1;
+        if (maxCoord < 0) maxCoord = 0;
+        widget.var("CellInt X", (int&)mValidationCellInt.x, 0, maxCoord);
+        widget.var("CellInt Y", (int&)mValidationCellInt.y, 0, maxCoord);
+        widget.var("CellInt Z", (int&)mValidationCellInt.z, 0, maxCoord);
+
+        if (widget.button("Validate SH"))
+        {
+            mValidationRequested = true;
+            requestRecompile();
+        }
+    }
+
     if (mpScene && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
@@ -109,6 +152,7 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mpScene = pScene;
     mAnalyzePolygonPass = nullptr;
     mLoadMeshPass = nullptr;
+    mValidationPass = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
 
@@ -222,7 +266,8 @@ void VoxelizationPass::uploadBuffers(RenderContext* pRenderContext)
     uint totalNodeCount = (uint)polygonGenerator.gBuffer.size();
 
     // gBuffer: per-node VoxelData (placeholder, filled by GPU)
-    gBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), totalNodeCount, ResourceBindFlags::UnorderedAccess);
+    gBuffer = mpDevice->createStructuredBuffer(sizeof(VoxelData), totalNodeCount,
+                                               ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     gBuffer->setBlob(polygonGenerator.gBuffer.data(), 0, totalNodeCount * sizeof(VoxelData));
 
     // pBuffer: per-node Ellipsoid (filled by GPU alongside gBuffer)
@@ -309,9 +354,9 @@ void VoxelizationPass::analyzeAllNodes(RenderContext* pRenderContext)
         cb_grid["voxelCount"] = gridData.voxelCount;
 
         mAnalyzePolygonPass->execute(pRenderContext, uint3(groupVoxelCount, 1, 1));
+        pRenderContext->submit(true);
     }
 
-    pRenderContext->submit(true);
     Tools::Profiler::EndSample("Analyze Polygons");
 }
 
@@ -465,4 +510,162 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer)
 
     f.close();
     VoxelizationBase::FileUpdated = true;
+}
+
+// ========================================================================
+// SH Validation: find octree node + compare exact vs SH projection area
+// ========================================================================
+
+uint32_t VoxelizationPass::findNodeByLODAndCell(int3 targetCellInt, uint32_t targetLOD)
+{
+    const auto& nodes = polygonGenerator.mOctreeNodes;
+
+    std::cout << "Octree Max Depth = " << polygonGenerator.mOctreeMaxDepth << "\n";
+    if (nodes.empty() || targetLOD > polygonGenerator.mOctreeMaxDepth)
+        return UINT32_MAX;
+
+    uint32_t nodeIndex = 0;
+    uint32_t maxDepth = polygonGenerator.mOctreeMaxDepth;
+
+    for (uint32_t level = 0; level <= maxDepth; level++)
+    {
+        const OctreeNode& node = nodes[nodeIndex];
+
+        if (level == targetLOD)
+            return node.dataIndex;
+
+        if (node.childMask == 0)
+            return UINT32_MAX;
+
+        uint32_t shift = targetLOD - level - 1;
+        uint32_t lx = (targetCellInt.x >> shift) & 1;
+        uint32_t ly = (targetCellInt.y >> shift) & 1;
+        uint32_t lz = (targetCellInt.z >> shift) & 1;
+        uint32_t childSlot = lx + ly * 2 + lz * 4;
+
+        if (node.childMask & (1u << childSlot))
+        {
+            uint32_t childOffset = node.childMask & ((1u << childSlot) - 1);
+            uint32_t childIdx = 0;
+            while (childOffset) { childIdx += childOffset & 1; childOffset >>= 1; }
+            nodeIndex = node.childBase + childIdx;
+        }
+        else
+        {
+            return UINT32_MAX;
+        }
+    }
+    return UINT32_MAX;
+}
+
+void VoxelizationPass::validateProjection(RenderContext* pRenderContext, uint32_t lodLevel,
+                                          int3 cellInt, const std::vector<float3>& directions)
+{
+    if (directions.empty())
+        return;
+
+    uint32_t targetIdx = findNodeByLODAndCell(cellInt, lodLevel);
+    if (targetIdx == UINT32_MAX)
+    {
+        std::cerr << "[Validate] Node not found at LOD=" << lodLevel
+                  << " cellInt=" << ToString(cellInt) << std::endl;
+        return;
+    }
+
+    // Find which polygon batch contains this node
+    int batchIdx = -1;
+    for (uint b = 0; b < polygonGroup.size(); b++)
+    {
+        uint offset = polygonGroup.getVoxelOffset(b);
+        uint count = polygonGroup.getVoxelCount(b);
+        if (targetIdx >= offset && targetIdx < offset + count)
+        {
+            batchIdx = (int)b;
+            break;
+        }
+    }
+    if (batchIdx < 0)
+    {
+        std::cerr << "[Validate] Node gbIndex=" << targetIdx << " not found in any batch" << std::endl;
+        return;
+    }
+
+    Tools::Profiler::BeginSample("Validate Projection");
+
+    // Create or reuse validation pass
+    if (!mValidationPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kValidationProgramFile).csEntry("main");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        mValidationPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
+    }
+
+    uint dirCount = (uint)directions.size();
+
+    // Upload directions buffer
+    auto dirBuffer = mpDevice->createStructuredBuffer(
+        sizeof(float3), dirCount,
+        ResourceBindFlags::ShaderResource
+    );
+    dirBuffer->setBlob(directions.data(), 0, dirCount * sizeof(float3));
+
+    // Create output buffer
+    auto outputBuffer = mpDevice->createStructuredBuffer(
+        sizeof(DirectionValidation), dirCount,
+        ResourceBindFlags::UnorderedAccess
+    );
+
+    ShaderVar var = mValidationPass->getRootVar();
+    var["polygonBuffer"] = polygonGroup.get(batchIdx);
+    var["polygonRangeBuffer"] = polygonRangeBuffer;
+    var["gBuffer"] = gBuffer;
+    var["directions"] = dirBuffer;
+    var["validationOutput"] = outputBuffer;
+
+    auto cb = var["CB"];
+    cb["targetGBufferIndex"] = targetIdx;
+    cb["directionCount"] = dirCount;
+
+    uint dispatchX = (dirCount + 63) / 64;
+    mValidationPass->execute(pRenderContext, uint3(dispatchX, 1, 1));
+    pRenderContext->submit(true);
+
+    // Readback
+    ref<Buffer> cpuBuffer = copyToCpu(mpDevice, pRenderContext, outputBuffer);
+    pRenderContext->submit(true);
+    const DirectionValidation* pResults =
+        reinterpret_cast<const DirectionValidation*>(cpuBuffer->map());
+
+    std::cout << "\n===== SH Validation Results =====" << std::endl;
+    std::cout << "LOD=" << lodLevel << " cellInt=" << ToString(cellInt)
+              << " gbIndex=" << targetIdx << " batch=" << batchIdx << std::endl;
+    std::cout << "DirectionCount=" << dirCount << std::endl;
+    std::cout << std::endl;
+    std::cout << std::fixed << std::setprecision(6);
+    for (uint i = 0; i < dirCount; i++)
+    {
+        const auto& r = pResults[i];
+        float visError = (r.exactVisibleArea > 0)
+            ? abs(r.shVisibleArea - r.exactVisibleArea) / r.exactVisibleArea * 100.0f
+            : 0.0f;
+        float totalError = (r.exactTotalArea > 0)
+            ? abs(r.shTotalArea - r.exactTotalArea) / r.exactTotalArea * 100.0f
+            : 0.0f;
+
+        std::cout << "Dir[" << i << "] (" << r.direction.x << "," << r.direction.y << "," << r.direction.z << ")"
+                  << "  visExact=" << r.exactVisibleArea
+                  << " visSH=" << r.shVisibleArea
+                  << " err=" << visError << "%"
+                  << "  |  totExact=" << r.exactTotalArea
+                  << " totSH=" << r.shTotalArea
+                  << " err=" << totalError << "%"
+                  << std::endl;
+    }
+    std::cout << "=================================\n" << std::endl;
+
+    cpuBuffer->unmap();
+
+    Tools::Profiler::EndSample("Validate Projection");
 }

@@ -1,0 +1,31 @@
+envMap = EnvMap('../EnvMap/White.exr')
+envMap.intensity = 1.0
+sceneBuilder.envMap = envMap
+
+# importScene 会:
+#   1. 解析 .obj 几何体 (保留所有子 mesh)
+#   2. 解析 .mtl 材质参数 (base color, specular, roughness 等)
+#   3. 自动加载 MTL 中引用的纹理 (map_Kd → BaseColor 等)
+#   OBJ 默认使用 SpecGloss 着色模型
+sceneBuilder.importScene('rainbow_coral_reef.obj')
+
+# 可以通过名称获取并调整导入的材质
+m = sceneBuilder.getMaterial("Material_0")
+if m:
+    # 如果纹理 Image_0.jpg 存在，会自动加载；否则可手动设置颜色
+    # m.baseColor = float4(1.0, 0.7, 0.7, 1.0)
+    pass
+
+# Add camera
+camera = Camera()
+camera.position = float3(3.2332, 1.1581, -1.1995)
+camera.target = float3(2.3229, 1.0297, -0.8060)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)
+
+# Add directional light
+# dirLight = DirectionalLight('Directional light')
+# dirLight.intensity = float3(2.0, 1.54, 1.08)
+# dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
+# sceneBuilder.addLight(dirLight)

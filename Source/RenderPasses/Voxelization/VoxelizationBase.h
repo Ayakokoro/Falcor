@@ -167,6 +167,7 @@ private:
 
 public:
     uint maxPolygonCount = 256000;
+    static constexpr uint kSafePerNodePolygonLimit = 65536; // per-thread GPU safety cap to avoid TDR
     PolygonBufferGroup(ref<Device> device, GridData& gridData) : gridData(gridData), mpDevice(device) {}
 
     uint getVoxelOffset(uint index) const
@@ -217,9 +218,18 @@ public:
         for (size_t v = 0; v < polygonArrays.size(); ++v)
         {
             const std::vector<Polygon>& polys = polygonArrays[v];
-            const uint n = (uint)polys.size();
+            uint n = (uint)polys.size();
 
-            FALCOR_ASSERT(n > 0 && n <= maxPolygonCount);
+            if (n == 0)
+                continue;
+
+            uint effectiveLimit = std::min(maxPolygonCount, kSafePerNodePolygonLimit);
+            if (n > effectiveLimit)
+            {
+                logWarning("setBlob: node has " + std::to_string(n) + " polygons, capping to " +
+                           std::to_string(effectiveLimit));
+                n = effectiveLimit;
+            }
 
             if (currentPolygonCount + n > maxPolygonCount)
             {
@@ -232,7 +242,7 @@ public:
             gridData.maxPolygonCount = max(gridData.maxPolygonCount, n);
             gridData.totalPolygonCount += n;
 
-            currentPolygons.insert(currentPolygons.end(), polys.begin(), polys.end());
+            currentPolygons.insert(currentPolygons.end(), polys.begin(), polys.begin() + n);
             currentPolygonCount += n;
             currentVoxelCount++;
         }

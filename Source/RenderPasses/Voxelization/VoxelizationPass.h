@@ -31,6 +31,14 @@ public:
     void outputDebugInfo();
     std::string getFileName();
 
+    // Find a node's gBuffer index by traversing the octree from root
+    uint32_t findNodeByLODAndCell(int3 targetCellInt, uint32_t targetLOD);
+
+    // Validate SH fitting: compare ground truth (rasterization) vs SH reconstruction
+    // directions are in world space, normalized
+    void validateProjection(RenderContext* pRenderContext, uint32_t lodLevel,
+                            int3 cellInt, const std::vector<float3>& directions);
+
     static uint64_t morton3(uint32_t x, uint32_t y, uint32_t z);
 
 protected:
@@ -38,6 +46,7 @@ protected:
 
     ref<ComputePass> mAnalyzePolygonPass;
     ref<ComputePass> mLoadMeshPass;
+    ref<ComputePass> mValidationPass;
 
     ref<Device> mpDevice;
     ref<Scene> mpScene;
@@ -59,4 +68,9 @@ protected:
     bool mUseMultiThread = true;
     bool mEnableDebug = false;
     bool mVoxelizationDirty = false;
+
+    // Validation state
+    int3 mValidationCellInt = int3(0, 0, 0);
+    uint32_t mValidationLOD = 0;
+    bool mValidationRequested = false;
 };
