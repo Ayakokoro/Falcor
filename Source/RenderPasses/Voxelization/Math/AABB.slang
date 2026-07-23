@@ -68,6 +68,12 @@ struct AABBInt
 
 inline float2 intersect(float p1, float p2, float p0, float q)
 {
+    if (abs(q) < 1e-12f)
+    {
+        if (p0 < p1 || p0 > p2)
+            return float2(2, -2); // outside slab → impossible interval
+        return float2(-1e30f, 1e30f); // inside slab → no constraint on t
+    }
     float u1 = (p1 - p0) / q;
     float u2 = (p2 - p0) / q;
     if (u1 > u2)

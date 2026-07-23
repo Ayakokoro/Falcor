@@ -13,7 +13,7 @@ import Utils.Sampling.UniformSampleGenerator;
 #define MAX_OCTREE_DEPTH 12
 #endif
 
-#define USE_BRUTE_FORCE 0  // 1 = DDA cell-by-cell, 0 = parameterized octree traversal
+#define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
 StructuredBuffer<TEBSDF> gBuffer;
 StructuredBuffer<Ellipsoid> pBuffer;
@@ -70,104 +70,6 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
-// Point query: descend octree from root to check if cellInt is solid.
-// Returns gbIndex if solid, 0xFFFFFFFF if empty.
-// When forcedLOD > 0, stops at the target LOD level instead of descending to leaf.
-uint lookupCell(int3 cellInt)
-{
-    uint targetLevel = (forcedLOD > 0) ? (octreeMaxDepth - (uint)forcedLOD) : octreeMaxDepth;
-    uint nodeIndex = 0;
-    for (uint level = 0; level < octreeMaxDepth; level++)
-    {
-        OctreeNode node = octreeBuffer[nodeIndex];
-
-        if (node.childMask == 0 || level == targetLevel)
-            return node.dataIndex;
-
-        uint childShift = octreeMaxDepth - level - 1;
-        int3 localCell = (cellInt >> childShift) & 1;
-        uint childSlot = localCell.x + localCell.y * 2 + localCell.z * 4;
-
-        if ((node.childMask & (1u << childSlot)) != 0 )
-            nodeIndex = node.childBase + countbits(node.childMask & ((1u << childSlot) - 1));
-        else
-            return 0xFFFFFFFF;
-    }
-    return octreeBuffer[nodeIndex].dataIndex;
-}
-
-// Brute-force DDA traversal: step one LOD-0 cell at a time, query octree per cell.
-// Used for A/B testing against the parameterized traversal.
-HitResult rayMarchingBruteForce(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
-{
-    direction = normalizeSafe(direction);
-    if (all(direction == float3(0)))
-        return { false, int3(from), from, 0 };
-
-    float3 cell = from;
-    int3 cellInt = int3(floor(from));
-    float distance = initialDistance;
-
-    float3 reciprocal_direction = 1.0f / direction;
-    int3 directions = int3(sign(direction));
-    if (ignoreFirst)
-        distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
-
-    while (true)
-    {
-        if (outsideGrid(cellInt))
-            break;
-        if (maxDistance > 0 && distance > maxDistance)
-            break;
-
-        uint gbIndex = lookupCell(cellInt);
-        if (gbIndex != 0xFFFFFFFF)
-        {
-            HitResult hit;
-            if (forcedLOD > 0)
-            {
-                // Convert to node-normalized space for coarser-LOD ellipsoid test
-                uint nodeSize = 1u << (uint)forcedLOD;
-                int3 nodeMin = (cellInt >> (uint)forcedLOD) << (uint)forcedLOD;
-                float3 localHit = (cell - float3(nodeMin)) / float(nodeSize);
-#if CHECK_ELLIPSOID
-                Ellipsoid e = pBuffer[gbIndex];
-                float3 fr = localHit;
-                int3 sgn = int3(sign(direction));
-                float3 bdr = float3(sgn + 1) * 0.5f;
-                float3 tBdr = (bdr - fr) / direction;
-                float tMinLoc = 2.0f;
-                if (direction.x != 0 && tBdr.x < tMinLoc) tMinLoc = tBdr.x;
-                if (direction.y != 0 && tBdr.y < tMinLoc) tMinLoc = tBdr.y;
-                if (direction.z != 0 && tBdr.z < tMinLoc) tMinLoc = tBdr.z;
-                if (tMinLoc < 0) tMinLoc = 0;
-                float3 to = fr + tMinLoc * direction;
-                float2 inOut = e.clip(fr, to);
-                if (inOut.x >= 0)
-                {
-                    float3 hitLocal = fr + inOut.x * (to - fr);
-                    float3 hitCell = float3(nodeMin) + hitLocal * float(nodeSize);
-                    hit = { true, int3(floor(hitCell)), hitCell, gbIndex };
-                }
-                else
-                    hit = { false, int3(cell), cell, 0 };
-#else
-                hit = { true, nodeMin, float3(nodeMin) + localHit * float(nodeSize), gbIndex };
-#endif
-            }
-            else
-            {
-                hit = rayHitVoxel(cell, direction, cellInt, gbIndex);
-            }
-            if (hit.hit)
-                return hit;
-        }
-
-        distance += leave(cell, cellInt, directions, direction, reciprocal_direction);
-    }
-    return { false, cellInt, cellInt + 0.5f, 0 };
-}
-
 // Extract max roughness across all lobes of a TEBSDF at gbIndex
 float maxRoughness(uint gbIndex)
 {
@@ -207,18 +109,33 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex)
     return { false, cellInt, cellInt + 0.5f, 0 };
 }
 
-// Ray-slab AABB intersection in cell space
-// tMin is clamped to 0 (only considers what's ahead of the ray origin)
+// Ray-slab AABB intersection in cell space.
+// Handles axis-aligned rays (direction component = 0) to avoid NaN from 0*inf.
 bool intersectAABB(float3 rayOrigin, float3 reciprocal, float3 aabbMin, float3 aabbMax,
                    out float tMin, out float tMax)
 {
-    float3 t0 = (aabbMin - rayOrigin) * reciprocal;
-    float3 t1 = (aabbMax - rayOrigin) * reciprocal;
-    float3 tNear = min(t0, t1);
-    float3 tFar = max(t0, t1);
-    tMin = max(max(tNear.x, tNear.y), max(tNear.z, 0.0f));
-    tMax = min(min(tFar.x, tFar.y), tFar.z);
-    return tMin <= tMax;
+    tMin = 0.0f;
+    tMax = 1e30f;
+
+    for (int i = 0; i < 3; i++)
+    {
+        float t0 = (aabbMin[i] - rayOrigin[i]) * reciprocal[i];
+        float t1 = (aabbMax[i] - rayOrigin[i]) * reciprocal[i];
+
+        if (isinf(t0) || isinf(t1) || isnan(t0) || isnan(t1))
+        {
+            if (rayOrigin[i] < aabbMin[i] || rayOrigin[i] > aabbMax[i])
+                return false;
+            continue;
+        }
+
+        if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
+        tMin = max(tMin, t0);
+        tMax = min(tMax, t1);
+        if (tMin > tMax)
+            return false;
+    }
+    return tMin <= tMax + 1e-6f;
 }
 
 #define MAX_OCTREE_STACK 128
@@ -234,7 +151,7 @@ struct StackEntry
 // Parameterized octree traversal using a stack ordered by ray-t
 // Each internal node: intersect children AABBs → sort by tMin → push (far to near)
 // Leaf node: test voxel; on miss the next stack entry is already the next cell along the ray
-HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
@@ -249,7 +166,7 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
         int3 cellInt = int3(floor(from));
         int3 dirs = int3(sign(direction));
         leave(cell, cellInt, dirs, direction, reciprocal);
-        rayOrigin = cell + direction * 1e-4f;
+        rayOrigin = cell + direction * RAY_BIAS;
     }
 
     // Ray must intersect the octree root AABB
@@ -279,7 +196,7 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
             int3 cellInt = entry.nodeMin;
             if (!outsideGrid(cellInt))
             {
-                float3 hitPoint = rayOrigin + (entry.tMin + 1e-5f) * direction;
+                float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
                 HitResult hit = rayHitVoxel(hitPoint, direction, cellInt, gbIndex);
                 if (hit.hit)
                     return hit;
@@ -293,7 +210,7 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
         {
             uint gbIndex = node.dataIndex;
             uint nodeSize = 1u << (octreeMaxDepth - entry.level);
-            float3 hitPoint = rayOrigin + (entry.tMin + 1e-5f) * direction;
+            float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
 
             // Convert to node-normalized space [0,1]^3
             // nodeMin is in leaf-voxel space; node spans [nodeMin, nodeMin+nodeSize]
@@ -371,6 +288,9 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
         }
 
         // Push children in reverse order (largest tMin first → nearest pops first)
+        if (stackTop + childCount > MAX_OCTREE_STACK)
+            return { false, int3(rayOrigin), rayOrigin, 0 };
+
         for (int i = int(childCount) - 1; i >= 0; i--)
         {
             uint s = childSlots[i];
@@ -387,15 +307,6 @@ HitResult rayMarchingParam(float3 from, float3 direction, float maxDistance, boo
     return { false, int3(rayOrigin), rayOrigin, 0 };
 }
 
-// Dispatcher: toggle USE_BRUTE_FORCE at top of file to switch traversal modes
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
-{
-#if USE_BRUTE_FORCE
-    return rayMarchingBruteForce(from, direction, maxDistance, ignoreFirst, cone, initialDistance);
-#else
-    return rayMarchingParam(from, direction, maxDistance, ignoreFirst, cone, initialDistance);
-#endif
-}
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {

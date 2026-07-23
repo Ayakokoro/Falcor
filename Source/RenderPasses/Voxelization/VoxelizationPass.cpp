@@ -139,6 +139,8 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         }
     }
 
+    widget.checkbox("LerpNormal", mLerpNormal);
+
     if (mpScene && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
@@ -325,6 +327,8 @@ void VoxelizationPass::analyzeAllNodes(RenderContext* pRenderContext)
         defines.add(mpSampleGenerator->getDefines());
         mAnalyzePolygonPass = ComputePass::create(mpDevice, desc, defines, true);
     }
+
+    mAnalyzePolygonPass->addDefine("LERP_NORMAL", mLerpNormal ? "1" : "0");
 
     uint totalNodeCount = (uint)polygonGenerator.gBuffer.size();
     uint groupCount = polygonGroup.size();

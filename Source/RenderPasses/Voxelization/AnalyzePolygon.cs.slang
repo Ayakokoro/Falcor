@@ -97,9 +97,11 @@ void sampleTexture(Polygon polygon, int3 cellInt, float nodeScale, int offset, i
     StaticVertexData[3] vertices = { gScene.getVertex(vtxIndices.x), gScene.getVertex(vtxIndices.y), gScene.getVertex(vtxIndices.z) };
     for (int i = 0; i < 3; i++)
     {
-        tri.vertices[i] = (vertices[i].position - gridMin) / voxelSize;
+        tri.vertices[i] = (vertices[i].position - gridMin) / voxelSize; // 叶子体素坐标
         tri.uvs[i] = vertices[i].texCrd;
+#if LERP_NORMAL
         tri.normals[i] = vertices[i].normal;
+#endif
     }
     tri.buildTBN();
     for (uint i = 0; i < polygon.count; i++)
@@ -124,19 +126,17 @@ void sampleTexture(Polygon polygon, int3 cellInt, float nodeScale, int offset, i
     float3 baseColor = sampleTextureArea(data.texBaseColor, center, area, data.baseColor).rgb;
     float4 spec = sampleTextureArea(data.texSpecular, center, area, data.specular);
     float3 normal;
-    if (data.texNormalMap.getMode() == TextureHandle::Mode::Texture)
-    {
-        normal = sampleTextureArea(data.texNormalMap, center, area, float4(0, 0, 1, 0)).rgb;
-        normal = normal * 2.f - 1.f;
-        normal = calcShadingNormal(tri.TBN, normal);
-    }
-    else
-    {
-        float dummy;
-        float3 centroid = polygon.calcCentroid(dummy);
-        float3 leafCentroid = centroid * nodeScale + float3(cellInt) * nodeScale;
-        normal = tri.lerpNormal(leafCentroid);
-    }
+
+#if LERP_NORMAL
+    float dummy;
+    float3 centroid = polygon.calcCentroid(dummy);
+    float3 leafCentroid = centroid * nodeScale;
+    normal = tri.lerpNormal(leafCentroid);
+#else
+    normal = sampleTextureArea(data.texNormalMap, center, area, float4(0, 0, 1, 0)).rgb;
+    normal = normal * 2.f - 1.f;
+    normal = calcShadingNormal(tri.TBN, normal);
+#endif
 
     ABSDFInput input = { baseColor, spec, normal, polygon.calcArea() };
     ABSDF.accumulate(input);

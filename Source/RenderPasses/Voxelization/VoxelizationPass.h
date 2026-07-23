@@ -73,4 +73,6 @@ protected:
     int3 mValidationCellInt = int3(0, 0, 0);
     uint32_t mValidationLOD = 0;
     bool mValidationRequested = false;
+
+    bool mLerpNormal;
 };

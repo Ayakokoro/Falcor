@@ -212,7 +212,7 @@ struct Triangle
                 len = 1;
             }
         }
-        N = normalize(N);
+        N /= len;
         float3 T, B;
         if (abs(D) < 1e-8)
         {
