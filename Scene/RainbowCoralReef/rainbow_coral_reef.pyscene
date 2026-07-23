@@ -1,20 +1,33 @@
-envMap = EnvMap('../EnvMap/White.exr')
-envMap.intensity = 1.0
-sceneBuilder.envMap = envMap
+# envMap = EnvMap('../EnvMap/White.exr')
+# envMap.intensity = 1.0
+# sceneBuilder.envMap = envMap
 
-# importScene 会:
-#   1. 解析 .obj 几何体 (保留所有子 mesh)
-#   2. 解析 .mtl 材质参数 (base color, specular, roughness 等)
-#   3. 自动加载 MTL 中引用的纹理 (map_Kd → BaseColor 等)
-#   OBJ 默认使用 SpecGloss 着色模型
-sceneBuilder.importScene('rainbow_coral_reef.obj')
+# # importScene 会:
+# #   1. 解析 .obj 几何体 (保留所有子 mesh)
+# #   2. 解析 .mtl 材质参数 (base color, specular, roughness 等)
+# #   3. 自动加载 MTL 中引用的纹理 (map_Kd → BaseColor 等)
+# #   OBJ 默认使用 SpecGloss 着色模型
+# sceneBuilder.importScene('rainbow_coral_reef.obj')
 
-# 可以通过名称获取并调整导入的材质
-m = sceneBuilder.getMaterial("Material_0")
-if m:
-    # 如果纹理 Image_0.jpg 存在，会自动加载；否则可手动设置颜色
-    # m.baseColor = float4(1.0, 0.7, 0.7, 1.0)
-    pass
+# # 可以通过名称获取并调整导入的材质
+# m = sceneBuilder.getMaterial("Material_0")
+# if m:
+#     # 如果纹理 Image_0.jpg 存在，会自动加载；否则可手动设置颜色
+#     # m.baseColor = float4(1.0, 0.7, 0.7, 1.0)
+#     pass
+
+coral_reef_mesh = TriangleMesh.createFromFile('rainbow_coral_reef.obj')
+
+coral_reef_mtl = StandardMaterial('CoralReefMtl')
+coral_reef_mtl.loadTexture(MaterialTextureSlot.BaseColor, 'textures/Image_0.jpeg')
+coral_reef_mtl.roughness = 1.0
+coral_reef_mtl.metallic = 0.0
+
+coral_reef_mesh_id = sceneBuilder.addTriangleMesh(coral_reef_mesh, coral_reef_mtl)
+
+coral_reef_node_id = sceneBuilder.addNode('CoralReef', Transform(scaling=1))
+
+sceneBuilder.addMeshInstance(coral_reef_node_id, coral_reef_mesh_id)
 
 # Add camera
 camera = Camera()
@@ -25,7 +38,7 @@ camera.focalLength = 35.0
 sceneBuilder.addCamera(camera)
 
 # Add directional light
-# dirLight = DirectionalLight('Directional light')
-# dirLight.intensity = float3(2.0, 1.54, 1.08)
-# dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
-# sceneBuilder.addLight(dirLight)
+dirLight = DirectionalLight('Directional light')
+dirLight.intensity = float3(20.0, 10.54, 10.08)
+dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
+sceneBuilder.addLight(dirLight)

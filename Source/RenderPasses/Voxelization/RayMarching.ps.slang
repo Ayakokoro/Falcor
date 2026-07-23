@@ -673,24 +673,25 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
-            // With octree, show depth of the leaf node as a heatmap
-            // Compute octree depth by checking cellInt relative to grid
-            uint depth = octreeMaxDepth;
-            // Simple: use voxelCount to infer approximate depth
-            float3 normalizedCell = float3(hit.cellInt) / float3(voxelCount);
-            float approxDepth = normalizedCell.x + normalizedCell.y + normalizedCell.z;
-            const float3 kDepthColors[] = {
-                float3(0.0, 1.0, 0.0), // green  — fine
-                float3(0.0, 0.8, 1.0), // cyan
-                float3(0.0, 0.0, 1.0), // blue
-                float3(0.8, 0.8, 0.0), // yellow
-                float3(1.0, 0.5, 0.0), // orange
-                float3(1.0, 0.0, 0.0), // red
-                float3(1.0, 0.0, 1.0), // magenta
-                float3(1.0, 1.0, 1.0), // white  — coarse
-            };
-            uint idx = uint(approxDepth * 8) % 8;
-            color = kDepthColors[idx];
+            // // With octree, show depth of the leaf node as a heatmap
+            // // Compute octree depth by checking cellInt relative to grid
+            // uint depth = octreeMaxDepth;
+            // // Simple: use voxelCount to infer approximate depth
+            // float3 normalizedCell = float3(hit.cellInt) / float3(voxelCount);
+            // float approxDepth = normalizedCell.x + normalizedCell.y + normalizedCell.z;
+            // const float3 kDepthColors[] = {
+            //     float3(0.0, 1.0, 0.0), // green  — fine
+            //     float3(0.0, 0.8, 1.0), // cyan
+            //     float3(0.0, 0.0, 1.0), // blue
+            //     float3(0.8, 0.8, 0.0), // yellow
+            //     float3(1.0, 0.5, 0.0), // orange
+            //     float3(1.0, 0.0, 0.0), // red
+            //     float3(1.0, 0.0, 1.0), // magenta
+            //     float3(1.0, 1.0, 1.0), // white  — coarse
+            // };
+            // uint idx = uint(approxDepth * 8) % 8;
+            // color = kDepthColors[idx];
+            color = maxRoughness(hit.gbIndex);
         }
             break;
         default:

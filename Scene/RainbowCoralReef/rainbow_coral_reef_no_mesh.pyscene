@@ -1,0 +1,19 @@
+
+# envMap = EnvMap('../EnvMap/White.exr')
+# envMap.intensity = 1.0
+# sceneBuilder.envMap = envMap
+
+# Add camera
+camera = Camera()
+camera.position = float3(3.2332, 1.1581, -1.1995)
+camera.target = float3(2.3229, 1.0297, -0.8060)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)
+
+# Add directional light
+dirLight = DirectionalLight('Directional light')
+dirLight.intensity = float3(20.0, 10.54, 10.08)
+dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
+sceneBuilder.addLight(dirLight)
+

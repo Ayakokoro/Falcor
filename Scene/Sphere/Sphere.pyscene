@@ -1,0 +1,25 @@
+envMap = EnvMap('../EnvMap/White.exr')
+envMap.intensity = 1.0
+sceneBuilder.envMap = envMap
+
+sphere_mtl = StandardMaterial('SphereMtl')
+sphere_mtl.baseColor = float4(0.63, 0.065, 0.05, 1.0)
+sphere_mtl.roughness = 1.0
+
+sphere_mesh = TriangleMesh.createSphere()
+
+sceneBuilder.addMeshInstance(
+    sceneBuilder.addNode('Sphere', Transform(scaling=1)),
+    sceneBuilder.addTriangleMesh(sphere_mesh, sphere_mtl)
+)
+
+# Add camera
+camera = Camera()
+camera.position = float3(3.2332, 1.1581, -1.1995)
+camera.target = float3(2.3229, 1.0297, -0.8060)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)
+
+
+
