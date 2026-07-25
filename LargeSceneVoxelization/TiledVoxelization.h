@@ -549,6 +549,7 @@ private:
                     mergedNodes[levelStart + i]  = sn[i];
                     mergedVoxels[levelStart + i] = sv[i];
                     mergedCells[levelStart + i]  = sc[i];
+                    mergedNodes[levelStart + i].dataIndex = levelStart + i;
                 }
 
                 // Update remap for this level so childBase fixup uses new positions
@@ -583,6 +584,20 @@ private:
         // ---- Step 2: Build upper octree levels (0 .. tileRootLevel-1) ----
         uint tileRootLevel = mConfig.tileLevel;
         if (tileRootLevel > 0) {
+            auto pack = [](const int3& c) -> uint64_t {
+                return (uint64_t)(uint32_t)c.x
+                    | ((uint64_t)(uint32_t)c.y << 21)
+                    | ((uint64_t)(uint32_t)c.z << 42);
+            };
+            auto unpack = [](uint64_t k) -> int3 {
+                return int3((int)(k & 0x1FFFFF),
+                            (int)((k >> 21) & 0x1FFFFF),
+                            (int)((k >> 42) & 0x1FFFFF));
+            };
+            auto octant = [](const int3& c) -> uint {
+                return (uint)(c.x & 1) | ((uint)(c.y & 1) << 1) | ((uint)(c.z & 1) << 2);
+            };
+
             for (int buildLvl = (int)tileRootLevel - 1; buildLvl >= 0; buildLvl--) {
                 uint childLvl = buildLvl + 1;
 
@@ -591,25 +606,54 @@ private:
                 uint childCount = mergedCounts[childLvl];
                 if (childCount == 0) continue;
 
-                // Group children by parent cell (= childCell / 2)
-                // Pack int3 into uint64 for map key (glm::ivec3 has no operator<)
-                auto pack = [](const int3& c) -> uint64_t {
-                    return (uint64_t)(uint32_t)c.x
-                        | ((uint64_t)(uint32_t)c.y << 21)
-                        | ((uint64_t)(uint32_t)c.z << 42);
-                };
-                auto unpack = [](uint64_t k) -> int3 {
-                    return int3((int)(k & 0x1FFFFF),
-                                (int)((k >> 21) & 0x1FFFFF),
-                                (int)((k >> 42) & 0x1FFFFF));
-                };
-                std::map<uint64_t, std::vector<uint>> parentGroups;
-                for (uint i = 0; i < childCount; i++) {
-                    uint idx = childStart + i;
-                    parentGroups[pack(mergedCells[idx] / 2)].push_back(idx);
+                // Sort children by (parentCell = cell/2, octant) so siblings are contiguous
+                {
+                    std::vector<uint> order(childCount);
+                    for (uint i = 0; i < childCount; i++) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](uint a, uint b) {
+                        uint64_t pa = pack(mergedCells[childStart + a] / 2);
+                        uint64_t pb = pack(mergedCells[childStart + b] / 2);
+                        if (pa != pb) return pa < pb;
+                        return octant(mergedCells[childStart + a]) < octant(mergedCells[childStart + b]);
+                    });
+
+                    bool sorted = true;
+                    for (uint i = 0; i < childCount; i++) {
+                        if (order[i] != i) { sorted = false; break; }
+                    }
+                    if (!sorted) {
+                        std::vector<OctreeNode> sn(childCount);
+                        std::vector<VoxelData>   sv(childCount);
+                        std::vector<int3>        sc(childCount);
+                        for (uint i = 0; i < childCount; i++) {
+                            sn[i] = mergedNodes[childStart + order[i]];
+                            sv[i] = mergedVoxels[childStart + order[i]];
+                            sc[i] = mergedCells[childStart + order[i]];
+                        }
+                        for (uint i = 0; i < childCount; i++) {
+                            mergedNodes[childStart + i]  = sn[i];
+                            mergedVoxels[childStart + i] = sv[i];
+                            mergedCells[childStart + i]  = sc[i];
+                            mergedNodes[childStart + i].dataIndex = childStart + i;
+                        }
+                    }
                 }
 
-                uint numParents = (uint)parentGroups.size();
+                // Group consecutive children by parent cell
+                struct ParentGroup { uint64_t key; uint firstChildIdx; uint childCount; };
+                std::vector<ParentGroup> groups;
+                for (uint i = 0; i < childCount; ) {
+                    int3 parentCell = mergedCells[childStart + i] / 2;
+                    uint64_t pk = pack(parentCell);
+                    uint first = childStart + i;
+                    uint cnt = 0;
+                    while (i < childCount && pack(mergedCells[childStart + i] / 2) == pk) {
+                        cnt++; i++;
+                    }
+                    groups.push_back({pk, first, cnt});
+                }
+
+                uint numParents = (uint)groups.size();
                 std::vector<OctreeNode> newParents;
                 std::vector<VoxelData> newVoxels;
                 std::vector<int3> newCells;
@@ -617,17 +661,18 @@ private:
                 newVoxels.reserve(numParents);
                 newCells.reserve(numParents);
 
-                for (auto& [packedKey, children] : parentGroups) {
-                    int3 parentCell = unpack(packedKey);
+                for (uint g = 0; g < (uint)groups.size(); g++) {
+                    auto& grp = groups[g];
+                    int3 parentCell = unpack(grp.key);
                     OctreeNode pn;
                     pn.childMask = 0;
-                    pn.childBase = children[0] + numParents;  // children shift right
-                    pn.dataIndex = 0;
+                    pn.childBase = grp.firstChildIdx + numParents;  // children shift right by numParents
+                    pn.dataIndex = childStart + g;  // position before insertion
 
-                    for (uint ci : children) {
-                        int3 cc = mergedCells[ci];
-                        uint octant = (uint)(cc.x & 1) | ((uint)(cc.y & 1) << 1) | ((uint)(cc.z & 1) << 2);
-                        pn.childMask |= (1u << octant);
+                    for (uint c = 0; c < grp.childCount; c++) {
+                        int3 cc = mergedCells[grp.firstChildIdx + c];
+                        uint oct = (uint)(cc.x & 1) | ((uint)(cc.y & 1) << 1) | ((uint)(cc.z & 1) << 2);
+                        pn.childMask |= (1u << oct);
                     }
 
                     newParents.push_back(pn);
@@ -643,8 +688,9 @@ private:
 
                 mergedCounts[buildLvl] = numParents;
 
-                // Offset childBase in all nodes after the insertion point
+                // Offset childBase and dataIndex in all nodes after the insertion point
                 for (uint i = childStart + numParents; i < mergedNodes.size(); i++) {
+                    mergedNodes[i].dataIndex += numParents;
                     if (mergedNodes[i].childMask)
                         mergedNodes[i].childBase += numParents;
                 }
@@ -672,6 +718,60 @@ private:
         for (uint l = 0; l <= mMaxDepth; l++)
             std::cout << " L" << l << "=" << mergedCounts[l];
         std::cout << std::endl;
+
+        // ---- Consistency check: verify dataIndex, childBase, and parent/child cell relationships ----
+        {
+            uint errors = 0;
+            uint offset = 0;
+            for (uint l = 0; l <= mMaxDepth; l++) {
+                uint count = mergedCounts[l];
+                uint nextOff = offset + count;
+                for (uint i = offset; i < nextOff; i++) {
+                    // 1. dataIndex must match node position
+                    if (mergedNodes[i].dataIndex != i) {
+                        if (errors < 5) std::cerr << "  [CONSISTENCY] dataIndex mismatch: node[" << i
+                            << "] level=" << l << " cell=(" << mergedCells[i].x << "," << mergedCells[i].y
+                            << "," << mergedCells[i].z << ") dataIndex=" << mergedNodes[i].dataIndex << std::endl;
+                        errors++;
+                    }
+                    // 2. Non-leaf: childBase must be within next level range
+                    if (mergedNodes[i].childMask) {
+                        uint childCount = countbits(mergedNodes[i].childMask);
+                        uint childStart = mergedNodes[i].childBase;
+                        uint childLevelOff = 0;
+                        for (uint cl = 0; cl <= l; cl++) childLevelOff += mergedCounts[cl];
+                        if (childStart < childLevelOff || childStart + childCount > childLevelOff + mergedCounts[l+1]) {
+                            if (errors < 5) std::cerr << "  [CONSISTENCY] childBase out of bounds: node[" << i
+                                << "] level=" << l << " childBase=" << childStart
+                                << " childCount=" << childCount
+                                << " childLevelRange=[" << childLevelOff << "," << (childLevelOff+mergedCounts[l+1]) << ")"
+                                << std::endl;
+                            errors++;
+                        }
+                        // 3. Each child's parent cell = this node's cell
+                        for (uint ci = 0; ci < childCount && ci < 8; ci++) {
+                            uint cpos = childStart + ci;
+                            int3 expectedParent = mergedCells[cpos] / 2;
+                            if (expectedParent.x != mergedCells[i].x ||
+                                expectedParent.y != mergedCells[i].y ||
+                                expectedParent.z != mergedCells[i].z) {
+                                if (errors < 5) std::cerr << "  [CONSISTENCY] parent/child cell mismatch: node[" << i
+                                    << "] level=" << l << " cell=(" << mergedCells[i].x << "," << mergedCells[i].y << "," << mergedCells[i].z
+                                    << ") child[" << cpos << "] cell=(" << mergedCells[cpos].x << "," << mergedCells[cpos].y << "," << mergedCells[cpos].z
+                                    << ") expectedParent=(" << expectedParent.x << "," << expectedParent.y << "," << expectedParent.z << ")"
+                                    << std::endl;
+                                errors++;
+                            }
+                        }
+                    }
+                }
+                offset = nextOff;
+            }
+            if (errors == 0)
+                std::cout << "  [CONSISTENCY] All checks passed." << std::endl;
+            else
+                std::cerr << "  [CONSISTENCY] " << errors << " errors found!" << std::endl;
+        }
 
         // ---- Step 3: Write flat format matching RayMarchingPass.cpp ----
         GridData outGrid = mGrid;
