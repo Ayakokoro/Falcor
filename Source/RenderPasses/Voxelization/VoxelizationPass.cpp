@@ -248,6 +248,43 @@ void VoxelizationPass::runHierarchicalClip(RenderContext* pRenderContext)
                                          mUseMultiThread ? 0 : 1);
     Tools::Profiler::EndSample("Hierarchical Clip");
 
+    // ---- Debug: dump all polygons of a specific voxel node ----
+    // {
+    //     uint debugNodeIdx = 33;  // <-- set to the node index you want to inspect (e.g. 0)
+    //     if (debugNodeIdx < polygonGenerator.polygonArrays.size()) {
+    //         const PolygonRange& range = polygonGenerator.polygonRangeBuffer[debugNodeIdx];
+    //         auto& polys = polygonGenerator.polygonArrays[debugNodeIdx];
+
+    //         std::cout << "========== Node Debug (nodeIdx=" << debugNodeIdx << ") ==========" << std::endl;
+    //         std::cout << "  PolygonRange:" << std::endl;
+    //         std::cout << "    cellInt    = " << range.cellInt.x << " " << range.cellInt.y << " " << range.cellInt.z << std::endl;
+    //         std::cout << "    nodeScale  = " << range.nodeScale << std::endl;
+    //         std::cout << "    localHead  = " << range.localHead << std::endl;
+    //         std::cout << "    count      = " << range.count << std::endl;
+    //         std::cout << "  polygons (" << polys.size() << "):" << std::endl;
+
+    //         for (uint pi = 0; pi < polys.size(); pi++) {
+    //             Polygon& poly = polys[pi];
+    //             float polyArea = poly.calcArea();
+    //             float centroidArea;
+    //             float3 centroid = poly.calcCentroid(centroidArea);
+
+    //             std::cout << "  --- poly[" << pi << "] ---" << std::endl;
+    //             std::cout << "    triRef     = { meshID=" << poly.triRef.meshID
+    //                       << ", triangleID=" << poly.triRef.triangleID
+    //                       << ", materialID=" << poly.triRef.materialID << " }" << std::endl;
+    //             std::cout << "    count      = " << poly.count << std::endl;
+    //             std::cout << "    area       = " << polyArea << std::endl;
+    //             std::cout << "    normal     = " << poly.normal.x << " " << poly.normal.y << " " << poly.normal.z << std::endl;
+    //             std::cout << "    centroid   = " << centroid.x << " " << centroid.y << " " << centroid.z << " (area=" << centroidArea << ")" << std::endl;
+    //             std::cout << "    vertices (" << poly.count << "):" << std::endl;
+    //             for (uint vi = 0; vi < poly.count; vi++)
+    //                 std::cout << "      [" << vi << "] " << poly.vertices[vi].x << " " << poly.vertices[vi].y << " " << poly.vertices[vi].z << std::endl;
+    //         }
+    //         std::cout << "================================================================" << std::endl;
+    //     }
+    // }
+
     cpuPositions->unmap();
     cpuNormals->unmap();
     cpuTexCoords->unmap();

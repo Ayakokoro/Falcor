@@ -446,6 +446,7 @@ public:
             tri.normals[1] = pNormal[indices.y];
             tri.normals[2] = pNormal[indices.z];
 
+
             for (int i = 0; i < 3; i++)
                 tri.vertices[i] = (tri.vertices[i] - gridData.gridMin) / gridData.voxelSize;
             tri.buildTBN();

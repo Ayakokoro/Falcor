@@ -34,3 +34,5 @@
 *.tlog
 *.bak
 *.swp
+
+/LargeSceneVoxelization/build/

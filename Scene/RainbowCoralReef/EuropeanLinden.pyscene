@@ -1,0 +1,12 @@
+envMap = EnvMap('../EnvMap/White.exr')
+envMap.intensity = 1.0
+sceneBuilder.envMap = envMap
+
+sceneBuilder.importScene('source/Realistic_tree.fbx')
+
+camera = Camera()
+camera.position = float3(0.81, 1.55, 1.47)
+camera.target = float3(0.31, 1.29, 0.64)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 21.0
+sceneBuilder.addCamera(camera)

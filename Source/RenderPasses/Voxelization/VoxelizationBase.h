@@ -167,7 +167,7 @@ private:
 
 public:
     uint maxPolygonCount = 256000;
-    static constexpr uint kSafePerNodePolygonLimit = 65536; // per-thread GPU safety cap to avoid TDR
+    static constexpr uint kSafePerNodePolygonLimit = 128000; // per-thread GPU safety cap to avoid TDR
     PolygonBufferGroup(ref<Device> device, GridData& gridData) : gridData(gridData), mpDevice(device) {}
 
     uint getVoxelOffset(uint index) const

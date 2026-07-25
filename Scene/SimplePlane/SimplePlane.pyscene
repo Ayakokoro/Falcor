@@ -1,0 +1,7 @@
+envMap = EnvMap('../EnvMap/White.exr')
+envMap.intensity = 1.0
+sceneBuilder.envMap = envMap
+
+sceneBuilder.importScene('simpleplane.fbx')
+
+
