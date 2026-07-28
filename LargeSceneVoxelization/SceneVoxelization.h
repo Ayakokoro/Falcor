@@ -9,10 +9,15 @@
 #include "TextureSampler.h"
 #include "PolygonGenerator.h"
 #include "SceneLoader.h"
+#include "ClipPhase.h"
+#include "MergePhase.h"
+#include "AnalyzePhase.h"
+#include "OctreeBuilder.h"
 #include <vector>
 #include <memory>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
 
 struct VoxelizationConfig {
     uint baseResolution = 512;     // N = 2^D
@@ -26,7 +31,12 @@ class SceneVoxelization {
 public:
     SceneVoxelization(const VoxelizationConfig& cfg) : mConfig(cfg) {}
 
-    // Main entry point: load FBX (instanced), voxelize, write binary output
+    // ---- Configuration setters for disk-backed pipeline ----
+    void setTmpDir(const std::string& dir)   { mTmpDir = dir; }
+    void setNumThreads(uint32_t n)          { mNumThreads = n; }
+    void setKeepTemp(bool keep)             { mKeepTemp = keep; }
+
+    // Existing in-memory pipeline (unchanged)
     bool process(const std::string& fbxPath, const std::string& outputPath) {
         // ---- Phase 0: Load scene (instanced mode: unique meshes + transforms) ----
         std::cout << "Loading (instanced): " << fbxPath << std::endl;
@@ -325,6 +335,9 @@ public:
         return true;
     }
 
+    // ---- Disk-backed pipeline ----
+    bool processDisk(const std::string& fbxPath, const std::string& outputPath);
+
 private:
     VoxelizationConfig mConfig;
     GridData mGrid;
@@ -334,6 +347,11 @@ private:
     std::vector<Texture2D> mBaseColorTextures;
     std::vector<Texture2D> mSpecularTextures;
     std::vector<Texture2D> mNormalMapTextures;
+
+    // Disk-backed pipeline configuration
+    std::string mTmpDir = "./tmp";
+    uint32_t mNumThreads = 0;   // 0 = auto-detect
+    bool mKeepTemp = true;      // default: keep temp files
 
     // ---- Transform helpers ----
 
@@ -538,4 +556,257 @@ private:
         f.close();
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
     }
+
+    // ---- Disk-backed output writer (works with OctreeResult) ----
+    void writeOutputDisk(const std::string& outputPath,
+                         const OctreeBuilder::OctreeResult& octree,
+                         uint64_t totalPolygons,
+                         uint32_t maxPolyPerNode) {
+        std::ofstream f(outputPath, std::ios::binary);
+        if (!f) {
+            std::cerr << "Cannot open output: " << outputPath << std::endl;
+            return;
+        }
+
+        uint32_t totalNodes = octree.totalNodes();
+
+        std::cout << "  [Output] nodes=" << totalNodes << " totalPoly=" << totalPolygons
+                  << " maxPolyPerNode=" << maxPolyPerNode << std::endl;
+        std::cout << "  [Output] per-level:";
+        for (uint32_t l = 0; l <= mMaxDepth; l++)
+            std::cout << " L" << l << "=" << octree.levelNodeCounts[l];
+        std::cout << std::endl;
+
+        // Consistency check
+        {
+            uint32_t errors = 0;
+            uint32_t offset = 0;
+            for (uint32_t l = 0; l <= mMaxDepth; l++) {
+                uint32_t count = octree.levelNodeCounts[l];
+                uint32_t nextOff = offset + count;
+                for (uint32_t i = offset; i < nextOff; i++) {
+                    if (octree.octreeNodes[i].dataIndex != i) {
+                        if (errors < 5) std::cerr << "  [CONSISTENCY] dataIndex mismatch at node[" << i << "]" << std::endl;
+                        errors++;
+                    }
+                    if (octree.octreeNodes[i].childMask) {
+                        uint32_t childCount = countbits(octree.octreeNodes[i].childMask);
+                        uint32_t childStart = octree.octreeNodes[i].childBase;
+                        uint32_t childLevelOff = 0;
+                        for (uint32_t cl = 0; cl <= l; cl++) childLevelOff += octree.levelNodeCounts[cl];
+                        if (childStart < childLevelOff || childStart + childCount > childLevelOff + octree.levelNodeCounts[l+1]) {
+                            if (errors < 5) std::cerr << "  [CONSISTENCY] childBase OOB at node[" << i << "]" << std::endl;
+                            errors++;
+                        }
+                    }
+                }
+                offset = nextOff;
+            }
+            if (errors == 0)
+                std::cout << "  [CONSISTENCY] All checks passed." << std::endl;
+            else
+                std::cerr << "  [CONSISTENCY] " << errors << " errors found!" << std::endl;
+        }
+
+        GridData outGrid = mGrid;
+        outGrid.solidVoxelCount = totalNodes;
+        outGrid.maxPolygonCount = maxPolyPerNode;
+        outGrid.totalPolygonCount = (uint32_t)totalPolygons;
+
+        f.write((const char*)&outGrid, sizeof(GridData));
+        f.write((const char*)&mMaxDepth, sizeof(uint32_t));
+        f.write((const char*)octree.levelNodeCounts.data(), (mMaxDepth + 1) * sizeof(uint32_t));
+        f.write((const char*)octree.octreeNodes.data(), totalNodes * sizeof(OctreeNode));
+        f.write((const char*)octree.gBuffer.data(), totalNodes * sizeof(VoxelData));
+
+        f.close();
+        std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
+    }
+
+    // ---- Phase 4: Parent aggregation from children's VoxelData ----
+    // Works identically for both in-memory (PolygonGenerator) and disk (OctreeResult) paths.
+    static void aggregateParents(OctreeBuilder::OctreeResult& octree, uint32_t maxDepth) {
+        int totalNodes = (int)octree.totalNodes();
+        for (int nodeIdx = totalNodes - 1; nodeIdx >= 0; nodeIdx--) {
+            uint32_t level = octree.bfsOrder[nodeIdx].level;
+
+            if (level == maxDepth) continue;  // leaves already filled
+
+            VoxelData& vd = octree.gBuffer[nodeIdx];
+            vd.init();
+
+            const OctreeNode& oct = octree.octreeNodes[nodeIdx];
+            if (!oct.childMask) continue;
+
+            float rawLobeWeight[LOBE_COUNT] = {};
+            float3 rawDiffuse[LOBE_COUNT] = {};
+            float3 rawSpecular[LOBE_COUNT] = {};
+            float rawRough[LOBE_COUNT] = {};
+            float3 rawNormal[LOBE_COUNT] = {};
+
+            {
+                uint32_t childBFS = oct.childBase;
+                for (uint32_t ci = 0; ci < 8; ci++) {
+                    if (!(oct.childMask & (1u << ci))) continue;
+                    VoxelData& childVd = octree.gBuffer[childBFS];
+                    float childArea = childVd.ABSDF.area;
+
+                    vd.ABSDF.area += childArea;
+
+                    for (int li = 0; li < LOBE_COUNT; li++) {
+                        float lobeArea = childVd.ABSDF.lobes[li].weight * childArea;
+                        if (lobeArea <= 0) continue;
+
+                        rawLobeWeight[li] += lobeArea;
+                        rawDiffuse[li]   += childVd.ABSDF.lobes[li].diffuse * lobeArea;
+                        rawSpecular[li]  += childVd.ABSDF.lobes[li].specular * lobeArea;
+                        rawRough[li]     += childVd.ABSDF.lobes[li].rough * lobeArea;
+                        rawNormal[li]    += childVd.ABSDF.lobes[li].normal * lobeArea;
+                    }
+
+                    for (int si = 0; si < EVEN_SH_COUNT; si++) {
+                        vd.polygonsProjAreaFunc.coefficients[si]  += childVd.polygonsProjAreaFunc.coefficients[si];
+                        vd.primitiveProjAreaFunc.coefficients[si] += childVd.primitiveProjAreaFunc.coefficients[si];
+                        vd.totalProjAreaFunc.coefficients[si]     += childVd.totalProjAreaFunc.coefficients[si];
+                    }
+
+                    childBFS++;
+                }
+            }
+
+            for (int li = 0; li < LOBE_COUNT; li++) {
+                if (rawLobeWeight[li] <= 0) continue;
+                vd.ABSDF.lobes[li].diffuse  = rawDiffuse[li] / rawLobeWeight[li];
+                vd.ABSDF.lobes[li].specular = rawSpecular[li] / rawLobeWeight[li];
+                vd.ABSDF.lobes[li].rough    = rawRough[li] / rawLobeWeight[li];
+                vd.ABSDF.lobes[li].normal   = safeNormalize(rawNormal[li]);
+                vd.ABSDF.lobes[li].weight   = rawLobeWeight[li] / vd.ABSDF.area;
+            }
+
+            if (!vd.isSolid()) continue;
+
+            // Ellipsoid: approximate from child ellipsoid extreme points
+            {
+                std::vector<float3> extPoints;
+                float parentScale = (float)(1u << (maxDepth - level));
+
+                uint32_t childBFS = oct.childBase;
+                for (uint32_t ci = 0; ci < 8; ci++) {
+                    if (!(oct.childMask & (1u << ci))) continue;
+                    VoxelData& childVd = octree.gBuffer[childBFS];
+                    Ellipsoid& childE = childVd.ellipsoid;
+                    if (childE.B[0][0] == 0 && childE.B[1][1] == 0 && childE.B[2][2] == 0) {
+                        childBFS++; continue;
+                    }
+
+                    int3 childCell = octree.bfsOrder[childBFS].cellInt;
+                    float3 childCenter = float3(childCell) + childE.center;
+
+                    float3x3 R;
+                    float3 evals;
+                    Ellipsoid::eigenSym3_Jacobi(childE.B, R, evals);
+
+                    for (int a = 0; a < 3; a++) {
+                        if (evals[a] <= 0) continue;
+                        float extent = 1.0f / std::sqrt(evals[a]);
+                        float3 dir(R[a].x, R[a].y, R[a].z);
+
+                        float3 p1 = (childCenter + dir * extent - float3(octree.bfsOrder[nodeIdx].cellInt)) / parentScale;
+                        float3 p2 = (childCenter - dir * extent - float3(octree.bfsOrder[nodeIdx].cellInt)) / parentScale;
+                        extPoints.push_back(p1);
+                        extPoints.push_back(p2);
+                    }
+
+                    childBFS++;
+                }
+
+                if (extPoints.size() >= 6)
+                    vd.ellipsoid.fitFromPoints(extPoints, octree.bfsOrder[nodeIdx].cellInt);
+            }
+        }
+    }
+
 };
+
+// ---- processDisk: disk-backed pipeline implementation ----
+inline bool SceneVoxelization::processDisk(
+    const std::string& fbxPath, const std::string& outputPath)
+{
+    namespace fs = std::filesystem;
+
+    // ---- Phase 0: Load scene (same as in-memory path) ----
+    std::cout << "Loading (instanced): " << fbxPath << std::endl;
+    SceneLoader loader;
+    InstancedScene scene;
+    if (!loader.loadMeshInstances(fbxPath, scene)) {
+        std::cerr << "Failed to load: " << loader.getError() << std::endl;
+        return false;
+    }
+    std::cout << "  Unique meshes: " << scene.meshes.size()
+              << "  Instances: " << scene.instances.size()
+              << "  Materials: " << scene.materials.size() << std::endl;
+
+    setupGrid(scene);
+
+    uint32_t resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+    mMaxDepth = 0;
+    while ((1u << mMaxDepth) < resolution) mMaxDepth++;
+
+    loadTextures(scene.materials);
+
+    std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
+              << "  maxDepth=" << mMaxDepth << std::endl;
+
+    // ---- Phase 1: Multi-threaded clip → shard files ----
+    std::cout << "\n=== Phase 1: Multi-threaded Clip ===" << std::endl;
+    auto clipResult = ClipPhase::execute(scene, mGrid, mMaxDepth,
+                                          mTmpDir, mNumThreads);
+    if (clipResult.shardFiles.empty()) {
+        std::cerr << "Clip phase produced no output." << std::endl;
+        return false;
+    }
+
+    // ---- Phase 2: Merge shards → leaves.idx + polygons.dat + octree ----
+    std::cout << "\n=== Phase 2: Merge ===" << std::endl;
+    auto mergeResult = MergePhase::execute(clipResult, mTmpDir, mMaxDepth);
+    if (mergeResult.totalLeaves == 0) {
+        std::cerr << "Merge phase produced no leaves." << std::endl;
+        return false;
+    }
+
+    // ---- Phase 3: Stream-based leaf analysis ----
+    std::cout << "\n=== Phase 3: Analyze ===" << std::endl;
+    AnalyzePhase::AnalyzeContext actx{
+        scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
+        mBaseColorTextures, mSpecularTextures, mNormalMapTextures
+    };
+    AnalyzePhase::execute(mergeResult, actx);
+
+    // ---- Phase 4: Parent aggregation ----
+    std::cout << "\n=== Phase 4: Parent Aggregation ===" << std::endl;
+    auto& octree = const_cast<OctreeBuilder::OctreeResult&>(mergeResult.octree);
+    aggregateParents(octree, mMaxDepth);
+
+    // ---- Phase 5: Write output ----
+    std::cout << "\n=== Phase 5: Write Output ===" << std::endl;
+    // maxPolyPerNode: scan leaf indices for the max
+    // (we could track this during merge, but scanning is fast)
+    uint32_t maxPolyPerNode = 0;
+    {
+        std::ifstream idxIn(mergeResult.leavesIdxPath, std::ios::binary);
+        PolygonSerializer::LeavesIdxHeader idxHdr;
+        if (PolygonSerializer::readLeavesIdxHeader(idxIn, idxHdr)) {
+            std::vector<PolygonSerializer::LeafIndex> leaves;
+            PolygonSerializer::readLeafIndices(idxIn, leaves, idxHdr.leafCount);
+            for (auto& li : leaves)
+                maxPolyPerNode = std::max(maxPolyPerNode, li.polyCount);
+        }
+    }
+    writeOutputDisk(outputPath, octree, mergeResult.totalPolygons, maxPolyPerNode);
+
+    // Clip shards already cleaned by MergePhase; merge data always kept.
+    std::cout << "Merge data kept in: " << mTmpDir << "/merge" << std::endl;
+
+    std::cout << "Done." << std::endl;
+    return true;
+}
