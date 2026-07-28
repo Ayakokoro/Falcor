@@ -47,6 +47,33 @@ struct LoadedScene {
     uint totalTriangles() const { return (uint)triangles.size(); }
 };
 
+// ---- Instanced mode: unique meshes in local space ----
+struct MeshGeometry {
+    uint meshID = 0;
+    uint materialID = 0;
+    uint aiMeshIndex = 0;  // Assimp mesh index for dedup
+    std::string name;
+    std::vector<float3> positions;
+    std::vector<float3> normals;
+    std::vector<float2> texCoords;
+    std::vector<uint3>  triangles;
+    float3 localMin = float3(1e30f);
+    float3 localMax = float3(-1e30f);
+    uint vertexCount() const { return (uint)positions.size(); }
+    uint triangleCount() const { return (uint)triangles.size(); }
+};
+
+struct MeshInstance {
+    uint meshID;
+    glm::mat4 transform;  // 4x4 world transform (column-major, like GLM/GPU)
+};
+
+struct InstancedScene {
+    std::vector<MeshGeometry> meshes;
+    std::vector<MeshInstance> instances;
+    std::vector<MaterialData> materials;
+};
+
 // Load an FBX (or any Assimp-supported) scene with instancing support.
 // Each mesh is expanded to world-space using its node transform.
 // Instanced meshes (same aiMesh referenced by multiple nodes) reuse the
@@ -81,7 +108,7 @@ public:
         mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
 
         // Phase 1: Collect materials
-        loadMaterials(ai, scene);
+        loadMaterials(ai, scene.materials);
 
         // Phase 2: Traverse nodes, collect mesh instances with transforms
         std::vector<InstanceInfo> instances;
@@ -129,6 +156,110 @@ public:
         return true;
     }
 
+    // Load FBX, extract unique meshes in local space + instance transforms
+    bool loadMeshInstances(const std::string& filePath, InstancedScene& outScene) {
+        Assimp::Importer importer;
+        uint32_t flags = aiProcessPreset_TargetRealtime_MaxQuality
+                       | aiProcess_FlipUVs
+                       | aiProcess_RemoveComponent;
+        flags &= ~(aiProcess_CalcTangentSpace);
+        flags &= ~(aiProcess_FindDegenerates);
+        flags &= ~(aiProcess_OptimizeGraph);
+        flags &= ~(aiProcess_RemoveRedundantMaterials);
+        flags &= ~(aiProcess_SplitLargeMeshes);
+
+        int removeFlags = aiComponent_COLORS;
+        for (uint32_t uvLayer = 1; uvLayer < AI_MAX_NUMBER_OF_TEXTURECOORDS; uvLayer++)
+            removeFlags |= aiComponent_TEXCOORDSn(uvLayer);
+        removeFlags |= aiComponent_TANGENTS_AND_BITANGENTS;
+        importer.SetPropertyInteger(AI_CONFIG_PP_RVC_FLAGS, removeFlags);
+
+        const aiScene* ai = importer.ReadFile(filePath, flags);
+        if (!ai || !ai->mRootNode) {
+            mError = importer.GetErrorString();
+            return false;
+        }
+        mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
+
+        // Phase 1: Load materials
+        loadMaterials(ai, outScene.materials);
+
+        // Phase 2: Collect all instances (aiMeshIndex, transform, materialID)
+        struct RawInstance { uint meshIndex; aiMatrix4x4 transform; uint materialID; };
+        std::vector<RawInstance> rawInstances;
+        auto collectInstances = [&](aiNode* node, const aiMatrix4x4& parentXf, auto& self) -> void {
+            aiMatrix4x4 world = parentXf * node->mTransformation;
+            for (uint i = 0; i < node->mNumMeshes; i++) {
+                uint meshIdx = node->mMeshes[i];
+                uint matID = ai->mMeshes[meshIdx]->mMaterialIndex;
+                rawInstances.push_back({meshIdx, world, matID});
+            }
+            for (uint i = 0; i < node->mNumChildren; i++)
+                self(node->mChildren[i], world, self);
+        };
+        collectInstances(ai->mRootNode, aiMatrix4x4(), collectInstances);
+
+        // Phase 3: Deduplicate unique meshes by aiMeshIndex
+        std::unordered_map<uint, uint> aiMeshToUnique;  // aiMeshIndex -> uniqueMeshID
+        for (auto& ri : rawInstances) {
+            if (aiMeshToUnique.find(ri.meshIndex) == aiMeshToUnique.end()) {
+                uint uid = (uint)outScene.meshes.size();
+                aiMeshToUnique[ri.meshIndex] = uid;
+                aiMesh* aim = ai->mMeshes[ri.meshIndex];
+                MeshGeometry geom;
+                geom.meshID = uid;
+                geom.materialID = ri.materialID;
+                geom.aiMeshIndex = ri.meshIndex;
+                geom.name = aim->mName.C_Str();
+                for (uint v = 0; v < aim->mNumVertices; v++) {
+                    float3 pos(aim->mVertices[v].x, aim->mVertices[v].y, aim->mVertices[v].z);
+                    geom.positions.push_back(pos);
+                    geom.localMin = glm::min(geom.localMin, pos);
+                    geom.localMax = glm::max(geom.localMax, pos);
+                    if (aim->HasNormals())
+                        geom.normals.push_back(float3(aim->mNormals[v].x, aim->mNormals[v].y, aim->mNormals[v].z));
+                    else
+                        geom.normals.push_back(float3(0, 1, 0));
+                    if (aim->HasTextureCoords(0))
+                        geom.texCoords.push_back(float2(aim->mTextureCoords[0][v].x, aim->mTextureCoords[0][v].y));
+                    else
+                        geom.texCoords.push_back(float2(0));
+                }
+                for (uint f = 0; f < aim->mNumFaces; f++) {
+                    if (aim->mFaces[f].mNumIndices == 3)
+                        geom.triangles.push_back(uint3(aim->mFaces[f].mIndices[0],
+                                                        aim->mFaces[f].mIndices[1],
+                                                        aim->mFaces[f].mIndices[2]));
+                }
+                outScene.meshes.push_back(std::move(geom));
+            }
+        }
+
+        // Phase 4: Build instance list with unique mesh IDs
+        for (auto& ri : rawInstances) {
+            MeshInstance inst;
+            inst.meshID = aiMeshToUnique[ri.meshIndex];
+            inst.transform = glm::mat4(
+                ri.transform.a1, ri.transform.b1, ri.transform.c1, ri.transform.d1,
+                ri.transform.a2, ri.transform.b2, ri.transform.c2, ri.transform.d2,
+                ri.transform.a3, ri.transform.b3, ri.transform.c3, ri.transform.d3,
+                ri.transform.a4, ri.transform.b4, ri.transform.c4, ri.transform.d4
+            );
+            outScene.instances.push_back(inst);
+        }
+
+        std::cout << "  [InstancedLoad] Unique meshes: " << outScene.meshes.size()
+                  << "  Instances: " << outScene.instances.size()
+                  << "  Materials: " << outScene.materials.size() << std::endl;
+        for (auto& geom : outScene.meshes) {
+            std::cout << "    mesh[" << geom.meshID << "] \"" << geom.name
+                      << "\" verts=" << geom.positions.size()
+                      << " tris=" << geom.triangles.size()
+                      << " mat=" << geom.materialID << std::endl;
+        }
+        return true;
+    }
+
     const std::string& getError() const { return mError; }
 
 private:
@@ -141,7 +272,7 @@ private:
         uint materialID;
     };
 
-    void loadMaterials(const aiScene* ai, LoadedScene& scene) {
+    void loadMaterials(const aiScene* ai, std::vector<MaterialData>& materials) {
         for (uint i = 0; i < ai->mNumMaterials; i++) {
             aiMaterial* aimat = ai->mMaterials[i];
             MaterialData mat;
@@ -233,7 +364,7 @@ private:
                 std::cout << " (none)";
             std::cout << std::endl;
 
-            scene.materials.push_back(mat);
+            materials.push_back(mat);
         }
     }
 

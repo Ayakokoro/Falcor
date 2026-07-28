@@ -8,8 +8,9 @@ struct TriangleRef {
     uint meshID = 0;
     uint triangleID = 0;
     uint materialID = 0;
+    uint instanceIdx = 0;
 
-    void init() { meshID = triangleID = materialID = 0; }
+    void init() { meshID = triangleID = materialID = instanceIdx = 0; }
 };
 
 struct Triangle {
@@ -104,6 +105,8 @@ struct Polygon {
     float3 normal;
 
     void init() { count = 0; }
+
+    size_t approxMem() const { return sizeof(*this); }
 
     float calcArea() const {
         float3 s(0);

@@ -164,6 +164,106 @@ struct Ellipsoid {
         center = center - float3(range.cellInt);
     }
 
+    // Fit an ellipsoid from a set of 3D points (non-area-weighted).
+    // Used for parent node ellipsoids aggregated from child ellipsoid extreme points.
+    // Points must be in normalized [0, 1] space relative to cellInt.
+    void fitFromPoints(const std::vector<float3>& points, const int3& cellInt) {
+        if (points.size() < 4) {
+            center = float3(0); B = zeros3x3();
+            return;
+        }
+
+        // Centroid (simple average)
+        float3 centroid(0);
+        for (auto& p : points) centroid += p;
+        centroid /= (float)points.size();
+
+        // Covariance matrix
+        float3x3 cov = zeros3x3();
+        for (auto& p : points) {
+            float3 d = p - centroid;
+            for (int i = 0; i < 3; i++)
+                for (int j = i; j < 3; j++)
+                    cov[i][j] += d[i] * d[j];
+        }
+        cov[1][0] = cov[0][1]; cov[2][0] = cov[0][2]; cov[2][1] = cov[1][2];
+        cov = mul(1.0f / (float)points.size(), cov);
+        cov = 0.5f * (cov + transpose(cov));
+
+        float tr = cov[0][0] + cov[1][1] + cov[2][2];
+        float lam = 1e-6f * std::max(tr, 1e-6f);
+        cov[0][0] += lam; cov[1][1] += lam; cov[2][2] += lam;
+
+        float3x3 R;
+        float3 evals;
+        eigenSym3_Jacobi(cov, R, evals);
+
+        // PCA-space extents
+        float3 qMin(1e30f), qMax(-1e30f);
+        float3 qMinPt[3] = {}, qMaxPt[3] = {};
+        for (auto& p : points) {
+            float3 q = transpose(R) * (p - centroid);
+            if (q.x < qMin.x) { qMin.x = q.x; qMinPt[0] = q; }
+            if (q.x > qMax.x) { qMax.x = q.x; qMaxPt[0] = q; }
+            if (q.y < qMin.y) { qMin.y = q.y; qMinPt[1] = q; }
+            if (q.y > qMax.y) { qMax.y = q.y; qMaxPt[1] = q; }
+            if (q.z < qMin.z) { qMin.z = q.z; qMinPt[2] = q; }
+            if (q.z > qMax.z) { qMax.z = q.z; qMaxPt[2] = q; }
+        }
+
+        float3 shift = 0.5f * (qMin + qMax);
+        float3 half = glm::max(0.5f * (qMax - qMin), float3(1e-3f));
+        float3 invHalf = 1.0f / half;
+
+        // Ritter bounding sphere in normalized PCA space
+        float3 yExt[6] = {
+            (qMinPt[0] - shift) * invHalf, (qMaxPt[0] - shift) * invHalf,
+            (qMinPt[1] - shift) * invHalf, (qMaxPt[1] - shift) * invHalf,
+            (qMinPt[2] - shift) * invHalf, (qMaxPt[2] - shift) * invHalf,
+        };
+        int ia = 0, ib = 1;
+        float bestD2 = 0;
+        for (int a = 0; a < 6; ++a)
+            for (int b = a + 1; b < 6; ++b) {
+                float d2 = dot(yExt[b] - yExt[a], yExt[b] - yExt[a]);
+                if (d2 > bestD2) { bestD2 = d2; ia = a; ib = b; }
+            }
+
+        float3 sphC = 0.5f * (yExt[ia] + yExt[ib]);
+        float sphR = std::max(glm::length(yExt[ib] - sphC), 1e-8f);
+
+        for (auto& p : points) {
+            float3 y = (transpose(R) * (p - centroid) - shift) * invHalf;
+            float3 d = y - sphC;
+            float dist2 = dot(d, d);
+            if (dist2 > sphR * sphR) {
+                float dist = std::sqrt(dist2);
+                float newR = 0.5f * (sphR + dist);
+                sphC += d * ((newR - sphR) / std::max(dist, 1e-12f));
+                sphR = newR;
+            }
+        }
+
+        // Tighten
+        float r2 = 0;
+        for (auto& p : points) {
+            float3 y = (transpose(R) * (p - centroid) - shift) * invHalf;
+            r2 = std::max(r2, dot(y - sphC, y - sphC));
+        }
+        sphR = std::sqrt(r2) * (1.0f + 1e-6f);
+
+        // Construct ellipsoid
+        float3 qCenter = shift + half * sphC;
+        center = centroid + R * qCenter;
+        float3 axis = half * sphR;
+        axis = glm::max(axis, float3(1e-3f));
+        float3 invAxis2 = 1.0f / (axis * axis);
+        B = R * diag3(invAxis2) * transpose(R);
+        B = 0.5f * (B + transpose(B));
+        // Points are already in [0,1] relative to cellInt, no subtraction needed
+        (void)cellInt;  // kept for API compatibility
+    }
+
     // Clip a ray segment against the ellipsoid, returns (tEnter, tExit) in [0,1]
     float2 clip(const float3& from, const float3& to) const {
         float3 v = to - from;

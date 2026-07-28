@@ -4,3 +4,9 @@ sceneBuilder.envMap = envMap
 
 sceneBuilder.importScene('OldTree.fbx')
 
+# Add directional light
+dirLight = DirectionalLight('Directional light')
+dirLight.intensity = float3(20.0, 10.54, 10.08)
+dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
+sceneBuilder.addLight(dirLight)
+

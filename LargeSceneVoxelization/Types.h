@@ -30,7 +30,7 @@ constexpr float M_PI_F = glm::pi<float>();
 constexpr float M_1_PI_F = glm::one_over_pi<float>();
 
 // Per-node polygon safety cap (matches GPU kSafePerNodePolygonLimit)
-#define SAFE_PER_NODE_POLYGON_LIMIT 128000
+#define SAFE_PER_NODE_POLYGON_LIMIT 512000
 
 // --- GLM-compatible Matrix helpers ---
 inline float3 mul(const float3x3& M, const float3& v) { return M * v; }
