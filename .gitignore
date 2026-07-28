@@ -36,3 +36,4 @@
 *.swp
 
 /LargeSceneVoxelization/build/
+/LargeSceneVoxelization/tmp/
