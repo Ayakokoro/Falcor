@@ -56,6 +56,7 @@ cbuffer CB
 struct RayCone
 {
     float tanHalfAngle; // tan(θ/2), where θ is the cone's full opening angle
+    float bias;         // footprint radius at ray origin (cell-space), inherited from previous bounces
 };
 
 struct HitResult
@@ -64,6 +65,7 @@ struct HitResult
     int3 cellInt;    // in LOD-0 coordinate space
     float3 cell;     // in LOD-0 coordinate space
     uint gbIndex;    // gBuffer offset at leaf node
+    uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
 };
 
 struct PsOut
@@ -112,21 +114,21 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     if (direction.z != 0 && t.z < tMin) tMin = t.z;
     float3 to = from + tMin * direction;
     float2 inOut = ellipsoid.clip(from, to);
-    HitResult result = { inOut.x >= 0, cellInt, cell + inOut.x * (to - from), gbIndex };
+    HitResult result = { inOut.x >= 0, cellInt, cell + inOut.x * (to - from), gbIndex, 1 };
     return result;
 }
 
 HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex)
 {
 #if !CHECK_ELLIPSOID
-    return { true, cellInt, cellInt + 0.5f, gbIndex };
+    return { true, cellInt, cellInt + 0.5f, gbIndex, 1 };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex);
     if (hit.hit)
         return hit;
 #endif
-    return { false, cellInt, cellInt + 0.5f, 0 };
+    return { false, cellInt, cellInt + 0.5f, 0, 1 };
 }
 
 // Ray-slab AABB intersection in cell space.
@@ -171,21 +173,50 @@ struct StackEntry
 // Parameterized octree traversal using a stack ordered by ray-t
 // Each internal node: intersect children AABBs → sort by tMin → push (far to near)
 // Leaf node: test voxel; on miss the next stack entry is already the next cell along the ray
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ignoreFirst, RayCone cone, float initialDistance)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
-        return { false, int3(from), from, 0 };
+        return { false, int3(from), from, 0, 0 };
 
     float3 reciprocal = 1.0f / direction;
     float3 rayOrigin = from;
 
-    if (ignoreFirst)
+    if (ignoreNodeSize > 0)
     {
         float3 cell = from;
         int3 cellInt = int3(floor(from));
         int3 dirs = int3(sign(direction));
-        leave(cell, cellInt, dirs, direction, reciprocal);
+
+        if (ignoreNodeSize == 1)
+        {
+            leave(cell, cellInt, dirs, direction, reciprocal);
+        }
+        else
+        {
+            // Step out of the coarse node block; use floor division for correct negative coords
+            float3 cellFloat = cell;
+            int3 blockMin;
+            blockMin.x = int(floor(cellFloat.x / float(ignoreNodeSize))) * int(ignoreNodeSize);
+            blockMin.y = int(floor(cellFloat.y / float(ignoreNodeSize))) * int(ignoreNodeSize);
+            blockMin.z = int(floor(cellFloat.z / float(ignoreNodeSize))) * int(ignoreNodeSize);
+
+            int3 exitFace;
+            exitFace.x = dirs.x > 0 ? blockMin.x + int(ignoreNodeSize) : blockMin.x;
+            exitFace.y = dirs.y > 0 ? blockMin.y + int(ignoreNodeSize) : blockMin.y;
+            exitFace.z = dirs.z > 0 ? blockMin.z + int(ignoreNodeSize) : blockMin.z;
+
+            float3 tToExit = (float3(exitFace) - cell) * reciprocal;
+            float tMin = 2.0f * float(ignoreNodeSize);
+            if (direction.x != 0 && tToExit.x < tMin) tMin = tToExit.x;
+            if (direction.y != 0 && tToExit.y < tMin) tMin = tToExit.y;
+            if (direction.z != 0 && tToExit.z < tMin) tMin = tToExit.z;
+            if (tMin < 0) tMin = 0;
+
+            cell += tMin * direction;
+            cellInt = int3(floor(cell + direction * RAY_BIAS));
+        }
+
         rayOrigin = cell + direction * RAY_BIAS;
     }
 
@@ -194,7 +225,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
     float rootTMin, rootTMax;
     if (!intersectAABB(rayOrigin, reciprocal, float3(0, 0, 0), float3(rootSize, rootSize, rootSize),
                        rootTMin, rootTMax))
-        return { false, int3(rayOrigin), rayOrigin, 0 };
+        return { false, int3(rayOrigin), rayOrigin, 0, 0 };
 
     StackEntry stack[MAX_OCTREE_STACK];
     uint stackTop = 0;
@@ -256,7 +287,52 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
             float3 hitLocal = localHit;
 #endif
             float3 hitCell = float3(entry.nodeMin) + hitLocal * float(nodeSize);
-            return { true, int3(floor(hitCell)), hitCell, gbIndex };
+            return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
+        }
+
+        // --- Dynamic LOD stop: compare ray footprint with node size ---
+        {
+            uint nodeSize = 1u << (octreeMaxDepth - entry.level);
+
+            // Compute ray exit t from this node's AABB
+            float3 nodeMinFloat = float3(entry.nodeMin);
+            float3 nodeMaxFloat = nodeMinFloat + float3(float(nodeSize));
+            float nodeTMin, nodeTMax;
+            intersectAABB(rayOrigin, reciprocal, nodeMinFloat, nodeMaxFloat, nodeTMin, nodeTMax);
+
+            float footprint = cone.bias + nodeTMax * cone.tanHalfAngle;
+            if (footprint > (float)nodeSize)
+            {
+                uint gbIndex = node.dataIndex;
+                float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
+                float3 localHit = (hitPoint - nodeMinFloat) / float(nodeSize);
+
+#if CHECK_ELLIPSOID
+                Ellipsoid e = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
+                float3 fromLE = localHit;
+                int3 signs = int3(sign(direction));
+                float3 border = float3(signs + 1) * 0.5f;
+                float3 tToBorder = (border - fromLE) / direction;
+                float tMinLocal = 2.0f;
+                if (direction.x != 0 && tToBorder.x < tMinLocal) tMinLocal = tToBorder.x;
+                if (direction.y != 0 && tToBorder.y < tMinLocal) tMinLocal = tToBorder.y;
+                if (direction.z != 0 && tToBorder.z < tMinLocal) tMinLocal = tToBorder.z;
+                if (tMinLocal < 0) tMinLocal = 0;
+                float3 to = fromLE + tMinLocal * direction;
+                float2 inOut = e.clip(fromLE, to);
+                if (inOut.x < 0)
+                    ; // fall through to child traversal — coarse ellipsoid missed
+                else
+                {
+                    float3 hitLocal = fromLE + inOut.x * (to - fromLE);
+                    float3 hitCell = nodeMinFloat + hitLocal * float(nodeSize);
+                    return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
+                }
+#else
+                float3 hitCell = nodeMinFloat + localHit * float(nodeSize);
+                return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
+#endif
+            }
         }
 
         // --- Internal node: collect intersecting children ---
@@ -309,7 +385,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
 
         // Push children in reverse order (largest tMin first → nearest pops first)
         if (stackTop + childCount > MAX_OCTREE_STACK)
-            return { false, int3(rayOrigin), rayOrigin, 0 };
+            return { false, int3(rayOrigin), rayOrigin, 0, 0 };
 
         for (int i = int(childCount) - 1; i >= 0; i--)
         {
@@ -324,13 +400,13 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
         }
     }
 
-    return { false, int3(rayOrigin), rayOrigin, 0 };
+    return { false, int3(rayOrigin), rayOrigin, 0, 0 };
 }
 
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
-    hit = rayMarching(hit.cell, direction, -1, true, cone, 0);
+    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0);
     return hit.hit ? 0 : 1;
 }
 
@@ -340,7 +416,7 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, true, cone, 0);
+    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, cone, 0);
     return hit.hit ? 0 : 1;
 }
 
@@ -358,7 +434,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, true, cone, 0);
+        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0);
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -465,9 +541,9 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         // Widen cone based on BSDF roughness before next bounce
         float rough = maxRoughness(offset);
         float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
-        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan) };
+        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
 
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, true, nextCone, 0);
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0);
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -560,12 +636,13 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 
     // Primary ray cone: pixel footprint
     // tan(coneHalfAngle) = tan(HalfFovY) / pixelHeight at distance=1
-    RayCone primaryCone = { tanHalfFovY / pixelCount.y };
+    float coneTan = tanHalfFovY / pixelCount.y;
 
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
     from = from + (inOut.x + 1e-6) * delta;
     float initialDistance = (inOut.x + 1e-6) * length(delta);
-    HitResult hit = rayMarching(from, direction, -1, false, primaryCone, initialDistance);
+    RayCone primaryCone = { coneTan, initialDistance * coneTan };
+    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance);
 
     if (all(pixel == selectedPixel))
     {
@@ -625,6 +702,28 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
                 color = float3(1, 0.5, 0);     // orange: sentinel LOST but area OK
             else
                 color = float3(1, 0, 0);       // red: sentinel LOST and area==0 (UAV write lost!)
+        }
+            break;
+        case ABSDFDrawMode::LODLevel:
+        {
+            // Visualize dynamic LOD: nodeSize → LOD level → color band
+            // nodeSize = 2^lodLevel, so lodLevel = log2(nodeSize)
+            uint lodLevel = firstbithigh(hit.nodeSize);
+            uint maxLod = octreeMaxDepth;
+
+            // 5-band heatmap: blue→cyan→green→yellow→red
+            if (lodLevel == 0)
+                color = float3(0.1, 0.2, 1.0);      // leaf: blue
+            else if (lodLevel == 1)
+                color = float3(0.0, 0.8, 0.8);      // cyan
+            else if (lodLevel == 2)
+                color = float3(0.0, 0.9, 0.2);      // green
+            else if (lodLevel == 3)
+                color = float3(0.9, 0.9, 0.0);      // yellow
+            else if (lodLevel == 4)
+                color = float3(1.0, 0.5, 0.0);      // orange
+            else
+                color = float3(1.0, 0.0, 0.0);      // coarse (5+): red
         }
             break;
         default:

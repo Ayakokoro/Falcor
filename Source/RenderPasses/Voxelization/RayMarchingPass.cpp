@@ -182,26 +182,6 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         std::cout << "VoxelData area: min=" << minArea << " max=" << maxArea
                   << " zeroCount=" << zeroAreaCount << "/" << voxelData.size() << std::endl;
 
-        // Debug: inspect black voxel index (from mouse-click readback)
-        {
-            uint32_t debugIdx = 6020142;
-            if (debugIdx < voxelData.size())
-            {
-                auto& vd = voxelData[debugIdx];
-                std::cout << "=== CPU voxelData[" << debugIdx << "] ===" << std::endl;
-                std::cout << "  ABSDF.area=" << vd.ABSDF.area << std::endl;
-                std::cout << "  ellipsoid.center=(" << vd.ellipsoid.center.x << "," << vd.ellipsoid.center.y << "," << vd.ellipsoid.center.z << ")" << std::endl;
-                for (int i = 0; i < 4; i++)
-                {
-                    auto& lobe = vd.ABSDF.lobes[i];
-                    std::cout << "  lobe[" << i << "]: weight=" << lobe.weight
-                              << " rough=" << lobe.rough
-                              << " n=(" << lobe.normal.x << "," << lobe.normal.y << "," << lobe.normal.z << ")"
-                              << std::endl;
-                }
-            }
-        }
-
         f.close();
 
         std::cout << ", solidVoxels=" << gd.solidVoxelCount << std::endl;

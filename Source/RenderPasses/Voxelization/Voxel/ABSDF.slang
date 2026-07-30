@@ -154,6 +154,7 @@ enum class ABSDFDrawMode : uint32_t
     InternalVisibility,
     TotalArea,
     LODHeatmap,
+    LODLevel,
 };
 FALCOR_ENUM_INFO(
     ABSDFDrawMode,
@@ -168,6 +169,7 @@ FALCOR_ENUM_INFO(
         { ABSDFDrawMode::InternalVisibility, "InternalVisibility" },
         { ABSDFDrawMode::TotalArea, "TotalArea" },
         { ABSDFDrawMode::LODHeatmap, "LODHeatmap" },
+        { ABSDFDrawMode::LODLevel, "LODLevel" },
     }
 );
 FALCOR_ENUM_REGISTER(ABSDFDrawMode);
