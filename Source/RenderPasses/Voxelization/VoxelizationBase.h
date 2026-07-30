@@ -59,14 +59,6 @@ public:
     static std::string ResourceFolder;
     static bool LightChanged;
 
-    static ref<Buffer> GBuffer;
-    static ref<Buffer> PBuffer;
-
-    // Octree data
-    static ref<Buffer> OctreeBuffer;
-    static uint32_t OctreeMaxDepth;
-    static std::vector<uint32_t> OctreeNodeCounts;
-
     static void UpdateVoxelGrid(ref<Scene> scene, uint baseVoxelResolution)
     {
         float3 diag;

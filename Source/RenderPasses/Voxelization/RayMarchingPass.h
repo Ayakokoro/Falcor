@@ -64,6 +64,19 @@ private:
     uint2 mSelectedPixel;
     uint mSelectedResolution;
 
+    // Triple buffer to avoid i32 overflow (>2³¹ bytes per buffer with 388-byte stride)
+    ref<Buffer> mGBuffer0;
+    ref<Buffer> mGBuffer1;
+    ref<Buffer> mGBuffer2;
+    ref<Buffer> mPBuffer0;
+    ref<Buffer> mPBuffer1;
+    ref<Buffer> mPBuffer2;
+    uint32_t mGBufferSplit0 = 0;
+    uint32_t mGBufferSplit1 = 0;
+    ref<Buffer> mOctreeBuffer;
+    uint32_t mOctreeMaxDepth = 0;
+    std::vector<uint32_t> mOctreeNodeCounts;
+
     bool mOptionsChanged;
     uint mFrameIndex;
     uint2 mOutputResolution;

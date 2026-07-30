@@ -63,6 +63,8 @@ struct MeshGeometry {
     uint triangleCount() const { return (uint)triangles.size(); }
 };
 
+
+// TODO:Add material in MeshInstance
 struct MeshInstance {
     uint meshID;
     glm::mat4 transform;  // 4x4 world transform (column-major, like GLM/GPU)

@@ -15,8 +15,12 @@ import Utils.Sampling.UniformSampleGenerator;
 
 #define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
-StructuredBuffer<TEBSDF> gBuffer;
-StructuredBuffer<Ellipsoid> pBuffer;
+StructuredBuffer<TEBSDF> gBuffer0;
+StructuredBuffer<TEBSDF> gBuffer1;
+StructuredBuffer<TEBSDF> gBuffer2;
+StructuredBuffer<Ellipsoid> pBuffer0;
+StructuredBuffer<Ellipsoid> pBuffer1;
+StructuredBuffer<Ellipsoid> pBuffer2;
 StructuredBuffer<OctreeNode> octreeBuffer;
 
 RWStructuredBuffer<float4> selectedVoxel;
@@ -43,6 +47,8 @@ cbuffer CB
     uint2 selectedPixel;
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
+    uint gbSplit0;      // boundary between buffer [0] and [1]
+    uint gbSplit1;      // boundary between buffer [1] and [2]
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -70,10 +76,24 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
+TEBSDF loadGBuffer(uint globalIdx, uint split0, uint split1)
+{
+    if (globalIdx < split0) return gBuffer0[globalIdx];
+    else if (globalIdx < split1) return gBuffer1[globalIdx - split0];
+    else return gBuffer2[globalIdx - split1];
+}
+
+Ellipsoid loadPBuffer(uint globalIdx, uint split0, uint split1)
+{
+    if (globalIdx < split0) return pBuffer0[globalIdx];
+    else if (globalIdx < split1) return pBuffer1[globalIdx - split0];
+    else return pBuffer2[globalIdx - split1];
+}
+
 // Extract max roughness across all lobes of a TEBSDF at gbIndex
 float maxRoughness(uint gbIndex)
 {
-    TEBSDF bsdf = gBuffer[gbIndex];
+    TEBSDF bsdf = loadGBuffer(gbIndex, gbSplit0, gbSplit1);
     float r = 0;
     for (uint i = 0; i < bsdf.surface.lobeCount; i++)
         r = max(r, bsdf.surface.lobes[i].frostBite.rough);
@@ -101,7 +121,7 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex)
 #if !CHECK_ELLIPSOID
     return { true, cellInt, cellInt + 0.5f, gbIndex };
 #else
-    Ellipsoid ellipsoid = pBuffer[gbIndex];
+    Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex);
     if (hit.hit)
         return hit;
@@ -217,7 +237,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, bool ign
             float3 localHit = (hitPoint - float3(entry.nodeMin)) / float(nodeSize);
 
 #if CHECK_ELLIPSOID
-            Ellipsoid e = pBuffer[gbIndex];
+            Ellipsoid e = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
             float3 from = localHit;
             int3 signs = int3(sign(direction));
             float3 border = float3(signs + 1) * 0.5f;
@@ -331,7 +351,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     float times = MAX_BOUNCE;
     while (times > 0)
     {
-        TEBSDF bsdf = gBuffer[offset];
+        TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
         coverage += (1 - coverage) * bsdf.calcCoverage(direction);
         if (coverage >= 1 - transmittanceThreshold)
         {
@@ -350,8 +370,8 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
-    TEBSDF bsdf = gBuffer[offset];
-    Ellipsoid e = pBuffer[offset];
+    TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
+    Ellipsoid e = loadPBuffer(offset, gbSplit0, gbSplit1);
     float result = 0;
     switch (drawMode)
     {
@@ -390,7 +410,7 @@ float3 debugShading(HitResult hit, float3 v)
 
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
-    TEBSDF BSDF = gBuffer[offset];
+    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
     BSDF.updateCoverage(v, transmittanceThreshold);
     return lightColor * BSDF.eval(l, v, h);
 }
@@ -398,7 +418,7 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
-    TEBSDF BSDF = gBuffer[offset];
+    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -429,7 +449,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     for (int i = 0; i < bounce; i++)
     {
         uint offset = hits[i].gbIndex;
-        TEBSDF BSDF = gBuffer[offset];
+        TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
         float3 currentV = i == 0 ? v : -ls[i - 1];
         BSDF.updateCoverage(currentV, transmittanceThreshold);
         BSDF.sample(currentV, ls[i], hs[i], sg);
@@ -584,25 +604,27 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
-            // // With octree, show depth of the leaf node as a heatmap
-            // // Compute octree depth by checking cellInt relative to grid
-            // uint depth = octreeMaxDepth;
-            // // Simple: use voxelCount to infer approximate depth
-            // float3 normalizedCell = float3(hit.cellInt) / float3(voxelCount);
-            // float approxDepth = normalizedCell.x + normalizedCell.y + normalizedCell.z;
-            // const float3 kDepthColors[] = {
-            //     float3(0.0, 1.0, 0.0), // green  — fine
-            //     float3(0.0, 0.8, 1.0), // cyan
-            //     float3(0.0, 0.0, 1.0), // blue
-            //     float3(0.8, 0.8, 0.0), // yellow
-            //     float3(1.0, 0.5, 0.0), // orange
-            //     float3(1.0, 0.0, 0.0), // red
-            //     float3(1.0, 0.0, 1.0), // magenta
-            //     float3(1.0, 1.0, 1.0), // white  — coarse
-            // };
-            // uint idx = uint(approxDepth * 8) % 8;
-            // color = kDepthColors[idx];
-            color = maxRoughness(hit.gbIndex);
+            Ellipsoid e = loadPBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+            TEBSDF bsdf = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+
+            float bSum = abs(e.B[0][0]) + abs(e.B[0][1]) + abs(e.B[0][2])
+                       + abs(e.B[1][0]) + abs(e.B[1][1]) + abs(e.B[1][2])
+                       + abs(e.B[2][0]) + abs(e.B[2][1]) + abs(e.B[2][2]);
+
+            bool pbufOK = (bSum > 0);
+            bool gbufArea = (bsdf.area > 0);
+            bool sentinel = (bsdf.coverage == 12345.0f);  // set by Prepare shader
+
+            if (!pbufOK)
+                color = float3(1, 0, 1);       // magenta: pBuffer also zero
+            else if (sentinel && gbufArea)
+                color = float3(0, 1, 0);       // green: sentinel OK, area OK
+            else if (sentinel && !gbufArea)
+                color = float3(0, 0, 1);       // blue: sentinel OK but area==0 (init() bug!)
+            else if (!sentinel && gbufArea)
+                color = float3(1, 0.5, 0);     // orange: sentinel LOST but area OK
+            else
+                color = float3(1, 0, 0);       // red: sentinel LOST and area==0 (UAV write lost!)
         }
             break;
         default:

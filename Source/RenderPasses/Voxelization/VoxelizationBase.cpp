@@ -1,13 +1,11 @@
 #include "VoxelizationBase.h"
 #include "VoxelizationPass.h"
 #include "RayMarchingPass.h"
-#include "ReadVoxelPass.h"
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, RayMarchingPass>();
     registry.registerClass<RenderPass, VoxelizationPass>();
-    registry.registerClass<RenderPass, ReadVoxelPass>();
 }
 
 uint3 VoxelizationBase::MinFactor = uint3(1, 1, 1);
@@ -15,11 +13,6 @@ bool VoxelizationBase::FileUpdated = true;
 bool VoxelizationBase::LightChanged = true;
 std::string VoxelizationBase::ResourceFolder = "D:/syc/Falcor/resource/";
 GridData VoxelizationBase::GlobalGridData = {};
-ref<Buffer> VoxelizationBase::GBuffer = {};
-ref<Buffer> VoxelizationBase::PBuffer = {};
-ref<Buffer> VoxelizationBase::OctreeBuffer = {};
-uint32_t VoxelizationBase::OctreeMaxDepth = 0;
-std::vector<uint32_t> VoxelizationBase::OctreeNodeCounts;
 
 std::random_device rd;
 std::mt19937 Random::Generator{ rd() };

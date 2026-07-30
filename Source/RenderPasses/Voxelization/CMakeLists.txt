@@ -5,7 +5,7 @@ target_sources(Voxelization PRIVATE
 
     Voxel/ABSDF.slang
     Voxel/VoxelGrid.slang
-    
+
     Math/AABB.slang
     Math/Projection.slang
     Math/Ellipsoid.slang
@@ -37,9 +37,6 @@ target_sources(Voxelization PRIVATE
     PrepareShadingData.cs.slang
     RayMarching.ps.slang
     DisplayNDF.ps.slang
-
-    ReadVoxelPass.cpp
-    ReadVoxelPass.h
 )
 target_copy_shaders(Voxelization RenderPasses/Voxelization)
 target_source_group(Voxelization "RenderPasses")

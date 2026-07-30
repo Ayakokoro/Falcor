@@ -57,7 +57,7 @@ inline OctreeResult buildFromLeafKeys(
         }
     }
 
-    // Step 2: BFS traversal (same algorithm as PolygonGenerator::finalizeBFS)
+    //
     OctreeResult result;
     result.maxDepth = maxDepth;
     result.levelNodeCounts.assign(maxDepth + 1, 0);

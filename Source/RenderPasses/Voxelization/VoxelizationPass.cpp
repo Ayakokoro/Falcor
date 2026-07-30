@@ -323,13 +323,6 @@ void VoxelizationPass::uploadBuffers(RenderContext* pRenderContext)
         sizeof(OctreeNode), octreeNodeCount, ResourceBindFlags::ShaderResource);
     octreeBuffer->setBlob(polygonGenerator.mOctreeNodes.data(), 0, octreeNodeCount * sizeof(OctreeNode));
 
-    // Store in static storage for file write
-    VoxelizationBase::OctreeMaxDepth = polygonGenerator.mOctreeMaxDepth;
-    VoxelizationBase::OctreeNodeCounts = polygonGenerator.mOctreeNodeCounts;
-    VoxelizationBase::OctreeBuffer = octreeBuffer;
-    VoxelizationBase::GBuffer = gBuffer;
-    VoxelizationBase::PBuffer = pBuffer;
-
     if (mEnableDebug)
     {
         std::cout << "[Upload] totalNodeCount=" << totalNodeCount

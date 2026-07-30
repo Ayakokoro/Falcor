@@ -284,7 +284,6 @@ public:
                 // Ellipsoid: approximate from child ellipsoid extreme points
                 {
                     std::vector<float3> extPoints;
-                    float parentScale = (float)(1u << (mMaxDepth - level));
 
                     uint childBFS = oct.childBase;
                     for (uint ci = 0; ci < 8; ci++) {
@@ -307,8 +306,8 @@ public:
                             float extent = 1.0f / std::sqrt(evals[a]);
                             float3 dir(R[a].x, R[a].y, R[a].z);
 
-                            float3 p1 = (childCenter + dir * extent - float3(gen.mBFSOrder[nodeIdx].cellInt)) / parentScale;
-                            float3 p2 = (childCenter - dir * extent - float3(gen.mBFSOrder[nodeIdx].cellInt)) / parentScale;
+                            float3 p1 = (childCenter + dir * extent) * 0.5f - float3(gen.mBFSOrder[nodeIdx].cellInt);
+                            float3 p2 = (childCenter - dir * extent) * 0.5f - float3(gen.mBFSOrder[nodeIdx].cellInt);
                             extPoints.push_back(p1);
                             extPoints.push_back(p2);
                         }
@@ -688,7 +687,6 @@ private:
             // Ellipsoid: approximate from child ellipsoid extreme points
             {
                 std::vector<float3> extPoints;
-                float parentScale = (float)(1u << (maxDepth - level));
 
                 uint32_t childBFS = oct.childBase;
                 for (uint32_t ci = 0; ci < 8; ci++) {
@@ -711,8 +709,8 @@ private:
                         float extent = 1.0f / std::sqrt(evals[a]);
                         float3 dir(R[a].x, R[a].y, R[a].z);
 
-                        float3 p1 = (childCenter + dir * extent - float3(octree.bfsOrder[nodeIdx].cellInt)) / parentScale;
-                        float3 p2 = (childCenter - dir * extent - float3(octree.bfsOrder[nodeIdx].cellInt)) / parentScale;
+                        float3 p1 = (childCenter + dir * extent) * 0.5f - float3(octree.bfsOrder[nodeIdx].cellInt);
+                        float3 p2 = (childCenter - dir * extent) * 0.5f - float3(octree.bfsOrder[nodeIdx].cellInt);
                         extPoints.push_back(p1);
                         extPoints.push_back(p2);
                     }

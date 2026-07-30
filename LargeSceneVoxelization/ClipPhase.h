@@ -34,6 +34,7 @@ static inline float3 localToVoxel(const float3& localPos, const glm::mat4& world
     );
 }
 
+// TODO:Correct transformed normal
 static inline float3 transformNormal(const float3& localNormal, const glm::mat4& worldM) {
     glm::mat3 rot(worldM);
     glm::vec3 wn = rot * glm::vec3(localNormal.x, localNormal.y, localNormal.z);
@@ -45,6 +46,7 @@ static inline float3 transformNormal(const float3& localNormal, const glm::mat4&
 // to a binary stream instead of mNodePolygonMap.
 // Returns the number of leaf entries written.
 
+// TODO:Maybe cause stack overflow
 static uint64_t clipHierarchicalToStream(
     uint32_t meshID, uint32_t materialID, uint32_t triangleID, uint32_t instanceIdx,
     Triangle& tri, const AABBInt& triAABB, const int3& nodeCell,
