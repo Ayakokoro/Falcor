@@ -31,6 +31,7 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mMaxBounce = 0;
     mRenderBackGround = true;
     mClearColor = float3(0);
+    mCoverageBlend = 0.0f;
     mSelectedResolution = 0;
     mOutputResolution = uint2(1920, 1080);
 
@@ -443,8 +444,10 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["clearColor"] = float4(mClearColor, 0);
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
+        cb["maxLODLevel"] = mMaxLODLevel;
         cb["gbSplit0"] = mGBufferSplit0;
         cb["gbSplit1"] = mGBufferSplit1;
+        cb["coverageBlend"] = mCoverageBlend;
         mFrameIndex++;
 
         mpFbo->attachColorTarget(pOutputColor, 0);
@@ -574,6 +577,13 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         if (mForcedLOD >= 0)
             widget.text("LOD " + std::to_string(mForcedLOD) + ": node size = " +
                         std::to_string(1 << (maxLOD - mForcedLOD)) + " leaf voxels");
+
+        // Max LOD level cap for dynamic LOD
+        if (widget.slider("Max LOD Level", mMaxLODLevel, -1, maxLOD))
+            mOptionsChanged = true;
+        if (mMaxLODLevel >= 0)
+            widget.text("LOD cap at level " + std::to_string(mMaxLODLevel)
+                        + ": node size = " + std::to_string(1 << (maxLOD - mMaxLODLevel)) + " leaf cells");
     }
     if (widget.checkbox("Use Emissive Light", mUseEmissiveLight))
         mOptionsChanged = true;
@@ -583,6 +593,11 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.checkbox("Check Coverage", mCheckCoverage))
         mOptionsChanged = true;
+    if (mCheckCoverage)
+    {
+        if (widget.slider("Coverage Blend", mCoverageBlend, 0.0f, 1.0f))
+            mOptionsChanged = true;
+    }
     if (widget.slider("Shadow Bias(x100)", mShadowBias100, 0.0f, 0.2f))
         mOptionsChanged = true;
     if (widget.slider("Min Pdf(x100)", mMinPdf100, 0.0f, 0.2f))

@@ -57,6 +57,8 @@ private:
     bool mRenderBackGround;
     bool mComplete;
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
+    int mMaxLODLevel = -1; // -1=no cap, N=never LOD-stop above this level (leaf=0)
+    float mCoverageBlend = 0.0f; // 0=raw coverage, 1=fill all empty cavity
     float3 mClearColor;
 
     bool mDisplayNDF;

@@ -413,7 +413,7 @@ struct TEBSDF
         }
     }
 
-    float calcCoverage(float3 direction)
+    float calcCoverage(float3 direction, float coverageBlend)
     {
 #if !CHECK_COVERAGE
         return 1;
@@ -422,17 +422,20 @@ struct TEBSDF
         if (primitiveProjArea <= 0)
             return 1;
         float polygonsProjArea = polygonsProjAreaFunc.calc(direction);
-        return saturate(polygonsProjArea / primitiveProjArea);
+        float rawCoverage = polygonsProjArea / primitiveProjArea;
+        float emptyRatio = (primitiveProjArea - polygonsProjArea) / max(primitiveProjArea, 1e-8f);
+        float coverage = rawCoverage + coverageBlend * emptyRatio;
+        return saturate(coverage);
     }
     // 采样前必须调用此函数
     [mutating]
-    void updateCoverage(float3 direction, float threshould)
+    void updateCoverage(float3 direction, float threshould, float coverageBlend)
     {
 #if !CHECK_COVERAGE
         coverage = 1;
         return;
 #endif
-        coverage = calcCoverage(direction);
+        coverage = calcCoverage(direction, coverageBlend);
         if (1 - coverage < threshould)
             coverage = 1;
     }

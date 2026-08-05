@@ -47,8 +47,10 @@ cbuffer CB
     uint2 selectedPixel;
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
+    int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
     uint gbSplit0;      // boundary between buffer [0] and [1]
     uint gbSplit1;      // boundary between buffer [1] and [2]
+    float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -301,7 +303,12 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             intersectAABB(rayOrigin, reciprocal, nodeMinFloat, nodeMaxFloat, nodeTMin, nodeTMax);
 
             float footprint = cone.bias + nodeTMax * cone.tanHalfAngle;
-            if (footprint > (float)nodeSize)
+
+            // Honor LOD level cap: don't stop at levels coarser than maxLODLevel
+            uint nodeLOD = octreeMaxDepth - entry.level;
+            bool lodLevelOK = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
+
+            if (lodLevelOK && footprint > (float)nodeSize)
             {
                 uint gbIndex = node.dataIndex;
                 float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
@@ -428,7 +435,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     while (times > 0)
     {
         TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
-        coverage += (1 - coverage) * bsdf.calcCoverage(direction);
+        coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend);
         if (coverage >= 1 - transmittanceThreshold)
         {
             coverage = 1;
@@ -487,7 +494,7 @@ float3 debugShading(HitResult hit, float3 v)
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
     TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
-    BSDF.updateCoverage(v, transmittanceThreshold);
+    BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend);
     return lightColor * BSDF.eval(l, v, h);
 }
 
@@ -527,7 +534,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         uint offset = hits[i].gbIndex;
         TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
         float3 currentV = i == 0 ? v : -ls[i - 1];
-        BSDF.updateCoverage(currentV, transmittanceThreshold);
+        BSDF.updateCoverage(currentV, transmittanceThreshold, coverageBlend);
         BSDF.sample(currentV, ls[i], hs[i], sg);
 
         pdfs[i] = BSDF.evalPdf(ls[i], currentV, hs[i]);
