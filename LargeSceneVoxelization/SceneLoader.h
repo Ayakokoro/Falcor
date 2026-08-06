@@ -5,6 +5,8 @@
 #include <string>
 #include <unordered_map>
 #include <cctype>
+#include <fstream>
+#include <filesystem>
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
@@ -23,8 +25,10 @@ struct MaterialData {
     float3 baseColor = float3(1.0f);
     float4 specular = float4(0.04f, 1.0f, 0.0f, 1.0f); // F0, roughness, metallic, _
     std::string texBaseColor;    // path to base color texture
-    std::string texSpecular;     // path to specular/roughness/metallic texture
+    std::string texSpecular;     // path to ORM combined / roughness-only / Phong specular
+    std::string texMetallic;     // path to separate metallic texture (FBX Blender PBR)
     std::string texNormalMap;
+    bool isSpecGloss = false;    // true = Phong/SpecGloss model → convert to metal-rough
 };
 
 struct LoadedScene {
@@ -268,6 +272,60 @@ private:
     std::string mError;
     std::string mSceneDir;
 
+    // Cache of extracted embedded textures (Assimp *N paths → temp file paths)
+    std::unordered_map<int, std::string> mEmbeddedTempFiles;
+
+    // Extract an embedded texture from aiScene and write to a temp file.
+    // Returns the temp file path, or empty string on failure.
+    std::string resolveEmbedded(const aiScene* ai, const std::string& texPath) {
+        if (texPath.size() < 2 || texPath[0] != '*')
+            return "";
+
+        for (size_t i = 1; i < texPath.size(); i++)
+            if (!std::isdigit(static_cast<unsigned char>(texPath[i])))
+                return "";
+
+        int index = std::stoi(texPath.substr(1));
+        if (index < 0 || index >= (int)ai->mNumTextures)
+            return "";
+
+        // Check cache first
+        auto it = mEmbeddedTempFiles.find(index);
+        if (it != mEmbeddedTempFiles.end())
+            return it->second;
+
+        const aiTexture* tex = ai->mTextures[index];
+        // mHeight == 0 → compressed (PNG/JPEG), mWidth = byte size
+        if (tex->mHeight != 0 || !tex->pcData || tex->mWidth == 0)
+            return "";
+
+        const char* fmt = tex->achFormatHint[0] != '\0' ? tex->achFormatHint : "png";
+        auto tmp = std::filesystem::temp_directory_path() /
+            ("vox_embedded_" + std::to_string(index) + "." + fmt);
+
+        std::ofstream ofs(tmp, std::ios::binary);
+        if (!ofs.is_open())
+            return "";
+        ofs.write(reinterpret_cast<const char*>(tex->pcData), tex->mWidth);
+        ofs.close();
+
+        mEmbeddedTempFiles[index] = tmp.string();
+        return tmp.string();
+    }
+
+    // Get the original filename of an embedded texture (for heuristic matching).
+    std::string embeddedOriginalName(const aiScene* ai, const std::string& texPath) const {
+        if (texPath.size() < 2 || texPath[0] != '*')
+            return "";
+        for (size_t i = 1; i < texPath.size(); i++)
+            if (!std::isdigit(static_cast<unsigned char>(texPath[i])))
+                return "";
+        int index = std::stoi(texPath.substr(1));
+        if (index < 0 || index >= (int)ai->mNumTextures)
+            return "";
+        return std::string(ai->mTextures[index]->mFilename.C_Str());
+    }
+
     struct InstanceInfo {
         uint meshIndex;          // aiMesh index
         aiMatrix4x4 transform;   // world transform
@@ -286,7 +344,8 @@ private:
 
             // PBR roughness: prefer explicit roughness factor, fall back to shininess
             float roughness = 1.0f;
-            if (aimat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) != AI_SUCCESS)
+            bool hasPbrRoughness = (aimat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS);
+            if (!hasPbrRoughness)
             {
                 float shininess = 0;
                 if (aimat->Get(AI_MATKEY_SHININESS, shininess) == AI_SUCCESS)
@@ -294,15 +353,32 @@ private:
             }
             mat.specular.g = roughness;
 
-            // Metallic: FBX uses PBR metallic; check for $raw.roughness and $raw.metalness
+            // Metallic: PBR metallic factor, or detect SpecGloss from Phong specular color
             float metallic = 0;
-            if (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS)
+            bool hasPbrMetallic = (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS);
+            if (hasPbrMetallic) {
                 mat.specular.b = metallic;
+            } else {
+                // No PBR metallic → check for SpecGloss (Phong) model
+                aiColor4D specColor;
+                if (aimat->Get(AI_MATKEY_COLOR_SPECULAR, specColor) == AI_SUCCESS) {
+                    mat.isSpecGloss = true;
+                    float specLum = specColor.r * 0.2126f + specColor.g * 0.7152f + specColor.b * 0.0722f;
+                    mat.specular.x = std::max(0.04f, specLum);      // F0 override
+                    mat.specular.b = std::min(specLum * 2.0f, 1.0f); // metallic hint from spec intensity
+                }
+            }
 
-            // Texture paths: handle both relative and absolute paths from Assimp
+            // Texture paths: handle both relative and absolute paths from Assimp.
+            // Embedded textures (*N) are extracted to temp files.
             auto resolvePath = [&](const aiString& p) -> std::string {
                 std::string s(p.C_Str());
                 if (s.empty()) return s;
+                // Handle embedded texture (*0, *1, ...)
+                if (s[0] == '*') {
+                    std::string tmp = resolveEmbedded(ai, s);
+                    if (!tmp.empty()) return tmp;
+                }
                 // Already absolute (Windows drive letter or Unix root)
                 if (s.size() >= 2 && s[1] == ':') return s;
                 if (s[0] == '/') return s;
@@ -329,14 +405,25 @@ private:
                         if (mat.texSpecular.empty())
                             mat.texSpecular = resolvePath(texPath);
                     } else if (texType == aiTextureType_UNKNOWN) {
-                        // Heuristic: match by filename keywords
-                        std::string lower = rawPath;
+                        // Heuristic: match by filename keywords.
+                        // For embedded textures (*N), use the original filename from aiScene.
+                        std::string matchName = rawPath;
+                        if (rawPath.size() >= 2 && rawPath[0] == '*') {
+                            std::string orig = embeddedOriginalName(ai, rawPath);
+                            if (!orig.empty()) matchName = orig;
+                        }
+                        std::string lower = matchName;
                         for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
                         if (lower.find("normal") != std::string::npos || lower.find("bump") != std::string::npos) {
                             if (mat.texNormalMap.empty())
                                 mat.texNormalMap = resolvePath(texPath);
-                        } else if (lower.find("rough") != std::string::npos || lower.find("metal") != std::string::npos
-                                   || lower.find("spec") != std::string::npos) {
+                        } else if (lower.find("rough") != std::string::npos) {
+                            if (mat.texSpecular.empty())
+                                mat.texSpecular = resolvePath(texPath);
+                        } else if (lower.find("metal") != std::string::npos) {
+                            if (mat.texMetallic.empty())
+                                mat.texMetallic = resolvePath(texPath);
+                        } else if (lower.find("spec") != std::string::npos) {
                             if (mat.texSpecular.empty())
                                 mat.texSpecular = resolvePath(texPath);
                         }
@@ -353,16 +440,18 @@ private:
                     mat.texSpecular = resolvePath(raw);
                 if (aimat->Get("$raw.normal_texture", 0, 0, raw) == AI_SUCCESS && mat.texNormalMap.empty())
                     mat.texNormalMap = resolvePath(raw);
-                if (aimat->Get("$raw.metallic_texture", 0, 0, raw) == AI_SUCCESS && mat.texSpecular.empty())
-                    mat.texSpecular = resolvePath(raw);
+                if (aimat->Get("$raw.metallic_texture", 0, 0, raw) == AI_SUCCESS && mat.texMetallic.empty())
+                    mat.texMetallic = resolvePath(raw);
             }
 
             // Print all texture slots for debugging
             std::cout << "    mat[" << i << "] textures:";
             if (!mat.texBaseColor.empty()) std::cout << " baseColor=" << mat.texBaseColor;
-            if (!mat.texSpecular.empty()) std::cout << " specular=" << mat.texSpecular;
+            if (!mat.texSpecular.empty()) std::cout << " roughness=" << mat.texSpecular;
+            if (!mat.texMetallic.empty()) std::cout << " metallic=" << mat.texMetallic;
             if (!mat.texNormalMap.empty()) std::cout << " normal=" << mat.texNormalMap;
-            if (mat.texBaseColor.empty() && mat.texSpecular.empty() && mat.texNormalMap.empty())
+            if (mat.isSpecGloss) std::cout << " [SpecGloss]";
+            if (mat.texBaseColor.empty() && mat.texSpecular.empty() && mat.texMetallic.empty() && mat.texNormalMap.empty())
                 std::cout << " (none)";
             std::cout << std::endl;
 

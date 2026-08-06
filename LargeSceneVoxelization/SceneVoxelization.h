@@ -178,19 +178,49 @@ public:
                     // Sample textures
                     const MaterialData& mat = scene.materials[matID];
                     float4 baseColorVal = float4(mat.baseColor, 1.0f);
-                    float4 specVal = mat.specular;
+
+                    // --- Roughness + Metallic ---
+                    float roughnessVal = mat.specular.g;
+                    float metallicVal  = mat.specular.b;
+
+                    if (mat.isSpecGloss)
+                    {
+                        // SpecGloss: specular texture is RGB spec color + A gloss
+                        float4 sgVal = mat.specular;
+                        if (matID < mSpecularTextures.size() && mSpecularTextures[matID].width > 0) {
+                            sgVal = sampleTextureArea(mSpecularTextures[matID], uvCenter, uvArea,
+                                                       float4(mat.specular.x, 1.0f, 0.0f, sgVal.w));
+                        }
+                        float specLum = sgVal.x * 0.2126f + sgVal.y * 0.7152f + sgVal.z * 0.0722f;
+                        roughnessVal = 1.0f - sgVal.w;          // gloss → roughness
+                        metallicVal  = std::min(specLum * 2.0f, 1.0f);
+                    }
+                    else
+                    {
+                        // MetalRough: roughness from specular (ORM) texture G channel
+                        if (matID < mSpecularTextures.size() && mSpecularTextures[matID].width > 0) {
+                            float4 r = sampleTextureArea(mSpecularTextures[matID], uvCenter, uvArea,
+                                                         float4(0.0f, roughnessVal, metallicVal, 1.0f));
+                            roughnessVal = r.y;
+                            // If no separate metallic texture, use ORM B channel
+                            if (matID >= mMetallicTextures.size() || mMetallicTextures[matID].width == 0)
+                                metallicVal = r.z;
+                        }
+                        // Separate metallic texture (FBX Blender PBR) → R channel
+                        if (matID < mMetallicTextures.size() && mMetallicTextures[matID].width > 0) {
+                            float4 m = sampleTextureArea(mMetallicTextures[matID], uvCenter, uvArea,
+                                                         float4(metallicVal, 0.0f, 0.0f, 1.0f));
+                            metallicVal = m.x;
+                        }
+                    }
+
+                    float4 specVal = float4(mat.specular.x, roughnessVal, metallicVal, 1.0f);
 
                     if (matID < mBaseColorTextures.size() &&
                         mBaseColorTextures[matID].width > 0) {
                         baseColorVal = sampleTextureArea(
                             mBaseColorTextures[matID], uvCenter,
                             uvArea, float4(mat.baseColor, 1.0f));
-                    }
-                    if (matID < mSpecularTextures.size() &&
-                        mSpecularTextures[matID].width > 0) {
-                        specVal = sampleTextureArea(
-                            mSpecularTextures[matID], uvCenter,
-                            uvArea, float4(mat.specular.x, mat.specular.y, mat.specular.z, 1.0f));
                     }
 
                     float3 shadingNormal = interpolatedNormal;
@@ -345,6 +375,7 @@ private:
     // Loaded textures: materialID -> texture
     std::vector<Texture2D> mBaseColorTextures;
     std::vector<Texture2D> mSpecularTextures;
+    std::vector<Texture2D> mMetallicTextures;
     std::vector<Texture2D> mNormalMapTextures;
 
     // Disk-backed pipeline configuration
@@ -417,12 +448,15 @@ private:
     void loadTextures(const std::vector<MaterialData>& materials) {
         mBaseColorTextures.resize(materials.size());
         mSpecularTextures.resize(materials.size());
+        mMetallicTextures.resize(materials.size());
         mNormalMapTextures.resize(materials.size());
         for (size_t i = 0; i < materials.size(); i++) {
             if (!materials[i].texBaseColor.empty())
                 mBaseColorTextures[i].load(materials[i].texBaseColor, true);
             if (!materials[i].texSpecular.empty())
                 mSpecularTextures[i].load(materials[i].texSpecular);
+            if (!materials[i].texMetallic.empty())
+                mMetallicTextures[i].load(materials[i].texMetallic);
             if (!materials[i].texNormalMap.empty())
                 mNormalMapTextures[i].load(materials[i].texNormalMap);
         }
@@ -776,7 +810,7 @@ inline bool SceneVoxelization::processDisk(
     std::cout << "\n=== Phase 3: Analyze ===" << std::endl;
     AnalyzePhase::AnalyzeContext actx{
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
-        mBaseColorTextures, mSpecularTextures, mNormalMapTextures
+        mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
     };
     AnalyzePhase::execute(mergeResult, actx);
 

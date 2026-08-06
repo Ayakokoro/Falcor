@@ -30,6 +30,7 @@ struct AnalyzeContext {
     uint32_t sampleFrequency;
     const std::vector<Texture2D>& baseColorTextures;
     const std::vector<Texture2D>& specularTextures;
+    const std::vector<Texture2D>& metallicTextures;
     const std::vector<Texture2D>& normalMapTextures;
 };
 
@@ -135,19 +136,49 @@ inline void analyzeLeaf(
         // Sample textures
         const MaterialData& mat = ctx.scene.materials[matID];
         float4 baseColorVal = float4(mat.baseColor, 1.0f);
-        float4 specVal = mat.specular;
+
+        // --- Roughness + Metallic ---
+        float roughnessVal = mat.specular.g;
+        float metallicVal  = mat.specular.b;
+
+        if (mat.isSpecGloss)
+        {
+            // SpecGloss: specular texture is RGB spec color + A gloss
+            float4 sgVal = mat.specular;
+            if (matID < ctx.specularTextures.size() && ctx.specularTextures[matID].width > 0) {
+                sgVal = sampleTextureArea(ctx.specularTextures[matID], uvCenter, uvArea,
+                                           float4(mat.specular.x, 1.0f, 0.0f, sgVal.w));
+            }
+            float specLum = sgVal.x * 0.2126f + sgVal.y * 0.7152f + sgVal.z * 0.0722f;
+            roughnessVal = 1.0f - sgVal.w;          // gloss → roughness
+            metallicVal  = std::min(specLum * 2.0f, 1.0f);
+        }
+        else
+        {
+            // MetalRough: roughness from specular (ORM) texture G channel
+            if (matID < ctx.specularTextures.size() && ctx.specularTextures[matID].width > 0) {
+                float4 r = sampleTextureArea(ctx.specularTextures[matID], uvCenter, uvArea,
+                                             float4(0.0f, roughnessVal, metallicVal, 1.0f));
+                roughnessVal = r.y;
+                // If no separate metallic texture, use ORM B channel
+                if (matID >= ctx.metallicTextures.size() || ctx.metallicTextures[matID].width == 0)
+                    metallicVal = r.z;
+            }
+            // Separate metallic texture (FBX Blender PBR) → R channel
+            if (matID < ctx.metallicTextures.size() && ctx.metallicTextures[matID].width > 0) {
+                float4 m = sampleTextureArea(ctx.metallicTextures[matID], uvCenter, uvArea,
+                                             float4(metallicVal, 0.0f, 0.0f, 1.0f));
+                metallicVal = m.x;
+            }
+        }
+
+        float4 specVal = float4(mat.specular.x, roughnessVal, metallicVal, 1.0f);
 
         if (matID < ctx.baseColorTextures.size() &&
             ctx.baseColorTextures[matID].width > 0) {
             baseColorVal = sampleTextureArea(
                 ctx.baseColorTextures[matID], uvCenter,
                 uvArea, float4(mat.baseColor, 1.0f));
-        }
-        if (matID < ctx.specularTextures.size() &&
-            ctx.specularTextures[matID].width > 0) {
-            specVal = sampleTextureArea(
-                ctx.specularTextures[matID], uvCenter,
-                uvArea, float4(mat.specular.x, mat.specular.y, mat.specular.z, 1.0f));
         }
 
         float3 shadingNormal = interpolatedNormal;

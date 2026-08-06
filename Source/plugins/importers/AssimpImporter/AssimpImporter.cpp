@@ -817,7 +817,53 @@ void loadTextures(
             continue;
         }
 
-        // Load the texture
+        // Handle embedded textures (paths like "*0", "*1").
+        // GLB and other formats embed textures in the Assimp scene data.
+        if (path[0] == '*' && path.size() > 1)
+        {
+            bool isNumeric = true;
+            for (size_t i = 1; i < path.size(); i++)
+                isNumeric = isNumeric && std::isdigit(static_cast<unsigned char>(path[i]));
+
+            if (isNumeric)
+            {
+                int textureIndex = std::stoi(path.substr(1));
+                if (textureIndex >= 0 && textureIndex < (int)data.pScene->mNumTextures)
+                {
+                    const aiTexture* pAiTex = data.pScene->mTextures[textureIndex];
+
+                    // mHeight == 0 means compressed data (PNG, JPEG, etc.);
+                    // mWidth holds the byte size of the compressed file.
+                    if (pAiTex->mHeight == 0 && pAiTex->pcData && pAiTex->mWidth > 0)
+                    {
+                        const char* fmt = pAiTex->achFormatHint[0] != '\0' ? pAiTex->achFormatHint : "png";
+                        auto tmp = std::filesystem::temp_directory_path() /
+                            ("falcor_embedded_" + std::to_string(textureIndex) + "." + fmt);
+
+                        std::ofstream ofs(tmp, std::ios::binary);
+                        if (ofs.is_open())
+                        {
+                            ofs.write(reinterpret_cast<const char*>(pAiTex->pcData), pAiTex->mWidth);
+                            ofs.close();
+                            data.builder.loadMaterialTexture(pMaterial, source.targetType, tmp);
+                        }
+                        else
+                        {
+                            logWarning("AssimpImporter: Failed to write embedded texture '{}' to temp file.", path);
+                        }
+                    }
+                    else if (pAiTex->mHeight != 0)
+                    {
+                        logWarning("AssimpImporter: Uncompressed embedded texture '{}' not supported.", path);
+                    }
+                    continue;
+                }
+            }
+            logWarning("AssimpImporter: Embedded texture '{}' could not be resolved, ignoring.", path);
+            continue;
+        }
+
+        // Load the texture from file
         auto fullPath = searchPath / path;
         data.builder.loadMaterialTexture(pMaterial, source.targetType, fullPath);
     }
@@ -1035,7 +1081,7 @@ void validateBones(ImporterData& data)
 void validateScene(ImporterData& data)
 {
     if (data.pScene->mNumTextures > 0)
-        logWarning("AssimpImporter: Scene has {} embedded textures which Falcor doesn't load.", data.pScene->mNumTextures);
+        logInfo("AssimpImporter: Scene has {} embedded textures.", data.pScene->mNumTextures);
 
     validateBones(data);
 }

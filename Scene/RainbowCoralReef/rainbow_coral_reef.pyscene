@@ -16,6 +16,10 @@
 #     # m.baseColor = float4(1.0, 0.7, 0.7, 1.0)
 #     pass
 
+envMap = EnvMap('../EnvMap/White.exr')
+envMap.intensity = 1.0
+sceneBuilder.envMap = envMap
+
 coral_reef_mesh = TriangleMesh.createFromFile('rainbow_coral_reef.obj')
 
 coral_reef_mtl = StandardMaterial('CoralReefMtl')
