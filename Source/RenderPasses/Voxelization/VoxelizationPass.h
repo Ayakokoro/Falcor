@@ -1,6 +1,7 @@
 #pragma once
 #include "VoxelizationBase.h"
 #include "PolygonGenerator.h"
+#include <Core/Pass/FullScreenPass.h>
 
 using namespace Falcor;
 
@@ -39,6 +40,10 @@ public:
     void validateProjection(RenderContext* pRenderContext, uint32_t lodLevel,
                             int3 cellInt, const std::vector<float3>& directions);
 
+    // Spherical function visualization: compute exact map + display sphere
+    void computeSphericalFuncMap(RenderContext* pRenderContext);
+    void displaySphericalFunc(RenderContext* pRenderContext, const RenderData& renderData);
+
     static uint64_t morton3(uint32_t x, uint32_t y, uint32_t z);
 
 protected:
@@ -47,16 +52,22 @@ protected:
     ref<ComputePass> mAnalyzePolygonPass;
     ref<ComputePass> mLoadMeshPass;
     ref<ComputePass> mValidationPass;
+    ref<ComputePass> mSphericalMapPass;
+    ref<FullScreenPass> mDisplaySphericalFuncPass;
 
     ref<Device> mpDevice;
     ref<Scene> mpScene;
     ref<SampleGenerator> mpSampleGenerator;
     ref<Sampler> mpSampler;
+    ref<Sampler> mpPointSampler;
+    ref<Fbo> mpFbo;
 
     ref<Buffer> gBuffer;
     ref<Buffer> pBuffer;
     ref<Buffer> octreeBuffer;
     ref<Buffer> polygonRangeBuffer;
+
+    ref<Texture> mSphericalFuncMap;   // precomputed exact-value texture
 
     PolygonBufferGroup polygonGroup;
     PolygonGenerator polygonGenerator;
@@ -75,4 +86,16 @@ protected:
     bool mValidationRequested = false;
 
     bool mLerpNormal;
+
+    // Spherical function visualization state
+    bool mShowSphericalFunc = false;
+    bool mSphericalFuncDirty = false;
+    uint32_t mSphericalFuncType = 0;     // 0=primitiveProjArea, 1=polygonsProjArea, 2=totalProjArea
+    uint32_t mVisualizationMode = 0;     // 0=SH Approx, 1=Exact, 2=Error
+    uint32_t mMapResolution = 256;       // precomputed map resolution (width, height=res/2)
+    uint32_t mDisplayResolution = 512;   // output render target size
+    uint32_t mPrimSampleFreq = 64;       // sample frequency for primitive area exact computation
+    uint32_t mTargetGBufferIndex = 0xFFFFFFFF;  // cached gBuffer index for selected voxel
+    float mSphericalFuncValueMin = 0.0f;
+    float mSphericalFuncValueMax = 1.0f;
 };

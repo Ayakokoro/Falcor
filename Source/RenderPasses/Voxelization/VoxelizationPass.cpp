@@ -8,6 +8,8 @@ namespace
 const std::string kAnalyzePolygonProgramFile = "RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
 const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.slang";
 const std::string kValidationProgramFile = "RenderPasses/Voxelization/ValidateProjection.cs.slang";
+const std::string kComputeSphericalFuncMapProgramFile = "RenderPasses/Voxelization/ComputeSphericalFuncMap.cs.slang";
+const std::string kDisplaySphericalFuncProgramFile = "RenderPasses/Voxelization/DisplaySphericalFunc.ps.slang";
 }; // namespace
 
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
@@ -24,15 +26,23 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     samplerDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
         .setAddressingMode(TextureAddressingMode::Wrap, TextureAddressingMode::Wrap, TextureAddressingMode::Wrap);
     mpSampler = pDevice->createSampler(samplerDesc);
+
+    Sampler::Desc pointSamplerDesc;
+    pointSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point)
+        .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+    mpPointSampler = pDevice->createSampler(pointSamplerDesc);
+
+    mpFbo = Fbo::create(mpDevice);
 }
 
 RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
+    uint2 outRes = mShowSphericalFunc ? uint2(mDisplayResolution, mDisplayResolution) : uint2(1, 1);
     reflector.addOutput("dummy", "Dummy")
         .bindFlags(ResourceBindFlags::RenderTarget)
         .format(ResourceFormat::RGBA32Float)
-        .texture2D(0, 0, 1, 1);
+        .texture2D(outRes.x, outRes.y, 1, 1);
     return reflector;
 }
 
@@ -80,6 +90,19 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
         dirs.push_back(normalize(float3(0.5f, -0.3f, 0.8f)));
         validateProjection(pRenderContext, mValidationLOD, mValidationCellInt, dirs);
         mValidationRequested = false;
+    }
+
+    // ===== Phase 7: Spherical function visualization =====
+    if (mShowSphericalFunc && gBuffer && polygonGroup.size() > 0)
+    {
+        if (mSphericalFuncDirty)
+        {
+            computeSphericalFuncMap(pRenderContext);
+            mSphericalFuncDirty = false;
+        }
+
+        if (mSphericalFuncMap)
+            displaySphericalFunc(pRenderContext, renderData);
     }
 }
 
@@ -141,6 +164,83 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
 
     widget.checkbox("LerpNormal", mLerpNormal);
 
+    // ---- Spherical Function Visualization ----
+    if (polygonGenerator.mOctreeMaxDepth > 0)
+    {
+        widget.text("--- Spherical Func Visualization ---");
+
+        widget.checkbox("Show Sphere", mShowSphericalFunc);
+        if (mShowSphericalFunc)
+        {
+            // Voxel selection (shared with validation)
+            int lodMax = (int)polygonGenerator.mOctreeMaxDepth;
+            widget.var("LOD Level", (int&)mValidationLOD, 0, lodMax);
+
+            int maxCoord = (1 << mValidationLOD) - 1;
+            if (maxCoord < 0) maxCoord = 0;
+            widget.var("CellInt X", (int&)mValidationCellInt.x, 0, maxCoord);
+            widget.var("CellInt Y", (int&)mValidationCellInt.y, 0, maxCoord);
+            widget.var("CellInt Z", (int&)mValidationCellInt.z, 0, maxCoord);
+
+            // Function type
+            static const char* funcTypes[] = {"PrimitiveProjArea", "PolygonsProjArea", "TotalProjArea"};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < 3; i++)
+                    list.push_back({i, funcTypes[i]});
+                widget.dropdown("Function", list, mSphericalFuncType);
+            }
+
+            // Visualization mode
+            static const char* visModes[] = {"SH Approx", "Exact", "Error (|SH-Exact|)"};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < 3; i++)
+                    list.push_back({i, visModes[i]});
+                widget.dropdown("Display Mode", list, mVisualizationMode);
+            }
+
+            // Map resolution
+            static const uint mapResolutions[] = {64, 128, 256, 512, 1024};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < sizeof(mapResolutions) / sizeof(uint); i++)
+                    list.push_back({mapResolutions[i], std::to_string(mapResolutions[i])});
+                widget.dropdown("Map Resolution", list, mMapResolution);
+            }
+
+            // Display resolution
+            static const uint displayResolutions[] = {128, 256, 512, 768, 1024};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < sizeof(displayResolutions) / sizeof(uint); i++)
+                    list.push_back({displayResolutions[i], std::to_string(displayResolutions[i])});
+                widget.dropdown("Display Resolution", list, mDisplayResolution);
+            }
+
+            // Primitive sample frequency (only for primitive mode)
+            if (mSphericalFuncType == 0)
+            {
+                static const uint primFreqs[] = {16, 32, 64, 128, 256};
+                {
+                    Gui::DropdownList list;
+                    for (uint32_t i = 0; i < sizeof(primFreqs) / sizeof(uint); i++)
+                        list.push_back({primFreqs[i], std::to_string(primFreqs[i])});
+                    widget.dropdown("Prim Sample Freq", list, mPrimSampleFreq);
+                }
+            }
+
+            widget.var("Value Range Min", mSphericalFuncValueMin, 0.0f, 10.0f, 0.01f);
+            widget.var("Value Range Max", mSphericalFuncValueMax, 0.0f, 10.0f, 0.01f);
+
+            if (widget.button("Update Sphere"))
+            {
+                mSphericalFuncDirty = true;
+                requestRecompile();
+            }
+        }
+    }
+
     if (mpScene && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
@@ -155,6 +255,9 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mAnalyzePolygonPass = nullptr;
     mLoadMeshPass = nullptr;
     mValidationPass = nullptr;
+    mSphericalMapPass = nullptr;
+    mDisplaySphericalFuncPass = nullptr;
+    mSphericalFuncMap = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
 
@@ -702,4 +805,130 @@ void VoxelizationPass::validateProjection(RenderContext* pRenderContext, uint32_
     cpuBuffer->unmap();
 
     Tools::Profiler::EndSample("Validate Projection");
+}
+
+// ========================================================================
+// Phase 7a: Compute spherical function exact map
+// ========================================================================
+
+void VoxelizationPass::computeSphericalFuncMap(RenderContext* pRenderContext)
+{
+    Tools::Profiler::BeginSample("Compute Spherical Func Map");
+
+    // Find the target node
+    uint32_t targetIdx = findNodeByLODAndCell(mValidationCellInt, mValidationLOD);
+    if (targetIdx == UINT32_MAX)
+    {
+        std::cerr << "[SphericalFunc] Node not found at LOD=" << mValidationLOD
+                  << " cellInt=" << ToString(mValidationCellInt) << std::endl;
+        mSphericalFuncMap = nullptr;
+        return;
+    }
+
+    // Find which polygon batch contains this node
+    int batchIdx = -1;
+    for (uint b = 0; b < polygonGroup.size(); b++)
+    {
+        uint offset = polygonGroup.getVoxelOffset(b);
+        uint count = polygonGroup.getVoxelCount(b);
+        if (targetIdx >= offset && targetIdx < offset + count)
+        {
+            batchIdx = (int)b;
+            break;
+        }
+    }
+    if (batchIdx < 0)
+    {
+        std::cerr << "[SphericalFunc] Node gbIndex=" << targetIdx << " not found in any batch" << std::endl;
+        mSphericalFuncMap = nullptr;
+        return;
+    }
+
+    mTargetGBufferIndex = targetIdx;
+
+    // Create or reuse the compute pass
+    if (!mSphericalMapPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kComputeSphericalFuncMapProgramFile).csEntry("main");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        mSphericalMapPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
+    }
+
+    uint2 mapRes(mMapResolution, mMapResolution / 2);  // hemisphere only needs half height
+
+    // Create output texture for exact values
+    mSphericalFuncMap = mpDevice->createTexture2D(
+        mapRes.x, mapRes.y, ResourceFormat::R32Float, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+
+    ShaderVar var = mSphericalMapPass->getRootVar();
+    var["polygonBuffer"] = polygonGroup.get(batchIdx);
+    var["polygonRangeBuffer"] = polygonRangeBuffer;
+    var["gBuffer"] = gBuffer;
+    var["outputMap"] = mSphericalFuncMap;
+
+    auto cb = var["CB"];
+    cb["targetGBufferIndex"] = targetIdx;
+    cb["mapResolution"] = mapRes;
+    cb["functionType"] = mSphericalFuncType;
+    cb["sampleFrequency"] = mPrimSampleFreq;
+
+    mSphericalMapPass->execute(pRenderContext, uint3(mapRes.x, mapRes.y, 1));
+    pRenderContext->submit(true);
+
+    std::cout << "[SphericalFunc] Compute map: targetIdx=" << targetIdx
+              << " batch=" << batchIdx
+              << " resolution=" << mapRes.x << "x" << mapRes.y
+              << " funcType=" << mSphericalFuncType << std::endl;
+
+    Tools::Profiler::EndSample("Compute Spherical Func Map");
+}
+
+// ========================================================================
+// Phase 7b: Display spherical function sphere
+// ========================================================================
+
+void VoxelizationPass::displaySphericalFunc(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    Tools::Profiler::BeginSample("Display Spherical Func");
+
+    if (!mDisplaySphericalFuncPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary(kDisplaySphericalFuncProgramFile).psEntry("main");
+        desc.setShaderModel(ShaderModel::SM6_5);
+        mDisplaySphericalFuncPass = FullScreenPass::create(mpDevice, desc);
+    }
+
+    // Get the output render target
+    ref<Texture> pOutputColor = renderData.getTexture("dummy");
+    if (!pOutputColor)
+    {
+        Tools::Profiler::EndSample("Display Spherical Func");
+        return;
+    }
+
+    pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0.2f, 0.2f, 0.2f, 1.0f));
+
+    ShaderVar var = mDisplaySphericalFuncPass->getRootVar();
+    var["gBuffer"] = gBuffer;
+    var["exactMap"] = mSphericalFuncMap;
+    var["pointSampler"] = mpPointSampler;
+
+    auto cb = var["CB"];
+    cb["targetGBufferIndex"] = mTargetGBufferIndex;
+    cb["mapResolution"] = uint2(mMapResolution, mMapResolution / 2);
+    cb["functionType"] = mSphericalFuncType;
+    cb["visualizationMode"] = mVisualizationMode;
+    cb["valueMin"] = mSphericalFuncValueMin;
+    cb["valueMax"] = mSphericalFuncValueMax;
+    cb["clearColor"] = float4(0.2f, 0.2f, 0.2f, 1.0f);
+
+    mpFbo->attachColorTarget(pOutputColor, 0);
+    mDisplaySphericalFuncPass->execute(pRenderContext, mpFbo);
+
+    Tools::Profiler::EndSample("Display Spherical Func");
 }
