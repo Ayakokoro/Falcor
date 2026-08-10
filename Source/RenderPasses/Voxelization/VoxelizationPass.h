@@ -44,6 +44,10 @@ public:
     void computeSphericalFuncMap(RenderContext* pRenderContext);
     void displaySphericalFunc(RenderContext* pRenderContext, const RenderData& renderData);
 
+    // Splitting approximation error visualization
+    void computeSplittingError(RenderContext* pRenderContext);
+    void displaySplittingError(RenderContext* pRenderContext, const RenderData& renderData);
+
     static uint64_t morton3(uint32_t x, uint32_t y, uint32_t z);
 
 protected:
@@ -54,6 +58,8 @@ protected:
     ref<ComputePass> mValidationPass;
     ref<ComputePass> mSphericalMapPass;
     ref<FullScreenPass> mDisplaySphericalFuncPass;
+    ref<ComputePass> mSplittingErrorPass;
+    ref<FullScreenPass> mDisplaySplittingErrorPass;
 
     ref<Device> mpDevice;
     ref<Scene> mpScene;
@@ -68,6 +74,7 @@ protected:
     ref<Buffer> polygonRangeBuffer;
 
     ref<Texture> mSphericalFuncMap;   // precomputed exact-value texture
+    ref<Texture> mSplittingErrorMap;  // splitting error texture (RGBA: GT, Approx, Error, unused)
 
     PolygonBufferGroup polygonGroup;
     PolygonGenerator polygonGenerator;
@@ -98,4 +105,15 @@ protected:
     uint32_t mTargetGBufferIndex = 0xFFFFFFFF;  // cached gBuffer index for selected voxel
     float mSphericalFuncValueMin = 0.0f;
     float mSphericalFuncValueMax = 1.0f;
+
+    // Splitting error visualization state
+    bool mShowSplittingError = false;
+    bool mSplittingErrorDirty = false;
+    uint32_t mSplittingBlockCount = 8;  // blocks per side (8×8=64 ω_i)
+    uint32_t mSplittingBlockSize = 32;  // pixels per block (32×32=1024 ω_o)
+    uint32_t mSplittingVisMode = 0;     // 0=GT, 1=Approx, 2=AbsError
+    uint32_t mSamplesPerPolygon = 4;    // samples per polygon for MC integration
+    uint32_t mSplittingErrorTargetIndex = 0xFFFFFFFF;
+    float mSplittingValueMin = 0.0f;
+    float mSplittingValueMax = 1.0f;
 };

@@ -37,6 +37,11 @@ target_sources(Voxelization PRIVATE
     PrepareShadingData.cs.slang
     RayMarching.ps.slang
     DisplayNDF.ps.slang
+
+    ComputeSphericalFuncMap.cs.slang
+    ComputeSplittingError.cs.slang
+    DisplaySphericalFunc.ps.slang
+    DisplaySplittingError.ps.slang
 )
 target_copy_shaders(Voxelization RenderPasses/Voxelization)
 target_source_group(Voxelization "RenderPasses")

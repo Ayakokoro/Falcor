@@ -10,6 +10,8 @@ const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.
 const std::string kValidationProgramFile = "RenderPasses/Voxelization/ValidateProjection.cs.slang";
 const std::string kComputeSphericalFuncMapProgramFile = "RenderPasses/Voxelization/ComputeSphericalFuncMap.cs.slang";
 const std::string kDisplaySphericalFuncProgramFile = "RenderPasses/Voxelization/DisplaySphericalFunc.ps.slang";
+const std::string kComputeSplittingErrorProgramFile = "RenderPasses/Voxelization/ComputeSplittingError.cs.slang";
+const std::string kDisplaySplittingErrorProgramFile = "RenderPasses/Voxelization/DisplaySplittingError.ps.slang";
 }; // namespace
 
 VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
@@ -38,7 +40,11 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
 RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
-    uint2 outRes = mShowSphericalFunc ? uint2(mDisplayResolution, mDisplayResolution) : uint2(1, 1);
+    uint2 outRes = uint2(1, 1);
+    if (mShowSphericalFunc)
+        outRes = uint2(mDisplayResolution, mDisplayResolution);
+    else if (mShowSplittingError)
+        outRes = uint2(mSplittingBlockCount * mSplittingBlockSize, mSplittingBlockCount * mSplittingBlockSize);
     reflector.addOutput("dummy", "Dummy")
         .bindFlags(ResourceBindFlags::RenderTarget)
         .format(ResourceFormat::RGBA32Float)
@@ -103,6 +109,19 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
 
         if (mSphericalFuncMap)
             displaySphericalFunc(pRenderContext, renderData);
+    }
+
+    // ===== Phase 8: Splitting error visualization =====
+    if (mShowSplittingError && gBuffer && polygonGroup.size() > 0)
+    {
+        if (mSplittingErrorDirty)
+        {
+            computeSplittingError(pRenderContext);
+            mSplittingErrorDirty = false;
+        }
+
+        if (mSplittingErrorMap)
+            displaySplittingError(pRenderContext, renderData);
     }
 }
 
@@ -241,6 +260,81 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         }
     }
 
+    // ---- Splitting Error Visualization ----
+    if (polygonGenerator.mOctreeMaxDepth > 0)
+    {
+        widget.text("--- Splitting Error Viz ---");
+
+        widget.checkbox("Show Splitting Error", mShowSplittingError);
+        if (mShowSplittingError)
+        {
+            // Voxel selection (shared)
+            int lodMax = (int)polygonGenerator.mOctreeMaxDepth;
+            widget.var("LOD Level", (int&)mValidationLOD, 0, lodMax);
+
+            int maxCoord = (1 << mValidationLOD) - 1;
+            if (maxCoord < 0) maxCoord = 0;
+            widget.var("CellInt X", (int&)mValidationCellInt.x, 0, maxCoord);
+            widget.var("CellInt Y", (int&)mValidationCellInt.y, 0, maxCoord);
+            widget.var("CellInt Z", (int&)mValidationCellInt.z, 0, maxCoord);
+
+            // Block count (incident directions: N×N ω_i)
+            static const uint gridResolutions[] = {4, 8, 16, 32};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < sizeof(gridResolutions) / sizeof(uint); i++)
+                {
+                    uint n = gridResolutions[i];
+                    list.push_back({n, std::to_string(n) + "x" + std::to_string(n) +
+                        " (" + std::to_string(n * n) + " wi)"});
+                }
+                widget.dropdown("Incident (wi) Grid", list, mSplittingBlockCount);
+            }
+
+            // Block size (outgoing directions per block: K×K ω_o)
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < sizeof(gridResolutions) / sizeof(uint); i++)
+                {
+                    uint n = gridResolutions[i];
+                    list.push_back({n, std::to_string(n) + "x" + std::to_string(n) +
+                        " (" + std::to_string(n * n) + " wo)"});
+                }
+                widget.dropdown("Outgoing (wo) Grid", list, mSplittingBlockSize);
+            }
+
+            // Display mode
+            static const char* splitModes[] = {"GT (Ground Truth)", "Approximation", "Abs Error"};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < 3; i++)
+                    list.push_back({i, splitModes[i]});
+                widget.dropdown("Display Mode", list, mSplittingVisMode);
+            }
+
+            // Samples per polygon
+            static const uint sampleCounts[] = {1, 2, 4, 8, 16, 32, 64, 128};
+            {
+                Gui::DropdownList list;
+                for (uint32_t i = 0; i < sizeof(sampleCounts) / sizeof(uint); i++)
+                    list.push_back({sampleCounts[i], std::to_string(sampleCounts[i])});
+                widget.dropdown("Samples Per Polygon", list, mSamplesPerPolygon);
+            }
+
+            widget.var("Value Range Min", mSplittingValueMin, 0.0f, 10.0f, 0.01f);
+            widget.var("Value Range Max", mSplittingValueMax, 0.0f, 10.0f, 0.01f);
+
+            uint totalRes = mSplittingBlockCount * mSplittingBlockSize;
+            widget.text("Output: " + std::to_string(totalRes) + "x" + std::to_string(totalRes));
+
+            if (widget.button("Compute Splitting Error"))
+            {
+                mSplittingErrorDirty = true;
+                requestRecompile();
+            }
+        }
+    }
+
     if (mpScene && widget.button("Generate"))
     {
         VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
@@ -257,7 +351,10 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mValidationPass = nullptr;
     mSphericalMapPass = nullptr;
     mDisplaySphericalFuncPass = nullptr;
+    mSplittingErrorPass = nullptr;
+    mDisplaySplittingErrorPass = nullptr;
     mSphericalFuncMap = nullptr;
+    mSplittingErrorMap = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
 
@@ -931,4 +1028,135 @@ void VoxelizationPass::displaySphericalFunc(RenderContext* pRenderContext, const
     mDisplaySphericalFuncPass->execute(pRenderContext, mpFbo);
 
     Tools::Profiler::EndSample("Display Spherical Func");
+}
+
+// ========================================================================
+// Phase 8a: Compute splitting approximation error map
+// ========================================================================
+
+void VoxelizationPass::computeSplittingError(RenderContext* pRenderContext)
+{
+    Tools::Profiler::BeginSample("Compute Splitting Error");
+
+    // Find the target node
+    uint32_t targetIdx = findNodeByLODAndCell(mValidationCellInt, mValidationLOD);
+    if (targetIdx == UINT32_MAX)
+    {
+        std::cerr << "[SplittingError] Node not found at LOD=" << mValidationLOD
+                  << " cellInt=" << ToString(mValidationCellInt) << std::endl;
+        mSplittingErrorMap = nullptr;
+        Tools::Profiler::EndSample("Compute Splitting Error");
+        return;
+    }
+
+    // Find which polygon batch contains this node
+    int batchIdx = -1;
+    for (uint b = 0; b < polygonGroup.size(); b++)
+    {
+        uint offset = polygonGroup.getVoxelOffset(b);
+        uint count = polygonGroup.getVoxelCount(b);
+        if (targetIdx >= offset && targetIdx < offset + count)
+        {
+            batchIdx = (int)b;
+            break;
+        }
+    }
+    if (batchIdx < 0)
+    {
+        std::cerr << "[SplittingError] Node gbIndex=" << targetIdx << " not found in any batch" << std::endl;
+        mSplittingErrorMap = nullptr;
+        Tools::Profiler::EndSample("Compute Splitting Error");
+        return;
+    }
+
+    mSplittingErrorTargetIndex = targetIdx;
+
+    // Create or reuse the compute pass
+    if (!mSplittingErrorPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderModules(mpScene->getShaderModules());
+        desc.addShaderLibrary(kComputeSplittingErrorProgramFile).csEntry("main");
+        desc.addTypeConformances(mpScene->getTypeConformances());
+        mSplittingErrorPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
+    }
+
+    uint totalRes = mSplittingBlockCount * mSplittingBlockSize;
+
+    // Create output texture: 4 channels (GT, Approx, AbsError, unused)
+    mSplittingErrorMap = mpDevice->createTexture2D(
+        totalRes, totalRes, ResourceFormat::RGBA32Float, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+    pRenderContext->clearUAV(mSplittingErrorMap->getUAV().get(), float4(0, 0, 0, 0));
+
+    ShaderVar var = mSplittingErrorPass->getRootVar();
+    mpScene->bindShaderData(var["gScene"]);
+    var["sampler"] = mpSampler;
+    var["polygonBuffer"] = polygonGroup.get(batchIdx);
+    var["polygonRangeBuffer"] = polygonRangeBuffer;
+    var["outputMap"] = mSplittingErrorMap;
+
+    auto cb_grid = var["GridData"];
+    cb_grid["gridMin"] = gridData.gridMin;
+    cb_grid["voxelSize"] = gridData.voxelSize;
+    cb_grid["voxelCount"] = gridData.voxelCount;
+
+    auto cb = var["CB"];
+    cb["targetGBufferIndex"] = targetIdx;
+    cb["blockCount"] = mSplittingBlockCount;
+    cb["blockSize"] = mSplittingBlockSize;
+    cb["samplesPerPolygon"] = mSamplesPerPolygon;
+
+    mSplittingErrorPass->execute(pRenderContext, uint3(totalRes, totalRes, 1));
+    pRenderContext->submit(true);
+
+    std::cout << "[SplittingError] Compute map: targetIdx=" << targetIdx
+              << " batch=" << batchIdx
+              << " blocks=" << mSplittingBlockCount << "x" << mSplittingBlockCount
+              << " blockSize=" << mSplittingBlockSize
+              << " totalRes=" << totalRes << std::endl;
+
+    Tools::Profiler::EndSample("Compute Splitting Error");
+}
+
+// ========================================================================
+// Phase 8b: Display splitting error grid
+// ========================================================================
+
+void VoxelizationPass::displaySplittingError(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    Tools::Profiler::BeginSample("Display Splitting Error");
+
+    if (!mDisplaySplittingErrorPass)
+    {
+        ProgramDesc desc;
+        desc.addShaderLibrary(kDisplaySplittingErrorProgramFile).psEntry("main");
+        desc.setShaderModel(ShaderModel::SM6_5);
+        mDisplaySplittingErrorPass = FullScreenPass::create(mpDevice, desc);
+    }
+
+    ref<Texture> pOutputColor = renderData.getTexture("dummy");
+    if (!pOutputColor)
+    {
+        Tools::Profiler::EndSample("Display Splitting Error");
+        return;
+    }
+
+    pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0.2f, 0.2f, 0.2f, 1.0f));
+
+    ShaderVar var = mDisplaySplittingErrorPass->getRootVar();
+    var["splittingMap"] = mSplittingErrorMap;
+    var["pointSampler"] = mpPointSampler;
+
+    auto cb = var["CB"];
+    cb["visualizationMode"] = mSplittingVisMode;
+    cb["valueMin"] = mSplittingValueMin;
+    cb["valueMax"] = mSplittingValueMax;
+    cb["clearColor"] = float4(0.2f, 0.2f, 0.2f, 1.0f);
+
+    mpFbo->attachColorTarget(pOutputColor, 0);
+    mDisplaySplittingErrorPass->execute(pRenderContext, mpFbo);
+
+    Tools::Profiler::EndSample("Display Splitting Error");
 }

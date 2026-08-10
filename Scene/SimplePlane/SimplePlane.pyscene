@@ -10,4 +10,11 @@ sceneBuilder.importScene('simpleplane.fbx')
 # dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
 # sceneBuilder.addLight(dirLight)
 
+camera = Camera()
+camera.position = float3(0, 0.28, 1.2)
+camera.target = float3(0, 0, 0)
+camera.up = float3(0, 1, 0)
+camera.focalLength = 35.0
+sceneBuilder.addCamera(camera)
+
 
