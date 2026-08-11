@@ -104,84 +104,71 @@ float maxRoughness(uint gbIndex)
     return r;
 }
 
-HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex)
+HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
 {
-    float3 from = cell - cellInt;
-    int3 directions = int3(sign(direction));
-    float3 border = (directions + 1) / 2;
-    float3 t = (border - from) / direction;
-    float tMin = 2.0f;
-    if (direction.x != 0 && t.x < tMin) tMin = t.x;
-    if (direction.y != 0 && t.y < tMin) tMin = t.y;
-    if (direction.z != 0 && t.z < tMin) tMin = t.z;
-    float3 to = from + tMin * direction;
-    float2 inOut = ellipsoid.clip(from, to);
-    HitResult result = { inOut.x >= 0, cellInt, cell + inOut.x * (to - from), gbIndex, 1 };
+    // Compute node-local coordinates for ellipsoid intersection.
+    // Ellipsoid is defined in node-local [0,1]³ space (fitted over the entire node),
+    // but the incoming coordinates are in LOD-0 cell space.
+    // Convert to node-local space, intersect, then convert back to LOD-0.
+    int3 nodeMinCell = (cellInt / int3((int)nodeSize)) * int3((int)nodeSize);
+    float3 localOrigin = (cell - float3(nodeMinCell)) / float(nodeSize);
+    // Direction in node-local space: a step of 1 LOD-0 cell = step of 1/nodeSize in node-local
+    float3 nodeDir = direction / float(nodeSize);
+
+    int3 dirs = int3(sign(nodeDir));
+    float3 border = (dirs + 1) / 2;
+    float3 t = (border - localOrigin) / nodeDir;
+    // t is in LOD-0 units; max distance to exit a node is ≤ √3 * nodeSize
+    float tMin = 2.0f * float(nodeSize);
+    if (nodeDir.x != 0 && t.x < tMin) tMin = t.x;
+    if (nodeDir.y != 0 && t.y < tMin) tMin = t.y;
+    if (nodeDir.z != 0 && t.z < tMin) tMin = t.z;
+    float3 to = localOrigin + tMin * nodeDir;
+
+    float2 inOut = ellipsoid.clip(localOrigin, to);
+
+    // Convert intersection back to LOD-0 cell space
+    float3 hitLocal = localOrigin + inOut.x * (to - localOrigin);
+    float3 hitCell = float3(nodeMinCell) + hitLocal * float(nodeSize);
+    int3 hitCellInt = int3(floor(hitCell));
+
+    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize };
     return result;
 }
 
-HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex)
+HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
 {
 #if !CHECK_ELLIPSOID
-    return { true, cellInt, cellInt + 0.5f, gbIndex, 1 };
+    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
-    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex);
+    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
     if (hit.hit)
         return hit;
 #endif
-    return { false, cellInt, cellInt + 0.5f, 0, 1 };
+    return { false, cellInt, cellInt + 0.5f, 0, nodeSize };
 }
 
-// Ray-slab AABB intersection in cell space.
-// Handles axis-aligned rays (direction component = 0) to avoid NaN from 0*inf.
-bool intersectAABB(float3 rayOrigin, float3 reciprocal, float3 aabbMin, float3 aabbMax,
-                   out float tMin, out float tMax)
-{
-    tMin = 0.0f;
-    tMax = 1e30f;
+// --- Parametric octree traversal (negative direction DDA) ---
+// Follows the Revelles 2000 parametric approach: axes are mirrored so that
+// the ray always travels in the negative direction (d < 0 everywhere).
+// Coordinate space: normalized to [1,2]³.
+// Stack stores one entry per octree level, not per node.
+#define S_MAX 23
+#define EPSILON exp2(-float(S_MAX))
 
-    for (int i = 0; i < 3; i++)
-    {
-        float t0 = (aabbMin[i] - rayOrigin[i]) * reciprocal[i];
-        float t1 = (aabbMax[i] - rayOrigin[i]) * reciprocal[i];
-
-        if (isinf(t0) || isinf(t1) || isnan(t0) || isnan(t1))
-        {
-            if (rayOrigin[i] < aabbMin[i] || rayOrigin[i] > aabbMax[i])
-                return false;
-            continue;
-        }
-
-        if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }
-        tMin = max(tMin, t0);
-        tMax = min(tMax, t1);
-        if (tMin > tMax)
-            return false;
-    }
-    return tMin <= tMax + 1e-6f;
-}
-
-#define MAX_OCTREE_STACK 128
-
-struct StackEntry
-{
-    uint nodeIndex;
-    uint level;
-    int3 nodeMin; // AABB min corner in LOD-0 cell coords
-    float tMin;   // ray entry t for this node (cell-space)
-};
-
-// Parameterized octree traversal using a stack ordered by ray-t
-// Each internal node: intersect children AABBs → sort by tMin → push (far to near)
-// Leaf node: test voxel; on miss the next stack entry is already the next cell along the ray
+// Parametric octree traversal using Revelles 2000 negative-direction DDA.
+// Merges the speed of parametric space stepping with LOD control (forced/dynamic),
+// ellipsoid intersection tests, and ignoreNodeSize pre-skip from the original
+// parameterized stack-based traversal.
+// from: starting point in LOD-0 cell space
 HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
         return { false, int3(from), from, 0, 0 };
 
-    float3 reciprocal = 1.0f / direction;
+    // ===== Phase 1: ignoreNodeSize pre-skip (unchanged logic) =====
     float3 rayOrigin = from;
 
     if (ignoreNodeSize > 0)
@@ -189,6 +176,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         float3 cell = from;
         int3 cellInt = int3(floor(from));
         int3 dirs = int3(sign(direction));
+        float3 reciprocal = 1.0f / direction;
 
         if (ignoreNodeSize == 1)
         {
@@ -196,7 +184,6 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         }
         else
         {
-            // Step out of the coarse node block; use floor division for correct negative coords
             float3 cellFloat = cell;
             int3 blockMin;
             blockMin.x = int(floor(cellFloat.x / float(ignoreNodeSize))) * int(ignoreNodeSize);
@@ -222,194 +209,196 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         rayOrigin = cell + direction * RAY_BIAS;
     }
 
-    // Ray must intersect the octree root AABB
+    // ===== Phase 2: normalize + mirror for negative-direction traversal =====
     uint rootSize = 1u << octreeMaxDepth;
-    float rootTMin, rootTMax;
-    if (!intersectAABB(rayOrigin, reciprocal, float3(0, 0, 0), float3(rootSize, rootSize, rootSize),
-                       rootTMin, rootTMax))
-        return { false, int3(rayOrigin), rayOrigin, 0, 0 };
 
-    StackEntry stack[MAX_OCTREE_STACK];
-    uint stackTop = 0;
-    stack[stackTop++] = { 0, 0, int3(0, 0, 0), rootTMin };
+    // Normalize ray origin to [1,2]³ space
+    float3 p = rayOrigin / float(rootSize) + 1.0f;
+    p = clamp(p, 1.0f, 2.0f);
 
-    while (stackTop > 0)
+    float3 d = direction;
+    if (abs(d.x) < EPSILON) d.x = d.x < 0.0f ? -EPSILON : EPSILON;
+    if (abs(d.y) < EPSILON) d.y = d.y < 0.0f ? -EPSILON : EPSILON;
+    if (abs(d.z) < EPSILON) d.z = d.z < 0.0f ? -EPSILON : EPSILON;
+
+    precise float3 coef = -1.0f / abs(d);
+    precise float3 bias = coef * p;
+
+    // octant_mask: bit i = 1 means axis i WAS mirrored (original d[i] > 0).
+    // Starts at 0; XOR toggles bits for axes whose original direction was positive.
+    uint octant_mask = 0;
+    if (d.x > 0.0f) { octant_mask ^= 1; bias.x = 3.0f * coef.x - bias.x; }
+    if (d.y > 0.0f) { octant_mask ^= 2; bias.y = 3.0f * coef.y - bias.y; }
+    if (d.z > 0.0f) { octant_mask ^= 4; bias.z = 3.0f * coef.z - bias.z; }
+
+    // ===== Phase 3: root entry / exit in parametric space =====
+    precise float t_min = max(max(2.0f * coef.x - bias.x, 2.0f * coef.y - bias.y), 2.0f * coef.z - bias.z);
+    precise float t_max = min(min(1.0f * coef.x - bias.x, 1.0f * coef.y - bias.y), 1.0f * coef.z - bias.z);
+
+    float h = t_max;
+    t_min = max(t_min, 0.0f);
+
+    // Clamp far end by maxDistance (convert cell-space distance → parametric t)
+    if (maxDistance > 0)
+        t_max = min(t_max, t_min + maxDistance / float(rootSize));
+
+    if (t_min > t_max)
+        return { false, int3(0), float3(0), 0, 0 };
+
+    // ===== Phase 4: initialize state machine =====
+    int2 stack[S_MAX + 1];
+
+    uint parent = 0;
+    uint idx = 0;
+    precise float3 pos = float3(1.0f, 1.0f, 1.0f);
+    int scale = S_MAX - 1;
+    precise float scale_exp2 = 0.5f;
+
+    // Determine which sub-octant the ray enters first
+    if (1.5f * coef.x - bias.x > t_min) { idx ^= 1; pos.x = 1.5f; }
+    if (1.5f * coef.y - bias.y > t_min) { idx ^= 2; pos.y = 1.5f; }
+    if (1.5f * coef.z - bias.z > t_min) { idx ^= 4; pos.z = 1.5f; }
+
+    // ===== Phase 5: main traversal loop (INTERSECT → PUSH | ADVANCE → POP) =====
+    uint maxIter = (1u << octreeMaxDepth) * 3u + 64u;
+    uint iter = 0;
+
+    while (scale < S_MAX)
     {
-        StackEntry entry = stack[--stackTop];
+        if (++iter > maxIter) break;
 
-        if (maxDistance > 0 && entry.tMin > maxDistance)
-            continue;
+        precise float3 t_corner = pos * coef - bias;
+        precise float tc_max = min(min(t_corner.x, t_corner.y), t_corner.z);
 
-        OctreeNode node = octreeBuffer[entry.nodeIndex];
+        uint child_shift = idx ^ octant_mask;   // un-mirror child index → real memory layout
+        OctreeNode node = octreeBuffer[parent];
+        bool childExists = (node.childMask & (1u << child_shift)) != 0;
 
-        // --- Leaf node ---
-        if (entry.level == octreeMaxDepth || node.childMask == 0)
+        // --- INTERSECT ---
+        if (childExists && t_min <= t_max)
         {
-            uint gbIndex = node.dataIndex;
-            int3 cellInt = entry.nodeMin;
-            if (!outsideGrid(cellInt))
+            uint childgbIdx = node.childBase + countbits(node.childMask & ((1u << child_shift) - 1));
+            OctreeNode childNode = octreeBuffer[childgbIdx];
+            bool isLeaf = (childNode.childMask == 0);
+
+            precise float tv_max = min(t_max, tc_max);
+            precise float half_scale = scale_exp2 * 0.5f;
+
+            // --- Node metadata for LOD decisions ---
+            uint octreeDepth = S_MAX - scale;                    // 1..octreeMaxDepth
+            uint nodeLOD     = octreeMaxDepth - octreeDepth;     // 0 at leaf
+            uint nodeSize    = 1u << nodeLOD;                    // 1 at leaf
+
+            bool forcedStop  = (forcedLOD > 0 && (int)nodeLOD == forcedLOD);
+
+            // Dynamic LOD: compare ray-footprint radius with node size
+            // Convert parametric t to cell-space distance for the footprint calculation
+            float worldDist = (tc_max - t_min) * float(rootSize);
+            float footprint = cone.bias + max(worldDist, 0.0f) * cone.tanHalfAngle;
+            bool lodLevelOK  = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
+            // bool dynamicStop = lodLevelOK && (footprint > (float)nodeSize);
+            bool dynamicStop = false; // Disable dynamic LOD for now, as it may cause artifacts in certain scenarios
+
+            bool shouldStop = isLeaf || forcedStop || dynamicStop;
+
+            // --- Hit test when a stopping condition is met ---
+            if (shouldStop && t_min <= tv_max)
             {
-                float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
-                HitResult hit = rayHitVoxel(hitPoint, direction, cellInt, gbIndex);
-                if (hit.hit)
-                    return hit;
-            }
-            continue;
-        }
+                float3 temp = pos;
+                if ((octant_mask & 1) == 1) temp.x = 3.0f - scale_exp2 - pos.x;
+                if ((octant_mask & 2) == 2) temp.y = 3.0f - scale_exp2 - pos.y;
+                if ((octant_mask & 4) == 4) temp.z = 3.0f - scale_exp2 - pos.z;
 
-        // --- Forced LOD stop: treat coarser node as a "voxel" ---
-        uint nodeLOD = octreeMaxDepth - entry.level;
-        if (forcedLOD > 0 && (int)nodeLOD == forcedLOD)
-        {
-            uint gbIndex = node.dataIndex;
-            uint nodeSize = 1u << (octreeMaxDepth - entry.level);
-            float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
+                precise float3 hit_pos = min(max(p + t_min * d, temp + EPSILON), temp + scale_exp2 - EPSILON);
 
-            // Convert to node-normalized space [0,1]^3
-            // nodeMin is in leaf-voxel space; node spans [nodeMin, nodeMin+nodeSize]
-            float3 localHit = (hitPoint - float3(entry.nodeMin)) / float(nodeSize);
+                precise float3 localHit = hit_pos - 1.0f;
 
-#if CHECK_ELLIPSOID
-            Ellipsoid e = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
-            float3 from = localHit;
-            int3 signs = int3(sign(direction));
-            float3 border = float3(signs + 1) * 0.5f;
-            float3 tToBorder = (border - from) / direction;
-            float tMinLocal = 2.0f;
-            if (direction.x != 0 && tToBorder.x < tMinLocal) tMinLocal = tToBorder.x;
-            if (direction.y != 0 && tToBorder.y < tMinLocal) tMinLocal = tToBorder.y;
-            if (direction.z != 0 && tToBorder.z < tMinLocal) tMinLocal = tToBorder.z;
-            if (tMinLocal < 0) tMinLocal = 0;
-            float3 to = from + tMinLocal * direction;
-            float2 inOut = e.clip(from, to);
-            if (inOut.x < 0)
-                continue; // ellipsoid miss at this LOD
-            float3 hitLocal = from + inOut.x * (to - from);
-#else
-            float3 hitLocal = localHit;
-#endif
-            float3 hitCell = float3(entry.nodeMin) + hitLocal * float(nodeSize);
-            return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
-        }
+                // in LOD-0 cell space, the hit point is:
+                precise float3 hitCell  = localHit * rootSize;
+                // in LOD-0 cell space, the hit cell is:
+                int3 cellInt = int3(floor(hitCell));
 
-        // --- Dynamic LOD stop: compare ray footprint with node size ---
-        {
-            uint nodeSize = 1u << (octreeMaxDepth - entry.level);
-
-            // Compute ray exit t from this node's AABB
-            float3 nodeMinFloat = float3(entry.nodeMin);
-            float3 nodeMaxFloat = nodeMinFloat + float3(float(nodeSize));
-            float nodeTMin, nodeTMax;
-            intersectAABB(rayOrigin, reciprocal, nodeMinFloat, nodeMaxFloat, nodeTMin, nodeTMax);
-
-            float footprint = cone.bias + nodeTMax * cone.tanHalfAngle;
-
-            // Honor LOD level cap: don't stop at levels coarser than maxLODLevel
-            uint nodeLOD = octreeMaxDepth - entry.level;
-            bool lodLevelOK = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
-
-            if (lodLevelOK && footprint > (float)nodeSize)
-            {
-                uint gbIndex = node.dataIndex;
-                float3 hitPoint = rayOrigin + (entry.tMin + RAY_BIAS) * direction;
-                float3 localHit = (hitPoint - nodeMinFloat) / float(nodeSize);
-
-#if CHECK_ELLIPSOID
-                Ellipsoid e = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
-                float3 fromLE = localHit;
-                int3 signs = int3(sign(direction));
-                float3 border = float3(signs + 1) * 0.5f;
-                float3 tToBorder = (border - fromLE) / direction;
-                float tMinLocal = 2.0f;
-                if (direction.x != 0 && tToBorder.x < tMinLocal) tMinLocal = tToBorder.x;
-                if (direction.y != 0 && tToBorder.y < tMinLocal) tMinLocal = tToBorder.y;
-                if (direction.z != 0 && tToBorder.z < tMinLocal) tMinLocal = tToBorder.z;
-                if (tMinLocal < 0) tMinLocal = 0;
-                float3 to = fromLE + tMinLocal * direction;
-                float2 inOut = e.clip(fromLE, to);
-                if (inOut.x < 0)
-                    ; // fall through to child traversal — coarse ellipsoid missed
-                else
+                if (!outsideGrid(cellInt))
                 {
-                    float3 hitLocal = fromLE + inOut.x * (to - fromLE);
-                    float3 hitCell = nodeMinFloat + hitLocal * float(nodeSize);
-                    return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
+                    uint gbIndex = childNode.dataIndex;
+
+                    HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize);
+                    if (hit.hit)
+                        return hit;
                 }
-#else
-                float3 hitCell = nodeMinFloat + localHit * float(nodeSize);
-                return { true, int3(floor(hitCell)), hitCell, gbIndex, nodeSize };
-#endif
             }
-        }
 
-        // --- Internal node: collect intersecting children ---
-        uint childLevel = entry.level + 1;
-        uint childSize = 1u << (octreeMaxDepth - childLevel);
-        int3 nodeMin = entry.nodeMin;
+            // --- PUSH: descend into child ---
+            // Push when: internal node AND not force-stopped.
+            // (dynamicStop nodes that missed the ellipsoid also push — their
+            //  forcedStop is false, so !isLeaf && !forcedStop holds.)
+            bool wantPush = (!isLeaf && !forcedStop) && (t_min <= tv_max);
 
-        uint childSlots[8];
-        float childTMins[8];
-        uint childCount = 0;
-        uint mask = node.childMask;
+            if (wantPush)
+            {
+                if (tc_max < h)
+                {
+                    stack[scale] = int2(parent, asint(t_max));
+                }
 
-        for (uint s = 0; s < 8; s++)
-        {
-            if (!(mask & (1u << s)))
+                h = tc_max;
+
+                parent = childgbIdx;
+                idx = 0;
+                scale--;
+                scale_exp2 = half_scale;
+
+                // Determine which sub-octant of the child the ray enters first.
+                // t_center is the parametric t at the child-cell center.
+                precise float3 t_center = half_scale * coef + t_corner;
+                if (t_center.x > t_min) { idx ^= 1; pos.x += scale_exp2; }
+                if (t_center.y > t_min) { idx ^= 2; pos.y += scale_exp2; }
+                if (t_center.z > t_min) { idx ^= 4; pos.z += scale_exp2; }
+
+                t_max = tv_max;
                 continue;
-
-            int3 childMin = nodeMin + int3(
-                (s & 1) ? int(childSize) : 0,
-                ((s >> 1) & 1) ? int(childSize) : 0,
-                ((s >> 2) & 1) ? int(childSize) : 0
-            );
-
-            float cTMin, cTMax;
-            if (intersectAABB(rayOrigin, reciprocal,
-                              float3(childMin), float3(childMin) + float3(float(childSize)),
-                              cTMin, cTMax))
-            {
-                childSlots[childCount] = s;
-                childTMins[childCount] = cTMin;
-                childCount++;
             }
         }
 
-        // Sort children by tMin ascending (insertion sort, ≤8 elements)
-        for (uint i = 1; i < childCount; i++)
-        {
-            uint slot = childSlots[i];
-            float t = childTMins[i];
-            int j = int(i) - 1;
-            while (j >= 0 && childTMins[j] > t)
-            {
-                childSlots[j + 1] = childSlots[j];
-                childTMins[j + 1] = childTMins[j];
-                j--;
-            }
-            childSlots[j + 1] = slot;
-            childTMins[j + 1] = t;
-        }
+        // --- ADVANCE: step to next sibling cell along the ray ---
+        uint step_mask = 0;
+        if (t_corner.x <= tc_max) { step_mask ^= 1; pos.x -= scale_exp2; }
+        if (t_corner.y <= tc_max) { step_mask ^= 2; pos.y -= scale_exp2; }
+        if (t_corner.z <= tc_max) { step_mask ^= 4; pos.z -= scale_exp2; }
 
-        // Push children in reverse order (largest tMin first → nearest pops first)
-        if (stackTop + childCount > MAX_OCTREE_STACK)
-            return { false, int3(rayOrigin), rayOrigin, 0, 0 };
+        t_min = tc_max;
+        idx ^= step_mask;
 
-        for (int i = int(childCount) - 1; i >= 0; i--)
+        // --- POP: crossed a parent boundary → return to ancestor level ---
+        if ((idx & step_mask) != 0)
         {
-            uint s = childSlots[i];
-            uint childIdx = node.childBase + countbits(mask & ((1u << s) - 1));
-            int3 childMin = nodeMin + int3(
-                (s & 1) ? int(childSize) : 0,
-                ((s >> 1) & 1) ? int(childSize) : 0,
-                ((s >> 2) & 1) ? int(childSize) : 0
-            );
-            stack[stackTop++] = { childIdx, childLevel, childMin, childTMins[i] };
+            uint differing_bits = 0;
+            if ((step_mask & 1) != 0) differing_bits |= asuint(pos.x) ^ asuint(pos.x + scale_exp2);
+            if ((step_mask & 2) != 0) differing_bits |= asuint(pos.y) ^ asuint(pos.y + scale_exp2);
+            if ((step_mask & 4) != 0) differing_bits |= asuint(pos.z) ^ asuint(pos.z + scale_exp2);
+
+            scale = firstbithigh(differing_bits);
+            scale_exp2 = asfloat((scale - S_MAX + 127) << 23);
+
+            int2 stackEntry = stack[scale];
+            parent = (uint)stackEntry.x;
+            t_max = asfloat(stackEntry.y);
+
+            uint shx = asuint(pos.x) >> scale;
+            uint shy = asuint(pos.y) >> scale;
+            uint shz = asuint(pos.z) >> scale;
+
+            pos.x = asfloat(shx << scale);
+            pos.y = asfloat(shy << scale);
+            pos.z = asfloat(shz << scale);
+
+            idx = (shx & 1) | ((shy & 1) << 1) | ((shz & 1) << 2);
+            h = 0.0f;
         }
     }
 
-    return { false, int3(rayOrigin), rayOrigin, 0, 0 };
+    return { false, int3(0), float3(0), 0, 0 };
 }
-
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
@@ -647,6 +636,8 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
     from = from + (inOut.x + 1e-6) * delta;
+
+    // Error: need world space distance
     float initialDistance = (inOut.x + 1e-6) * length(delta);
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
     HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance);
