@@ -296,8 +296,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             float worldDist = (tc_max - t_min) * float(rootSize);
             float footprint = cone.bias + max(worldDist, 0.0f) * cone.tanHalfAngle;
             bool lodLevelOK  = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
-            // bool dynamicStop = lodLevelOK && (footprint > (float)nodeSize);
-            bool dynamicStop = false; // Disable dynamic LOD for now, as it may cause artifacts in certain scenarios
+            bool dynamicStop = lodLevelOK && (footprint > (float)nodeSize);
 
             bool shouldStop = isLeaf || forcedStop || dynamicStop;
 
