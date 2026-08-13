@@ -1,6 +1,7 @@
 #include "Math/Polygon.slang"
 #include "Math/Triangle.slang"
 #include "Voxel/VoxelGrid.slang"
+#include "Shading.slang"
 import Utils.Sampling.UniformSampleGenerator;
 import Scene.SceneTypes;
 import Scene.Scene;
@@ -10,13 +11,6 @@ import Rendering.Materials.TexLODHelpers;
 import Scene.Material.BasicMaterialData;
 
 // Utility
-inline float pow5(float x)
-{
-    x = saturate(x);
-    float x2 = x * x;
-    return x2 * x2 * x;
-}
-
 inline float luminance(float3 c)
 {
     return dot(c, float3(0.299f, 0.587f, 0.114f));
@@ -169,9 +163,10 @@ float3 evalPointBSDF(
 // Buffers & CB
 StructuredBuffer<Polygon> polygonBuffer;
 StructuredBuffer<PolygonRange> polygonRangeBuffer;
+StructuredBuffer<VoxelData> gBuffer;
 SamplerState sampler;
 
-RWTexture2D<float4> outputMap;  // R=GT, G=Approx, B=absError
+RWTexture2D<float4> outputMap;  // R=GT, G=Approx, B=|GT-Approx|, A=|formula4 - lobeBSDF|
 
 cbuffer GridData
 {
@@ -186,6 +181,8 @@ cbuffer CB
     uint blockCount;
     uint blockSize;
     uint samplesPerPolygon;
+    uint ndfMode;         // 0=splitting error (default), 1=NDF visualization
+    uint2 ndfResolution;  // hemisphere map resolution (only used when ndfMode==1)
 };
 
 // Uniform hemisphere sampling: map pixel (px, py) to a direction on the
@@ -200,9 +197,122 @@ float3 sampleUniformHemisphere(uint px, uint py, uint res)
     return float3(sinT * cos(phi), sinT * sin(phi), cos(theta));
 }
 
+float3 octahedralMapping(uint bx, uint by, uint blockCount)
+{
+    float2 uv = float2(bx + 0.5f, by + 0.5f) / float(blockCount);
+
+    float2 p = uv * 2.0f - 1.0f;
+
+    float3 dir = float3(p.x, p.y, 1.0f - abs(p.x) - abs(p.y));
+
+    if (dir.z < 0.0f)
+    {
+        dir.xy = (1.0f - abs(dir.yx)) * sign(dir.xy);
+    }
+
+    return normalize(dir);
+}
+
+// NDF visualization: per-sample GGX ground truth vs lobe-averaged NDF
+void computeNDF(uint3 tid)
+{
+    if (tid.x >= ndfResolution.x || tid.y >= ndfResolution.y)
+        return;
+
+    // Map pixel to unit disk → direction h (center = (0,0,1), edge = equator)
+    float2 uv = (float2(tid.xy) + 0.5f) / float2(ndfResolution) * 2.0f - 1.0f;  // [-1, 1]
+    float r2 = dot(uv, uv);
+    if (r2 > 1.0f)
+    {
+        outputMap[tid.xy] = float4(0, 0, 0, 0);
+        return;
+    }
+    float r = sqrt(r2);
+    float theta = r * PI * 0.5f;          // r=0 → θ=0 (north pole), r=1 → θ=π/2 (equator)
+    float phi = atan2(uv.y, uv.x);
+    float3 h = float3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+
+    // Load the renderer's SurfaceBRDF
+    VoxelData voxelData = gBuffer[targetGBufferIndex];
+    SurfaceBRDF surfaceBRDF;
+    surfaceBRDF.init(voxelData.ABSDF);
+
+    // --- GT NDF: per-sample GGX accumulation -------------------------------
+    PolygonRange range = polygonRangeBuffer[targetGBufferIndex];
+    float nodeScale = range.nodeScale;
+    float sumNDF = 0;
+    float totalArea = 0;
+
+    MaterialSystem ms = gScene.materials;
+    float IoR = 1.5f;
+    float f0Term = (IoR - 1.0f) / (IoR + 1.0f);
+    float F0 = f0Term * f0Term;
+
+    for (uint s = 0; s < range.count; s++)
+    {
+        uint polyIdx = range.localHead + s;
+        Polygon poly = polygonBuffer[polyIdx];
+        float polyArea = poly.calcArea();
+        float sampleWeight = polyArea / float(samplesPerPolygon);
+
+        TriangleRef triRef = poly.triRef;
+        uint3 vtxIndices = gScene.getIndices(triRef.meshID, triRef.triangleID);
+        StaticVertexData v[3] = {
+            gScene.getVertex(vtxIndices.x),
+            gScene.getVertex(vtxIndices.y),
+            gScene.getVertex(vtxIndices.z)
+        };
+        Triangle tri = {};
+        for (int i = 0; i < 3; i++)
+        {
+            tri.vertices[i] = (v[i].position - gridMin) / voxelSize;
+            tri.uvs[i] = v[i].texCrd;
+            tri.normals[i] = v[i].normal;
+        }
+        tri.buildTBN();
+        BasicMaterialData mat = ms.getBasicMaterialData(triRef.materialID);
+
+        uint baseSeed = hash32(polyIdx * 2654435761u + tid.x * 3266489917u + tid.y);
+
+        for (uint k = 0; k < samplesPerPolygon; k++)
+        {
+            uint seed = hash32(baseSeed + k * 2246822519u);
+            float2 u = float2(rand01(seed), rand01(seed));
+            float3 localPos = samplePointOnPolygon(poly, u);
+            float3 leafCoord = localPos * nodeScale;
+            float2 uv = tri.lerpUV(leafCoord);
+            float3 sampleNormal = tri.lerpNormal(leafCoord);
+
+            // Sample roughness from texture
+            float4 spec = sampleTexture(mat.texSpecular, uv, mat.specular);
+            float rough = max(spec.g, 0.01f);
+            float alpha2 = rough * rough;
+
+            float NdotH = abs(dot(sampleNormal, h));
+            sumNDF += sampleWeight * ggx(NdotH, alpha2);
+            totalArea += sampleWeight;
+        }
+    }
+
+    float gtNDF = (totalArea > 0) ? sumNDF / totalArea : 0;
+
+    // --- Lobe NDF ---
+    float lobeNDF = surfaceBRDF.evalNormalDistribution(h);
+
+    // --- Output ---
+    float ndfError = abs(gtNDF - lobeNDF);
+    outputMap[tid.xy] = float4(gtNDF, lobeNDF, ndfError, 0);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID)
 {
+    if (ndfMode == 1)
+    {
+        computeNDF(tid);
+        return;
+    }
+
     uint totalPixels = blockCount * blockSize;
     if (tid.x >= totalPixels || tid.y >= totalPixels)
         return;
@@ -217,14 +327,19 @@ void main(uint3 tid : SV_DispatchThreadID)
     uint totalWi = blockCount * blockCount;
     uint totalWo = blockSize * blockSize;
 
-    float3 wi = fibonacciSphere(blockIdx, totalWi);
-
-    // ---- ω_o: uniform hemisphere sample (local space, z > 0) ----
-    float3 localWo = sampleUniformHemisphere(px, py, blockSize);
+    // float3 wi = fibonacciSphere(blockIdx, totalWi);
+    float3 wi = octahedralMapping(bx, by, blockCount);
+    float3 wo = octahedralMapping(px, py, blockSize);
+    float3 h = normalize(wi + wo);
 
     PolygonRange range = polygonRangeBuffer[targetGBufferIndex];
     float nodeScale = range.nodeScale;
     float maxDist = 2.0f;
+
+    // Load the renderer's actual BSDF representation (4-lobe ABSDF → SurfaceBRDF)
+    VoxelData voxelData = gBuffer[targetGBufferIndex];
+    SurfaceBRDF surfaceBRDF;
+    surfaceBRDF.init(voxelData.ABSDF);
 
     // Pre-load per-polygon triangle data (same for all samples on this polygon)
     // We'll iterate polygons first, then samples within each polygon
@@ -288,10 +403,6 @@ void main(uint3 tid : SV_DispatchThreadID)
 
             // ---- Flip normal to face ω_i, then transform ω_o to world space ----
             float3 hemAxis = dot(sampleNormal, wi) >= 0.0f ? sampleNormal : -sampleNormal;
-            float3 t, b;
-            buildTBN(t, b, hemAxis);
-            float3 wo = normalize(localToWorld(localWo, t, b, hemAxis));
-            float3 h = normalize(wi + wo);
 
             float dot_sample_i = dot(sampleNormal, wi);
             float dot_sample_o = dot(sampleNormal, wo);
@@ -314,7 +425,7 @@ void main(uint3 tid : SV_DispatchThreadID)
             float lobeRough = max(spec.g, 0.01f);
 
             // Visibility
-            float3 rayOrigin = localPos + effectiveNormal * 1e-5f;
+            float3 rayOrigin = localPos + effectiveNormal * 1e-6f;
             float Vi = traceVisibility(rayOrigin, wi, maxDist, polygonBuffer, range.localHead, range.count);
             float Vo = traceVisibility(rayOrigin, wo, maxDist, polygonBuffer, range.localHead, range.count);
 
@@ -334,19 +445,29 @@ void main(uint3 tid : SV_DispatchThreadID)
     }
 
     float gt = 0, approx = 0, error = 0;
+    float formula4 = 0;
+    float lobeBSDF = 0;
+    float bsdfApproxError = 0;
 
     if (totalWeight > 0 && sum_ViVo_cc > 0 && sum_Vo_co > 0)
     {
         gt = sum_fViVo_cc / sum_Vo_co;
     }
 
+    // Lobe-averaged BSDF from the renderer's actual SurfaceBRDF (same path as RayMarching)
+    {
+        float3 lobeVal = surfaceBRDF.eval(wi, wo, h);
+        lobeBSDF = luminance(lobeVal);
+    }
+
     if (totalWeight > 0 && sum_co > 0 && sum_Vo_ci_co > 0 && sum_ViVo_cc > 0)
     {
-        float formula4 = sum_f_cc / sum_co;
+        formula4 = sum_f_cc / sum_co;
         float formula5 = sum_ViVo_cc / sum_Vo_ci_co;
         approx = formula4 * formula5;
     }
 
     error = abs(gt - approx);
-    outputMap[tid.xy] = float4(gt, approx, error, 0);
+    bsdfApproxError = abs(formula4 - lobeBSDF);
+    outputMap[tid.xy] = float4(gt, approx, error, bsdfApproxError);
 }

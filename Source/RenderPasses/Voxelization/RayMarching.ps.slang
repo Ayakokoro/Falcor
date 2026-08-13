@@ -68,6 +68,7 @@ struct HitResult
     float3 cell;     // in LOD-0 coordinate space
     uint gbIndex;    // gBuffer offset at leaf node
     uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
+    float lodLevel;  // continuous LOD = log2(footprint), clamped to ≥0; 0=leaf
 };
 
 struct PsOut
@@ -132,21 +133,21 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     float3 hitCell = float3(nodeMinCell) + hitLocal * float(nodeSize);
     int3 hitCellInt = int3(floor(hitCell));
 
-    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize };
+    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize, 0.0f };
     return result;
 }
 
 HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
 {
 #if !CHECK_ELLIPSOID
-    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize };
+    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
     if (hit.hit)
         return hit;
 #endif
-    return { false, cellInt, cellInt + 0.5f, 0, nodeSize };
+    return { false, cellInt, cellInt + 0.5f, 0, nodeSize, 0.0f };
 }
 
 // --- Parametric octree traversal (negative direction DDA) ---
@@ -162,11 +163,11 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 // ellipsoid intersection tests, and ignoreNodeSize pre-skip from the original
 // parameterized stack-based traversal.
 // from: starting point in LOD-0 cell space
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance, int fixedLod)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
-        return { false, int3(from), from, 0, 0 };
+        return { false, int3(from), from, 0, 0, 0.0f };
 
     // ===== Phase 1: ignoreNodeSize pre-skip (unchanged logic) =====
     float3 rayOrigin = from;
@@ -243,7 +244,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         t_max = min(t_max, t_min + maxDistance / float(rootSize));
 
     if (t_min > t_max)
-        return { false, int3(0), float3(0), 0, 0 };
+        return { false, int3(0), float3(0), 0, 0, 0.0f };
 
     // ===== Phase 4: initialize state machine =====
     int2 stack[S_MAX + 1];
@@ -258,6 +259,13 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     if (1.5f * coef.x - bias.x > t_min) { idx ^= 1; pos.x = 1.5f; }
     if (1.5f * coef.y - bias.y > t_min) { idx ^= 2; pos.y = 1.5f; }
     if (1.5f * coef.z - bias.z > t_min) { idx ^= 4; pos.z = 1.5f; }
+
+    // Save entry parametric t for cumulative distance calculation.
+    // t_min is the parametric t at which the ray enters the root [1,2] cube,
+    // and stays constant while t_min advances cell-by-cell.  Using t_entry
+    // guarantees worldDist grows monotonically along the ray instead of
+    // resetting per cell.
+    precise float t_entry = t_min;
 
     // ===== Phase 5: main traversal loop (INTERSECT → PUSH | ADVANCE → POP) =====
     uint maxIter = (1u << octreeMaxDepth) * 3u + 64u;
@@ -289,14 +297,20 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             uint nodeLOD     = octreeMaxDepth - octreeDepth;     // 0 at leaf
             uint nodeSize    = 1u << nodeLOD;                    // 1 at leaf
 
-            bool forcedStop  = (forcedLOD > 0 && (int)nodeLOD == forcedLOD);
+            bool forcedStop  = (forcedLOD > 0 && (int)nodeLOD == forcedLOD)
+                            || (fixedLod >= 0 && (int)nodeLOD == fixedLod);
 
-            // Dynamic LOD: compare ray-footprint radius with node size
-            // Convert parametric t to cell-space distance for the footprint calculation
-            float worldDist = (tc_max - t_min) * float(rootSize);
+            // Dynamic LOD: compare ray-footprint radius with node size.
+            // Only active for primary rays (fixedLod < 0); secondary bounces,
+            // visibility checks, and coverage tests use a fixed LOD level
+            // inherited from the hit point to avoid LOD switching.
+            // Convert parametric t to cell-space distance for the footprint calculation.
+            // Use t_entry (root entry t) instead of t_min so the distance accumulates
+            // across cells — footprint grows monotonically along the ray.
+            float worldDist = (tc_max - t_entry) * float(rootSize);
             float footprint = cone.bias + max(worldDist, 0.0f) * cone.tanHalfAngle;
             bool lodLevelOK  = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
-            bool dynamicStop = lodLevelOK && (footprint > (float)nodeSize);
+            bool dynamicStop = (fixedLod < 0) && lodLevelOK && (footprint > (float)nodeSize);
 
             bool shouldStop = isLeaf || forcedStop || dynamicStop;
 
@@ -323,7 +337,10 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 
                     HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize);
                     if (hit.hit)
+                    {
+                        hit.lodLevel = log2(max(footprint, 1.0f));
                         return hit;
+                    }
                 }
             }
 
@@ -396,12 +413,12 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         }
     }
 
-    return { false, int3(0), float3(0), 0, 0 };
+    return { false, int3(0), float3(0), 0, 0, 0.0f };
 }
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
-    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0);
+    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
     return hit.hit ? 0 : 1;
 }
 
@@ -411,7 +428,7 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, cone, 0);
+    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
     return hit.hit ? 0 : 1;
 }
 
@@ -429,7 +446,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0);
+        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -538,7 +555,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
         RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
 
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0);
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize));
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -574,6 +591,10 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
             if (nextHit.hit)
             {
                 float3 incidentLight = reflectLights[i + 1];
+                // Clamp fireflies from low-pdf BSDF samples:
+                // a lit diffuse surface is ~0.25, so 10.0 catches spikes
+                // while leaving normal indirect paths untouched.
+                incidentLight = min(incidentLight, 10.0);
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
         }
@@ -610,6 +631,34 @@ float4 renderBackground(float3 direction)
     return clearColor;
 }
 
+// Simple Lambert + shadow-ray shading for LOD heatmap visualization.
+// Samples the scene light and traces a visibility ray; baseColor is the
+// LOD heatmap hue modulated by N·L and shadow.
+float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
+{
+    TEBSDF BSDF = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+    float3 posW = gridMin + hit.cell * voxelSize;
+
+    LightSample ls = {};
+    bool valid = sampleLight(posW, v, BSDF, sg, ls);
+
+    // Ambient fallback (no valid light sample)
+    float3 ambient = baseColor * 0.04;
+
+    if (!valid || ls.pdf <= 0)
+        return ambient;
+
+    float3 N = BSDF.surface.getMainNormal(ls.l);
+    float NdotL = saturate(dot(N, ls.l));
+
+    float visibility = calcLightVisibility(hit, ls.l, N, ls.distance / voxelSize.x, cone);
+
+    // Lambert: diffuse = baseColor * (N·L) * lightColor * visibility / (π * pdf)
+    float3 diffuse = baseColor * NdotL * ls.lightColor * visibility * (1.0 / Pi) / max(ls.pdf, minPdf);
+
+    return ambient + diffuse;
+}
+
 PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 {
     PsOut psOut = {};
@@ -639,7 +688,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     // Error: need world space distance
     float initialDistance = (inOut.x + 1e-6) * length(delta);
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
-    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance);
+    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1);
 
     if (all(pixel == selectedPixel))
     {
@@ -703,24 +752,40 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODLevel:
         {
-            // Visualize dynamic LOD: nodeSize → LOD level → color band
-            // nodeSize = 2^lodLevel, so lodLevel = log2(nodeSize)
+            float t = saturate(hit.lodLevel / max(float(octreeMaxDepth), 1.0f));
             uint lodLevel = firstbithigh(hit.nodeSize);
-            uint maxLod = octreeMaxDepth;
 
-            // 5-band heatmap: blue→cyan→green→yellow→red
-            if (lodLevel == 0)
-                color = float3(0.1, 0.2, 1.0);      // leaf: blue
-            else if (lodLevel == 1)
-                color = float3(0.0, 0.8, 0.8);      // cyan
-            else if (lodLevel == 2)
-                color = float3(0.0, 0.9, 0.2);      // green
-            else if (lodLevel == 3)
-                color = float3(0.9, 0.9, 0.0);      // yellow
-            else if (lodLevel == 4)
-                color = float3(1.0, 0.5, 0.0);      // orange
-            else
-                color = float3(1.0, 0.0, 0.0);      // coarse (5+): red
+            const float3 colors[] = {
+                float3(1.0, 1.0, 0.0), // c0: 底部 (黄色)
+                float3(0.0, 1.0, 0.0), // c1: 绿色段
+                float3(0.0, 1.0, 1.0), // c2: 青色段
+                float3(0.0, 0.0, 1.0), // c3: 蓝色段
+                float3(1.0, 0.0, 1.0), // c4: 品红色段
+                float3(1.0, 0.0, 0.0), // c5: 顶部 (红色)
+            };
+
+            float3 baseColor;
+            float sectionT; // 当前段内的局部 t 值
+
+            if (t < 0.2f) { // 第1段: 黄色到绿色
+                sectionT = t / 0.2f;
+                baseColor = lerp(colors[0], colors[1], sectionT);
+            } else if (t < 0.4f) { // 第2段: 绿色到青色
+                sectionT = (t - 0.2f) / 0.2f;
+                baseColor = lerp(colors[1], colors[2], sectionT);
+            } else if (t < 0.6f) { // 第3段: 青色到蓝色
+                sectionT = (t - 0.4f) / 0.2f;
+                baseColor = lerp(colors[2], colors[3], sectionT);
+            } else if (t < 0.8f) { // 第4段: 蓝色到品红色
+                sectionT = (t - 0.6f) / 0.2f;
+                baseColor = lerp(colors[3], colors[4], sectionT);
+            } else { // 第5段: 品红色到红色
+                sectionT = (t - 0.8f) / 0.2f;
+                baseColor = lerp(colors[4], colors[5], sectionT);
+            }
+
+            baseColor = colors[min(lodLevel, 5u)]; // Clamp to max color index
+            color = lambertShading(hit, -direction, sg, primaryCone, baseColor);
         }
             break;
         default:

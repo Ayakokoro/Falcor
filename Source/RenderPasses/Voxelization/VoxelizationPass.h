@@ -114,6 +114,8 @@ protected:
     uint32_t mSplittingVisMode = 0;     // 0=GT, 1=Approx, 2=AbsError
     uint32_t mSamplesPerPolygon = 4;    // samples per polygon for MC integration
     uint32_t mSplittingErrorTargetIndex = 0xFFFFFFFF;
+    bool     mNDFMode = false;            // NDF visualization mode
+    uint32_t mNDFResolution = 256;        // NDF hemisphere map resolution
     float mSplittingValueMin = 0.0f;
     float mSplittingValueMax = 1.0f;
 };

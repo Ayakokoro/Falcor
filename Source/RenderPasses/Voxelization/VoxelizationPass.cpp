@@ -279,7 +279,7 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             widget.var("CellInt Z", (int&)mValidationCellInt.z, 0, maxCoord);
 
             // Block count (incident directions: N×N ω_i)
-            static const uint gridResolutions[] = {4, 8, 16, 32};
+            static const uint gridResolutions[] = {4, 8, 16, 32, 64, 128};
             {
                 Gui::DropdownList list;
                 for (uint32_t i = 0; i < sizeof(gridResolutions) / sizeof(uint); i++)
@@ -304,16 +304,32 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             }
 
             // Display mode
-            static const char* splitModes[] = {"GT (Ground Truth)", "Approximation", "Abs Error"};
+            static const char* splitModes[] = {"GT", "Approx", "Abs Error", "BSDF Error"};
             {
                 Gui::DropdownList list;
-                for (uint32_t i = 0; i < 3; i++)
+                for (uint32_t i = 0; i < 4; i++)
                     list.push_back({i, splitModes[i]});
                 widget.dropdown("Display Mode", list, mSplittingVisMode);
             }
 
+            // NDF mode
+            widget.checkbox("NDF Mode", mNDFMode);
+            if (mNDFMode)
+            {
+                static const uint ndfResolutions[] = {64, 128, 256, 512, 1024, 2048, 4096};
+                {
+                    Gui::DropdownList list;
+                    for (uint32_t i = 0; i < sizeof(ndfResolutions) / sizeof(uint); i++)
+                    {
+                        uint n = ndfResolutions[i];
+                        list.push_back({n, std::to_string(n) + "x" + std::to_string(n)});
+                    }
+                    widget.dropdown("NDF Resolution", list, mNDFResolution);
+                }
+            }
+
             // Samples per polygon
-            static const uint sampleCounts[] = {1, 2, 4, 8, 16, 32, 64, 128};
+            static const uint sampleCounts[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
             {
                 Gui::DropdownList list;
                 for (uint32_t i = 0; i < sizeof(sampleCounts) / sizeof(uint); i++)
@@ -1081,9 +1097,17 @@ void VoxelizationPass::computeSplittingError(RenderContext* pRenderContext)
         mSplittingErrorPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
     }
 
-    uint totalRes = mSplittingBlockCount * mSplittingBlockSize;
+    uint totalRes;
+    if (mNDFMode)
+    {
+        totalRes = mNDFResolution;
+    }
+    else
+    {
+        totalRes = mSplittingBlockCount * mSplittingBlockSize;
+    }
 
-    // Create output texture: 4 channels (GT, Approx, AbsError, unused)
+    // Create output texture: 4 channels (GT, Approx/Lobe, Error)
     mSplittingErrorMap = mpDevice->createTexture2D(
         totalRes, totalRes, ResourceFormat::RGBA32Float, 1, 1, nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
@@ -1095,6 +1119,7 @@ void VoxelizationPass::computeSplittingError(RenderContext* pRenderContext)
     var["sampler"] = mpSampler;
     var["polygonBuffer"] = polygonGroup.get(batchIdx);
     var["polygonRangeBuffer"] = polygonRangeBuffer;
+    var["gBuffer"] = gBuffer;
     var["outputMap"] = mSplittingErrorMap;
 
     auto cb_grid = var["GridData"];
@@ -1107,14 +1132,15 @@ void VoxelizationPass::computeSplittingError(RenderContext* pRenderContext)
     cb["blockCount"] = mSplittingBlockCount;
     cb["blockSize"] = mSplittingBlockSize;
     cb["samplesPerPolygon"] = mSamplesPerPolygon;
+    cb["ndfMode"] = mNDFMode ? 1u : 0u;
+    cb["ndfResolution"] = uint2(mNDFResolution, mNDFResolution);
 
     mSplittingErrorPass->execute(pRenderContext, uint3(totalRes, totalRes, 1));
     pRenderContext->submit(true);
 
     std::cout << "[SplittingError] Compute map: targetIdx=" << targetIdx
               << " batch=" << batchIdx
-              << " blocks=" << mSplittingBlockCount << "x" << mSplittingBlockCount
-              << " blockSize=" << mSplittingBlockSize
+              << " ndfMode=" << (mNDFMode ? "true" : "false")
               << " totalRes=" << totalRes << std::endl;
 
     Tools::Profiler::EndSample("Compute Splitting Error");
