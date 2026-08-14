@@ -4,6 +4,7 @@
 #include "Math/Ellipsoid.slang"
 #include "Math/Triangle.slang"
 #include "Math/SphericalHarmonics.slang"
+#include "Math/OctahedralMap.slang"
 BEGIN_NAMESPACE_FALCOR
 
 typedef EvenSphericalHarmonics SphericalFunc;
@@ -15,6 +16,9 @@ struct VoxelData
     SphericalFunc primitiveProjAreaFunc;
     SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
     SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
+    OctahedralFunc primitiveProjAreaOcta; // 半八面体映射版本
+    OctahedralFunc polygonsProjAreaOcta;
+    OctahedralFunc totalProjAreaOcta;
 
     MUTATING
     void init()
@@ -23,6 +27,9 @@ struct VoxelData
         primitiveProjAreaFunc.init();
         polygonsProjAreaFunc.init();
         totalProjAreaFunc.init();
+        primitiveProjAreaOcta.init();
+        polygonsProjAreaOcta.init();
+        totalProjAreaOcta.init();
     }
 
     bool IsSolid() { return ABSDF.area > 0; }

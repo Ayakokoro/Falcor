@@ -1,18 +1,21 @@
 #include "Voxel/ABSDF.slang"
 #include "Voxel/VoxelGrid.slang"
 #include "VoxelizationShared.slang"
+#include "Math/OctahedralMap.slang"
 
 StructuredBuffer<VoxelData> gBuffer;
-Texture2D<float> exactMap;
-SamplerState pointSampler;
+Texture2D<float> exactMap;   // 高分辨率 equirectangular 精确值
+Texture2D<float> octaMap;    // 8x8 半八面体纹理（每个 texel 存该方向精确值）
+SamplerState pointSampler;   // exactMap 采样（point）
+SamplerState linearSampler;  // octaMap 采样（bilinear + clamp）
 
 cbuffer CB
 {
     uint targetGBufferIndex;
     uint2 mapResolution;
     uint functionType;       // 0=primitiveProjArea, 1=polygonsProjArea, 2=totalProjArea
-    uint visualizationMode;  // 0=SH Approx, 1=Exact, 2=Error (abs diff)
-    float valueMin;          // for color range normalization
+    uint visualizationMode;  // 0=SH, 1=Exact, 2=Octahedral, 3=|SH-Exact|, 4=|Octa-Exact|
+    float valueMin;
     float valueMax;
     float4 clearColor;
 }
@@ -39,7 +42,6 @@ float evalSH(VoxelData data, float3 direction)
 }
 
 // Convert hemisphere direction to equirectangular texture coordinates
-// direction is in the local hemisphere frame with z up (z > 0)
 float sampleExactMap(float3 localDir)
 {
     float theta = acos(saturate(localDir.z));
@@ -50,6 +52,13 @@ float sampleExactMap(float3 localDir)
     float v = theta / (PI * 0.5f);
 
     return exactMap.SampleLevel(pointSampler, float2(u, v), 0);
+}
+
+// 从 8x8 八面体纹理采样（双线性插值），与 buffer 存储方案的采样一致
+float sampleOctaMap(float3 localDir)
+{
+    float2 uv = octaEncode(localDir);
+    return octaMap.SampleLevel(linearSampler, uv, 0);
 }
 
 struct PsOut
@@ -82,24 +91,20 @@ PsOut main(float2 texCoord : TEXCOORD, float4 pos : SV_POSITION)
 
     float shVal = evalSH(data, direction);
     float exactVal = sampleExactMap(direction);
+    float octaVal = sampleOctaMap(direction);
 
     float value = 0;
 
     if (visualizationMode == 0)
-    {
-        // SH Approximation (smooth)
         value = shVal;
-    }
     else if (visualizationMode == 1)
-    {
-        // Exact ground truth (from precomputed map)
         value = exactVal;
-    }
-    else
-    {
-        // Error: absolute difference between SH and exact
+    else if (visualizationMode == 2)
+        value = octaVal;
+    else if (visualizationMode == 3)
         value = abs(shVal - exactVal);
-    }
+    else
+        value = abs(octaVal - exactVal);
 
     psOut.color = float4(funcValueToColor(value), 1.0f);
     return psOut;

@@ -54,6 +54,7 @@ protected:
     void write(std::string fileName, void* pGBuffer);
 
     ref<ComputePass> mAnalyzePolygonPass;
+    ref<ComputePass> mEstimateOctahedronPass;
     ref<ComputePass> mLoadMeshPass;
     ref<ComputePass> mValidationPass;
     ref<ComputePass> mSphericalMapPass;
@@ -66,6 +67,7 @@ protected:
     ref<SampleGenerator> mpSampleGenerator;
     ref<Sampler> mpSampler;
     ref<Sampler> mpPointSampler;
+    ref<Sampler> mpClampLinearSampler;
     ref<Fbo> mpFbo;
 
     ref<Buffer> gBuffer;
@@ -74,6 +76,7 @@ protected:
     ref<Buffer> polygonRangeBuffer;
 
     ref<Texture> mSphericalFuncMap;   // precomputed exact-value texture
+    ref<Texture> mOctaFuncMap;        // 8x8 half-octahedron map (per-texel exact value)
     ref<Texture> mSplittingErrorMap;  // splitting error texture (RGBA: GT, Approx, Error, unused)
 
     PolygonBufferGroup polygonGroup;

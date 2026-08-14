@@ -1,5 +1,6 @@
 #include "Voxel/VoxelGrid.slang"
 #include "Math/VoxelizationUtility.slang"
+#include "Math/OctahedralMap.slang"
 #include "VoxelizationShared.slang"
 #include "MixLightSampler.slang"
 import Rendering.Materials.StandardMaterial;
@@ -455,6 +456,30 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     return valueToColor(coverage);
 }
 
+// 用半八面体采样替代 SH 的 coverage 对比版本
+float3 coverageTestOcta(HitResult hit, float3 direction, RayCone cone)
+{
+    float coverage = 0;
+    uint offset = hit.gbIndex;
+    float times = MAX_BOUNCE;
+    while (times > 0)
+    {
+        TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
+        coverage += (1 - coverage) * bsdf.calcCoverageOcta(direction, coverageBlend);
+        if (coverage >= 1 - transmittanceThreshold)
+        {
+            coverage = 1;
+            break;
+        }
+        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+        if (!hit.hit)
+            break;
+        offset = hit.gbIndex;
+        times--;
+    }
+    return valueToColor(coverage);
+}
+
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
@@ -484,8 +509,23 @@ float3 debugShading(HitResult hit, float3 v)
     case ABSDFDrawMode::PrimitiveProjArea:
         result = bsdf.primitiveProjAreaFunc.calc(v);
         break;
+    case ABSDFDrawMode::PrimitiveProjAreaOcta:
+        result = bsdf.primitiveProjAreaOcta.calc(v);
+        break;
+    case ABSDFDrawMode::PolygonsProjAreaOcta:
+        result = bsdf.polygonsProjAreaOcta.calc(v);
+        break;
+    case ABSDFDrawMode::TotalProjAreaOcta:
+        result = bsdf.totalProjAreaOcta.calc(v);
+        break;
     case ABSDFDrawMode::InternalVisibility:
         result = bsdf.calcInternalVisibility(v);
+        break;
+    case ABSDFDrawMode::CoverageOcta:
+        result = bsdf.calcCoverageOcta(v, coverageBlend);
+        break;
+    case ABSDFDrawMode::InternalVisibilityOcta:
+        result = bsdf.calcInternalVisibilityOcta(v);
         break;
     case ABSDFDrawMode::TotalArea:
         result = bsdf.area;
@@ -596,6 +636,111 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
                 // while leaving normal indirect paths untouched.
                 incidentLight = min(incidentLight, 10.0);
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
+            }
+        }
+    }
+    return reflectLights[0];
+}
+
+// ===== Octa 版本 shading：coverage/visibility 用半八面体采样，其余与 TEBSDF 相同 =====
+
+float3 shadingOcta(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
+{
+    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    BSDF.updateCoverageOcta(v, transmittanceThreshold, coverageBlend);
+    return lightColor * BSDF.evalOcta(l, v, h);
+}
+
+float3 shadingDirectOcta(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
+{
+    uint offset = hit.gbIndex;
+    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    float3 posW = gridMin + hit.cell * voxelSize;
+    LightSample ls = {};
+
+    // 光源采样只用到 surface，与 coverage 无关
+    bool valid = sampleLight(posW, v, BSDF, sg, ls);
+
+    if (!valid || ls.pdf <= 0 || all(ls.h == 0))
+        return 0;
+
+    ls.pdf = max(ls.pdf, minPdf);
+    float3 mainNormal = BSDF.surface.getMainNormal(ls.l);
+    float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x, cone);
+
+    if (visibility > 0)
+        return visibility * shadingOcta(offset, ls.l, v, ls.h, ls.lightColor) / ls.pdf;
+    return 0;
+}
+
+float3 shadingGlobalOcta(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
+{
+    HitResult[MAX_BOUNCE + 1] hits;
+    float3[MAX_BOUNCE + 1] ls;
+    float3[MAX_BOUNCE + 1] hs;
+    float[MAX_BOUNCE + 1] pdfs;
+    uint bounce = MAX_BOUNCE;
+    uint shadingPointCount = bounce + 1;
+    hits[0] = hit;
+    bool leaveGrid = false;
+
+    for (int i = 0; i < bounce; i++)
+    {
+        uint offset = hits[i].gbIndex;
+        TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+        float3 currentV = i == 0 ? v : -ls[i - 1];
+        BSDF.updateCoverageOcta(currentV, transmittanceThreshold, coverageBlend);
+        BSDF.sample(currentV, ls[i], hs[i], sg);
+
+        pdfs[i] = BSDF.evalPdf(ls[i], currentV, hs[i]);
+        if (pdfs[i] <= 0)
+        {
+            shadingPointCount = i + 1;
+            break;
+        }
+        pdfs[i] = max(pdfs[i], minPdf);
+
+        float rough = maxRoughness(offset);
+        float spreadTan = tan(min(rough, 0.995f) * 1.57f);
+        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
+
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize));
+        if (!hits[i + 1].hit)
+        {
+            leaveGrid = true;
+            shadingPointCount = i + 1;
+            break;
+        }
+    }
+
+    float3 reflectLights[MAX_BOUNCE + 1];
+    for (int i = shadingPointCount - 1; i >= 0; i--)
+    {
+        reflectLights[i] = 0;
+        HitResult currentHit = hits[i];
+        uint currentOffset = currentHit.gbIndex;
+        float3 currentV = i == 0 ? v : -ls[i - 1];
+
+        reflectLights[i] += shadingDirectOcta(currentHit, currentV, sg, cone);
+        if (i == shadingPointCount - 1)
+        {
+#if USE_ENV_MAP
+            if (leaveGrid && all(hs[i] == 0))
+            {
+                float3 incidentLight = gEnvMapSampler.eval(ls[i]);
+                reflectLights[i] += shadingOcta(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
+            }
+#endif
+        }
+        else
+        {
+            if (pdfs[i] <= 0)
+                continue;
+            HitResult nextHit = hits[i + 1];
+            if (nextHit.hit)
+            {
+                float3 incidentLight = min(reflectLights[i + 1], 10.0);
+                reflectLights[i] += shadingOcta(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
         }
     }
@@ -722,8 +867,14 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 #endif
             color = shadingGlobal(hit, -direction, sg, primaryCone);
             break;
+        case ABSDFDrawMode::ShadedOcta:
+            color = shadingGlobalOcta(hit, -direction, sg, primaryCone);
+            break;
         case ABSDFDrawMode::Coverage:
             color = coverageTest(hit, direction, primaryCone);
+            break;
+        case ABSDFDrawMode::CoverageOcta:
+            color = coverageTestOcta(hit, direction, primaryCone);
             break;
         case ABSDFDrawMode::LODHeatmap:
         {

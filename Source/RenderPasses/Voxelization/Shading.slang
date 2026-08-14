@@ -395,6 +395,9 @@ struct TEBSDF
     SphericalFunc primitiveProjAreaFunc;
     SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
     SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
+    OctahedralFunc primitiveProjAreaOcta;
+    OctahedralFunc polygonsProjAreaOcta;
+    OctahedralFunc totalProjAreaOcta;
     float area;
 
     float coverage; // 临时变量
@@ -409,6 +412,9 @@ struct TEBSDF
             primitiveProjAreaFunc = data.primitiveProjAreaFunc;
             polygonsProjAreaFunc = data.polygonsProjAreaFunc;
             totalProjAreaFunc = data.totalProjAreaFunc;
+            primitiveProjAreaOcta = data.primitiveProjAreaOcta;
+            polygonsProjAreaOcta = data.polygonsProjAreaOcta;
+            totalProjAreaOcta = data.totalProjAreaOcta;
             surface.init(data.ABSDF);
         }
     }
@@ -453,6 +459,46 @@ struct TEBSDF
         return saturate(polygonsProjArea / totalProjArea);
     }
 
+    // ---- 半八面体映射版本（coverage / visibility 用 octa 采样）----
+    float calcCoverageOcta(float3 direction, float coverageBlend)
+    {
+#if !CHECK_COVERAGE
+        return 1;
+#endif
+        float primitiveProjArea = primitiveProjAreaOcta.calc(direction);
+        if (primitiveProjArea <= 0)
+            return 1;
+        float polygonsProjArea = polygonsProjAreaOcta.calc(direction);
+        float rawCoverage = polygonsProjArea / primitiveProjArea;
+        float emptyRatio = (primitiveProjArea - polygonsProjArea) / max(primitiveProjArea, 1e-8f);
+        float coverage = rawCoverage + coverageBlend * emptyRatio;
+        return saturate(coverage);
+    }
+
+    [mutating]
+    void updateCoverageOcta(float3 direction, float threshould, float coverageBlend)
+    {
+#if !CHECK_COVERAGE
+        coverage = 1;
+        return;
+#endif
+        coverage = calcCoverageOcta(direction, coverageBlend);
+        if (1 - coverage < threshould)
+            coverage = 1;
+    }
+
+    float calcInternalVisibilityOcta(float3 direction)
+    {
+#if !CHECK_VISIBILITY
+        return 1.f;
+#endif
+        float totalProjArea = totalProjAreaOcta.calc(direction);
+        if (totalProjArea <= 0)
+            return 1;
+        float polygonsProjArea = polygonsProjAreaOcta.calc(direction);
+        return saturate(polygonsProjArea / totalProjArea);
+    }
+
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)
     {
         if (coverage == 1 || Next(sg) <= coverage)
@@ -466,6 +512,13 @@ struct TEBSDF
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
         return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
+    }
+
+    float3 evalOcta(float3 l, float3 v, float3 h)
+    {
+        if (coverage < 1 && all(h == 0))
+            return (1 - coverage) * delta.eval(l, v, h);
+        return coverage * surface.eval(l, v, h) * calcInternalVisibilityOcta(l);
     }
 
     float evalPdf(float3 l, float3 v, float3 h)

@@ -5,7 +5,7 @@ BEGIN_NAMESPACE_FALCOR
 
 #define SQRTPI 1.7724538509055160273f
 #define SH_COUNT 16
-#define EVEN_SH_COUNT 6
+#define EVEN_SH_COUNT 15
 
 inline float calcSH(uint idx, float3 p)
 {

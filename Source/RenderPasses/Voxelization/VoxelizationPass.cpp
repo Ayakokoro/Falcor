@@ -1,4 +1,5 @@
 #include "VoxelizationPass.h"
+#include "Math/OctahedralMap.slang"
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
@@ -6,6 +7,7 @@
 namespace
 {
 const std::string kAnalyzePolygonProgramFile = "RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
+const std::string kEstimateOctahedronProgramFile = "RenderPasses/Voxelization/EstimateOctahedron.cs.slang";
 const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.slang";
 const std::string kValidationProgramFile = "RenderPasses/Voxelization/ValidateProjection.cs.slang";
 const std::string kComputeSphericalFuncMapProgramFile = "RenderPasses/Voxelization/ComputeSphericalFuncMap.cs.slang";
@@ -33,6 +35,11 @@ VoxelizationPass::VoxelizationPass(ref<Device> pDevice, const Properties& props)
     pointSamplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point)
         .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
     mpPointSampler = pDevice->createSampler(pointSamplerDesc);
+
+    Sampler::Desc clampLinearDesc;
+    clampLinearDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
+        .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+    mpClampLinearSampler = pDevice->createSampler(clampLinearDesc);
 
     mpFbo = Fbo::create(mpDevice);
 }
@@ -211,10 +218,10 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             }
 
             // Visualization mode
-            static const char* visModes[] = {"SH Approx", "Exact", "Error (|SH-Exact|)"};
+            static const char* visModes[] = {"SH", "Exact", "Octahedral", "|SH-Exact|", "|Octa-Exact|"};
             {
                 Gui::DropdownList list;
-                for (uint32_t i = 0; i < 3; i++)
+                for (uint32_t i = 0; i < 5; i++)
                     list.push_back({i, visModes[i]});
                 widget.dropdown("Display Mode", list, mVisualizationMode);
             }
@@ -363,6 +370,7 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
 {
     mpScene = pScene;
     mAnalyzePolygonPass = nullptr;
+    mEstimateOctahedronPass = nullptr;
     mLoadMeshPass = nullptr;
     mValidationPass = nullptr;
     mSphericalMapPass = nullptr;
@@ -370,6 +378,7 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mSplittingErrorPass = nullptr;
     mDisplaySplittingErrorPass = nullptr;
     mSphericalFuncMap = nullptr;
+    mOctaFuncMap = nullptr;
     mSplittingErrorMap = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
@@ -607,6 +616,45 @@ void VoxelizationPass::analyzeAllNodes(RenderContext* pRenderContext)
         pRenderContext->submit(true);
     }
 
+    // Half-octahedron projection map (per-node, independent buffer, same batching)
+    {
+        Tools::Profiler::BeginSample("Estimate Octahedron");
+
+        if (!mEstimateOctahedronPass)
+        {
+            ProgramDesc desc;
+            desc.addShaderModules(mpScene->getShaderModules());
+            desc.addShaderLibrary(kEstimateOctahedronProgramFile).csEntry("main");
+            desc.addTypeConformances(mpScene->getTypeConformances());
+
+            DefineList defines;
+            defines.add(mpScene->getSceneDefines());
+            defines.add(mpSampleGenerator->getDefines());
+            mEstimateOctahedronPass = ComputePass::create(mpDevice, desc, defines, true);
+        }
+
+        for (uint batch = 0; batch < groupCount; batch++)
+        {
+            ShaderVar var = mEstimateOctahedronPass->getRootVar();
+            var[kPolygonBuffer] = polygonGroup.get(batch);
+            var[kPolygonRangeBuffer] = polygonRangeBuffer;
+            var[kGBuffer] = gBuffer;
+
+            uint groupVoxelCount = polygonGroup.getVoxelCount(batch);
+            uint totalThreads = groupVoxelCount * OCTA_COUNT;
+
+            auto cb = var["CB"];
+            cb["gBufferOffset"] = polygonGroup.getVoxelOffset(batch);
+            cb["groupVoxelCount"] = groupVoxelCount;
+            cb["sampleFrequency"] = mSampleFrequency;
+
+            mEstimateOctahedronPass->execute(pRenderContext, uint3(totalThreads, 1, 1));
+            pRenderContext->submit(true);
+        }
+
+        Tools::Profiler::EndSample("Estimate Octahedron");
+    }
+
     Tools::Profiler::EndSample("Analyze Polygons");
 }
 
@@ -724,6 +772,7 @@ std::string VoxelizationPass::getFileName()
     oss << "_";
     oss << std::to_string(mSampleFrequency);
     oss << "_hier";  // mark as hierarchical
+    oss << "_with_octa_" << OCTA_RES;
     oss << ".bin";
     return oss.str();
 }
@@ -977,11 +1026,18 @@ void VoxelizationPass::computeSphericalFuncMap(RenderContext* pRenderContext)
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
 
+    // 8x8 half-octahedron map: each texel stores the exact value at that direction
+    mOctaFuncMap = mpDevice->createTexture2D(
+        OCTA_RES, OCTA_RES, ResourceFormat::R32Float, 1, 1, nullptr,
+        ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
+    );
+
     ShaderVar var = mSphericalMapPass->getRootVar();
     var["polygonBuffer"] = polygonGroup.get(batchIdx);
     var["polygonRangeBuffer"] = polygonRangeBuffer;
     var["gBuffer"] = gBuffer;
     var["outputMap"] = mSphericalFuncMap;
+    var["octaMap"] = mOctaFuncMap;
 
     auto cb = var["CB"];
     cb["targetGBufferIndex"] = targetIdx;
@@ -1029,7 +1085,9 @@ void VoxelizationPass::displaySphericalFunc(RenderContext* pRenderContext, const
     ShaderVar var = mDisplaySphericalFuncPass->getRootVar();
     var["gBuffer"] = gBuffer;
     var["exactMap"] = mSphericalFuncMap;
+    var["octaMap"] = mOctaFuncMap;
     var["pointSampler"] = mpPointSampler;
+    var["linearSampler"] = mpClampLinearSampler;
 
     auto cb = var["CB"];
     cb["targetGBufferIndex"] = mTargetGBufferIndex;

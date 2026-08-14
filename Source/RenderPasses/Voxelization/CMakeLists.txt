@@ -14,6 +14,7 @@ target_sources(Voxelization PRIVATE
     Math/Sampling.slang
     Math/SphericalHarmonics.slang
     Math/LebedevQuadrature.slang
+    Math/OctahedralMap.slang
     Math/VoxelizationUtility.h
     Math/VoxelizationUtility.slang
     Math/Random.h
@@ -29,6 +30,7 @@ target_sources(Voxelization PRIVATE
     VoxelizationPass.cpp
     VoxelizationPass.h
     AnalyzePolygon.cs.slang
+    EstimateOctahedron.cs.slang
     PolygonGenerator.h
     LoadMesh.cs.slang
 
