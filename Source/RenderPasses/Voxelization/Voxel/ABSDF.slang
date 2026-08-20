@@ -160,6 +160,24 @@ struct ABSDF
             lobes[i].normalizeSelf(totalVisibleProjArea);
         }
     }
+
+    MUTATING
+    void normalizeWeightsOnly()
+    {
+        float totalWeight = 0.0f;
+
+        for (uint i = 0; i < LOBE_COUNT; ++i)
+            totalWeight += lobes[i].weight;
+
+        if (totalWeight > 0.0f)
+        {
+            const float targetWeightSum = 2.0f; // 双面 ±n
+            float scale = targetWeightSum / totalWeight;
+
+            for (uint i = 0; i < LOBE_COUNT; ++i)
+                lobes[i].weight *= scale;
+        }
+    }
 };
 
 enum class ABSDFDrawMode : uint32_t

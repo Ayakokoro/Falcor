@@ -241,7 +241,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 
     // Clamp far end by maxDistance (convert cell-space distance → parametric t)
     if (maxDistance > 0)
-        t_max = min(t_max, t_min + maxDistance / float(rootSize));
+        t_max = min(t_max, t_min + maxDistance);
 
     if (t_min > t_max)
         return { false, int3(0), float3(0), 0, 0, 0.0f };

@@ -292,6 +292,8 @@ void calc(uint offset)
         data.ABSDF.lobes[k].normalizeSelf(vpa_k);
     }
 
+    data.ABSDF.normalizeWeightsOnly();
+
     if (!data.IsSolid())
         return;
 

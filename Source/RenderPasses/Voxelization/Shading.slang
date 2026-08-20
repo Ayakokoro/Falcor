@@ -153,7 +153,7 @@ struct CookTorrenceCosBRDF
             return 0;
         float D = ggx(h.z, alpha);
         float G1 = 1.0 / (1.0 + Lambda(v.z, alpha));
-        return D * G1 * h.z / (4.0 * max(1e-6, v.z));
+        return D * G1 / (4.0 * max(1e-6, v.z));
     }
 #endif
 };
@@ -508,7 +508,7 @@ struct TEBSDF
     {
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
-        return coverage * surface.eval(l, v, h) * calcVisibility(l, v);
+        return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
     }
 
     float evalPdf(float3 l, float3 v, float3 h)
