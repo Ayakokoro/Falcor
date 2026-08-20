@@ -729,7 +729,7 @@ std::string VoxelizationPass::getFileName()
     oss << ToString((int3)VoxelizationBase::GlobalGridData.voxelCount);
     oss << "_";
     oss << std::to_string(mSampleFrequency);
-    oss << "_hier";  // mark as hierarchical
+    oss << "_hier_with_visible_mat";  // mark as hierarchical
     oss << ".bin";
     return oss.str();
 }
