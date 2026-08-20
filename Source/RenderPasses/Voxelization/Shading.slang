@@ -153,7 +153,7 @@ struct CookTorrenceCosBRDF
             return 0;
         float D = ggx(h.z, alpha);
         float G1 = 1.0 / (1.0 + Lambda(v.z, alpha));
-        return D * G1 * h.z / (4.0 * max(1e-6, v.z));
+        return D * G1 / (4.0 * max(1e-6, v.z));
     }
 #endif
 };
