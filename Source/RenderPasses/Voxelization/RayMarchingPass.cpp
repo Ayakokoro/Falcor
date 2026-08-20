@@ -606,7 +606,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.dropdown("Draw Mode", reinterpret_cast<ABSDFDrawMode&>(mDrawMode)))
         mOptionsChanged = true;
-    if (widget.slider("Max Bounce", mMaxBounce, 0u, 4u))
+    if (widget.slider("Max Bounce", mMaxBounce, 0u, 64u))
         mOptionsChanged = true;
     if (widget.checkbox("Display NDF", mDisplayNDF))
         mOptionsChanged = true;
