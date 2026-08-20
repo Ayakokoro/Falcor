@@ -539,6 +539,11 @@ void VoxelizationPass::uploadBuffers(RenderContext* pRenderContext)
         sizeof(OctreeNode), octreeNodeCount, ResourceBindFlags::ShaderResource);
     octreeBuffer->setBlob(polygonGenerator.mOctreeNodes.data(), 0, octreeNodeCount * sizeof(OctreeNode));
 
+    // Scratch buffer: per-polygon lobe index.
+    // localHead 是 batch 内局部索引（flushCurrent 会归零），故索引上界 = 单个 batch 面片数 <= maxPolygonCount。
+    uint scratchCount = std::max((uint)polygonGroup.maxPolygonCount, 1u);
+    mLobeOfBuffer = mpDevice->createStructuredBuffer(sizeof(uint), scratchCount, ResourceBindFlags::UnorderedAccess);
+
     if (mEnableDebug)
     {
         std::cout << "[Upload] totalNodeCount=" << totalNodeCount
@@ -590,6 +595,7 @@ void VoxelizationPass::analyzeAllNodes(RenderContext* pRenderContext)
         var[kOctreeBuffer] = octreeBuffer;
         var[kPolygonRangeBuffer] = polygonRangeBuffer;
         var[kPolygonBuffer] = polygonGroup.get(batch);
+        var["lobeOfBuffer"] = mLobeOfBuffer;
 
         uint groupVoxelCount = polygonGroup.getVoxelCount(batch);
 

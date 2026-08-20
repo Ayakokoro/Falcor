@@ -158,7 +158,7 @@ struct CookTorrenceCosBRDF
 #endif
 };
 
-// 从此结构体开始接收和返回世界空间方向，法线分布是中心对称的，只存了上半球面的Lobe
+// 从此结构体开始接收和返回世界空间方向；8 个单面 lobe 各对应一个确定法线（不做双面折叠）
 struct LobeBRDF
 {
     FrostbiteCosBRDF frostBite;
@@ -192,28 +192,19 @@ struct LobeBRDF
         specularWeight = evalSpecularWeight();
     }
 
-    // 只有l,v在平面两侧时，才会返回0
+    // 单面：背面视线（dot(v,n)<0）时由底层 v.z<=0 判据返回 0
     float3 eval(float3 l, float3 v, float3 h)
     {
-        bool negative = dot(v, n) < 0;
         l = worldToLocal(l, t, b, n);
         v = worldToLocal(v, t, b, n);
         h = worldToLocal(h, t, b, n);
-        if (negative)
-        {
-            l = -l;
-            v = -v;
-            h = -h;
-        }
         return frostBite.eval(l, v, h) + cookTorrence.eval(l, v, h);
     }
 
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)
     {
-        bool negative = dot(v, n) < 0;
+        // 前置条件：dot(v,n)>=0（SurfaceBRDF::sample 只选择前向 lobe）
         v = worldToLocal(v, t, b, n);
-        if (negative)
-            v = -v;
 
         float uEnergy = Next(sg);
         if (uEnergy <= specularWeight)
@@ -223,25 +214,13 @@ struct LobeBRDF
 
         l = localToWorld(l, t, b, n);
         h = localToWorld(h, t, b, n);
-        if (negative)
-        {
-            l = -l;
-            h = -h;
-        }
     }
-    // 只有l,v在平面两侧时，才会返回0
+
     float evalPdf(float3 l, float3 v, float3 h)
     {
-        bool negative = dot(v, n) < 0;
         l = worldToLocal(l, t, b, n);
         v = worldToLocal(v, t, b, n);
         h = worldToLocal(h, t, b, n);
-        if (negative)
-        {
-            l = -l;
-            v = -v;
-            h = -h;
-        }
         return (1 - specularWeight) * frostBite.evalPdf(l, v, h) + specularWeight * cookTorrence.evalPdf(l, v, h);
     }
 #endif
@@ -280,15 +259,35 @@ struct SurfaceBRDF
         }
     }
 
-    uint getRandomLobe(float uLobe)
+    // 当前视线 v 下所有前向 lobe（dot(n,v)>0）的权重和
+    float frontWeightSum(float3 v)
+    {
+        float sum = 0;
+        for (uint i = 0; i < lobeCount; i++)
+        {
+            if (dot(lobes[i].n, v) > 0)
+                sum += weights[i];
+        }
+        return sum;
+    }
+
+    // 在前向 lobe 中按（重归一化的）权重随机选一个
+    uint getRandomFrontLobe(float uLobe, float3 v, float frontSum)
     {
         for (uint i = 0; i < lobeCount; i++)
         {
-            uLobe -= weights[i];
-            if (uLobe <= 0)
-                return i;
+            if (dot(lobes[i].n, v) > 0)
+            {
+                uLobe -= weights[i] / frontSum;
+                if (uLobe <= 0)
+                    return i;
+            }
         }
-        return lobeCount - 1;
+        // fallback：无命中时返回第一个前向 lobe
+        for (uint i = 0; i < lobeCount; i++)
+            if (dot(lobes[i].n, v) > 0)
+                return i;
+        return 0;
     }
 
     float calcBRDFWeight()
@@ -301,25 +300,22 @@ struct SurfaceBRDF
         return sum;
     }
 
-    // 可视化法线分布时，要渲染的点在球面上的方向充当h即可
+    // 可视化法线分布时，要渲染的点在球面上的方向充当h即可（单面：仅自身半球贡献）
     inline float evalNormalDistribution(float3 h)
     {
         float sum = 0;
         for (int i = 0; i < lobeCount; i++)
         {
-            float3 n = lobes[i].n;
-            float NdotH = dot(n, h);
-            if (NdotH < 0)
-            {
-                n = -n;
-                NdotH = -NdotH;
-            }
+            float NdotH = dot(lobes[i].n, h);
+            if (NdotH <= 0)
+                continue;
             float alpha = lobes[i].cookTorrence.alpha;
             sum += weights[i] * ggx(NdotH, alpha);
         }
         return sum;
     }
 
+    // 物理 BRDF：sum_k w_k f_k，背向 lobe 底层 v.z<=0 自归零（权重不重归一）
     float3 eval(float3 l, float3 v, float3 h)
     {
         float3 sum = 0;
@@ -332,38 +328,64 @@ struct SurfaceBRDF
 
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)
     {
+        float frontSum = frontWeightSum(v);
+        if (frontSum <= 0)
+        {
+            // 无前向 lobe（背面视线）：返回无效样本，evalPdf=0
+            l = -v;
+            h = 0;
+            return;
+        }
         float uLobe = Next(sg);
-        uint index = getRandomLobe(uLobe);
-        return lobes[index].sample(v, l, h, sg);
+        uint index = getRandomFrontLobe(uLobe, v, frontSum);
+        lobes[index].sample(v, l, h, sg);
     }
 
+    // 采样密度：与 sample 一致，前向 lobe 权重按 frontSum 重归一
     float evalPdf(float3 l, float3 v, float3 h)
     {
+        float frontSum = frontWeightSum(v);
+        if (frontSum <= 0)
+            return 0;
         float pdf = 0;
         for (uint i = 0; i < lobeCount; i++)
         {
-            pdf += weights[i] * lobes[i].evalPdf(l, v, h);
+            if (dot(lobes[i].n, v) > 0)
+                pdf += (weights[i] / frontSum) * lobes[i].evalPdf(l, v, h);
         }
         return pdf;
     }
 
-    // 返回与所给方向夹角不超过90°且权重最大的法线
+    // 返回朝向给定方向（n·dir>0）且权重最大的法线；若无前向 lobe，退回最高权重 lobe 并翻转朝向
     float3 getMainNormal(float3 direction)
     {
-        float3 n = 0;
+        float3 best = 0;
         float maxWeight = 0;
+        bool found = false;
+        for (int i = 0; i < lobeCount; i++)
+        {
+            if (dot(lobes[i].n, direction) > 0 && weights[i] > maxWeight)
+            {
+                best = lobes[i].n;
+                maxWeight = weights[i];
+                found = true;
+            }
+        }
+        if (found)
+            return best;
+
+        maxWeight = 0;
         for (int i = 0; i < lobeCount; i++)
         {
             if (weights[i] > maxWeight)
             {
-                n = lobes[i].n;
-                float cosTerm = dot(n, direction);
-                if (cosTerm < 0)
-                    n = -n;
+                best = lobes[i].n;
                 maxWeight = weights[i];
             }
         }
-        return n;
+        if (dot(best, direction) < 0)
+            best = -best;
+        return best;
     }
 #endif
 };
@@ -440,7 +462,7 @@ struct TEBSDF
             coverage = 1;
     }
 
-    // 自遮挡导致入射光减少
+    // 自遮挡导致入射光减少（单向，退化形式：Λ_o=0 时的 VPA/TPA）
     float calcInternalVisibility(float3 direction)
     {
 #if !CHECK_VISIBILITY
@@ -451,6 +473,27 @@ struct TEBSDF
             return 1;
         float polygonsProjArea = polygonsProjAreaFunc.calc(direction);
         return saturate(polygonsProjArea / totalProjArea);
+    }
+
+    // Λ(ω) = (TPA(ω) - VPA(ω)) / VPA(ω)，Heitz 高度相关 Smith 的阴影因子
+    float calcLambda(float3 direction)
+    {
+        float vpa = polygonsProjAreaFunc.calc(direction);
+        if (vpa <= 0)
+            return 1e6f; // 完全遮挡 → Λ 极大，双向可见性趋于 0
+        float tpa = totalProjAreaFunc.calc(direction);
+        return max(0, (tpa - vpa) / vpa);
+    }
+
+    // 双向可见性（视线受光率）：V_vis(ωi, ωo) = (1 + Λ(ωo)) / (1 + Λ(ωi) + Λ(ωo))
+    float calcVisibility(float3 wi, float3 wo)
+    {
+#if !CHECK_VISIBILITY
+        return 1.f;
+#endif
+        float Li = calcLambda(wi);
+        float Lo = calcLambda(wo);
+        return (1.0f + Lo) / (1.0f + Li + Lo);
     }
 
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)
@@ -465,7 +508,7 @@ struct TEBSDF
     {
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
-        return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
+        return coverage * surface.eval(l, v, h) * calcVisibility(l, v);
     }
 
     float evalPdf(float3 l, float3 v, float3 h)

@@ -100,6 +100,71 @@ void rasterizeTriToMask(float2 a, float2 b, float2 c, inout uint mask[PROJ_WORDS
         }
     }
 }
+
+// 逐像素深度光栅化：在给定顶点深度 d0/d1/d2 下，把三角形覆盖到的每个像素，
+// 用重心坐标插值出深度 d，若 d < depthArr 则写入（并记录该三角形 id）。
+// 仅考虑前表面（插值深度单调），后表面被更小的深度自然覆盖。
+void rasterizeTriDepth(
+    float2 a, float2 b, float2 c,
+    float d0, float d1, float d2,
+    uint triId,
+    inout float depthArr[PROJ_RES * PROJ_RES],
+    inout uint idArr[PROJ_RES * PROJ_RES])
+{
+    float2 mn = min(a, min(b, c));
+    float2 mx = max(a, max(b, c));
+
+    int ix0 = int(floor((mn.x + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE));
+    int iy0 = int(floor((mn.y + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE));
+    int ix1 = int(floor((mx.x + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE));
+    int iy1 = int(floor((mx.y + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE));
+
+    int Rm1 = int(PROJ_RES) - 1;
+    ix0 = clampInt(ix0, 0, Rm1);
+    iy0 = clampInt(iy0, 0, Rm1);
+    ix1 = clampInt(ix1, 0, Rm1);
+    iy1 = clampInt(iy1, 0, Rm1);
+
+    // 重心坐标分母：edgeFunc(a,b,c) = -2×三角形有符号面积（退化为边视时跳过）
+    float denom = edgeFunc(a, b, c);
+    const float areaEps = 1e-8f;
+    if (abs(denom) < areaEps)
+        return; // 投影后退化为线段/点，无面积贡献
+    float invDenom = 1.0f / denom;
+
+    for (int iy = iy0; iy <= iy1; ++iy)
+    {
+        float y = -PROJ_HALF_SIZE + (float(iy) + 0.5f) * PROJ_PIXEL_SIZE;
+        for (int ix = ix0; ix <= ix1; ++ix)
+        {
+            float x = -PROJ_HALF_SIZE + (float(ix) + 0.5f) * PROJ_PIXEL_SIZE;
+            float2 p = float2(x, y);
+
+            float e0 = edgeFunc(b, c, p);
+            float e1 = edgeFunc(c, a, p);
+            float e2 = edgeFunc(a, b, p);
+
+            const float eps = 1e-6f;
+            bool hasNeg = (e0 < -eps) || (e1 < -eps) || (e2 < -eps);
+            bool hasPos = (e0 > eps) || (e1 > eps) || (e2 > eps);
+            if (hasNeg && hasPos)
+                continue; // 在三角形外
+
+            // 重心坐标（相对顶点 a/b/c 的权重）
+            float w0 = e0 * invDenom;
+            float w1 = e1 * invDenom;
+            float w2 = e2 * invDenom;
+            float d = w0 * d0 + w1 * d1 + w2 * d2;
+
+            uint idx = uint(iy) * PROJ_RES + uint(ix);
+            if (d < depthArr[idx])
+            {
+                depthArr[idx] = d;
+                idArr[idx] = triId;
+            }
+        }
+    }
+}
 #endif
 
 END_NAMESPACE_FALCOR

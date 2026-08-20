@@ -209,6 +209,45 @@ struct PolygonRange
         uint covered = calcVisibleProjCellsRaster(polygons, direction);
         return float(covered) * (PROJ_PIXEL_SIZE * PROJ_PIXEL_SIZE);
     }
+
+    // 沿 direction 对节点内所有面片做正交投影深度光栅化，得到每像素最前表面的
+    // 全局面片索引（localHead+s）。depthArr/idArr 为 PROJ_RES^2 的小数组（调用方提供）。
+    // polygon.vertices 是 node-local [0,1]^3 坐标，投影中心取节点中心 cellInt+0.5。
+    void rasterizeDepth(
+        StructuredBuffer<Polygon> polygons, float3 direction,
+        inout float depthArr[PROJ_RES * PROJ_RES],
+        inout uint idArr[PROJ_RES * PROJ_RES])
+    {
+        Basis2 b = orthonormal_basis(normalize(direction));
+        float3 ref = float3(cellInt) + 0.5f;
+
+        for (uint s = 0; s < count; s++)
+        {
+            Polygon poly = polygons[localHead + s];
+            uint n = poly.count;
+            if (n < 3)
+                continue;
+
+            float2 pv[MAX_VERTEX_COUNT];
+            float dv[MAX_VERTEX_COUNT];
+            for (uint k = 0; k < n; k++)
+            {
+                float3 p = poly.vertices[k] - ref;
+                pv[k] = float2(dot(p, b.u), dot(p, b.w));
+                // 深度取负：direction 指向观察者一侧（外向法线），
+                // 离观察者越近的表面的 dot(p,direction) 越大，
+                // 取负后越近的表面深度值越小，rasterizeTriDepth 的 min 比较才能选中前表面
+                dv[k] = -dot(p, direction);
+            }
+
+            uint globalId = localHead + s; // 全局面片号（batch 内唯一，用于 scratch 缓冲索引）
+            // 三角扇分解
+            for (uint k = 1; k + 1 < n; k++)
+            {
+                rasterizeTriDepth(pv[0], pv[k], pv[k + 1], dv[0], dv[k], dv[k + 1], globalId, depthArr, idArr);
+            }
+        }
+    }
 #endif
 };
 

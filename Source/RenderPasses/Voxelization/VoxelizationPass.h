@@ -72,6 +72,7 @@ protected:
     ref<Buffer> pBuffer;
     ref<Buffer> octreeBuffer;
     ref<Buffer> polygonRangeBuffer;
+    ref<Buffer> mLobeOfBuffer;    // 每面片所属 lobe（scratch，batch 内全局面片号索引）
 
     ref<Texture> mSphericalFuncMap;   // precomputed exact-value texture
     ref<Texture> mSplittingErrorMap;  // splitting error texture (RGBA: GT, Approx, Error, unused)
