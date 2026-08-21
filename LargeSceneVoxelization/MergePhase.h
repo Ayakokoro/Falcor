@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <iostream>
 #include <cstring>
+#include <chrono>
 
 namespace MergePhase {
 
@@ -22,17 +23,49 @@ struct MergeResult {
     uint64_t totalLeaves    = 0;
 };
 
-// Lightweight reference to a polygon entry in a shard file.
+// Lightweight reference to a polygon entry in the in-memory payload arena.
 // Used for in-memory sorting during merge (24 bytes each).
 struct ShardEntryRef {
     uint64_t nodeKey;
-    uint32_t shardIdx;       // which shard file
-    uint64_t shardOffset;    // byte offset in shard file (points to dataSize field)
+    uint64_t payloadOffset;  // offset in the in-memory payload arena
     uint32_t dataSize;       // size of serialized polygon bytes
-
-    // Total bytes of the shard entry (nodeKey + dataSize + polygon)
-    uint64_t entryByteSize() const { return sizeof(uint64_t) + sizeof(uint32_t) + dataSize; }
 };
+
+// LSD radix sort for 64-bit node keys.
+// The merge input contains a very large number of small fixed-shape refs;
+// radix sort avoids the comparison and branch overhead of std::sort.
+inline void radixSortRefs(std::vector<ShardEntryRef>& refs) {
+    if (refs.size() < 2) return;
+
+    constexpr uint32_t RADIX_BITS = 16;
+    constexpr uint32_t RADIX_SIZE = 1u << RADIX_BITS;
+    constexpr uint64_t RADIX_MASK = RADIX_SIZE - 1u;
+
+    std::vector<ShardEntryRef> scratch(refs.size());
+    std::vector<size_t> counts(RADIX_SIZE);
+
+    for (uint32_t pass = 0; pass < 4; pass++) {
+        std::fill(counts.begin(), counts.end(), size_t(0));
+        uint32_t shift = pass * RADIX_BITS;
+
+        for (const auto& ref : refs)
+            counts[(ref.nodeKey >> shift) & RADIX_MASK]++;
+
+        size_t offset = 0;
+        for (size_t i = 0; i < counts.size(); i++) {
+            size_t count = counts[i];
+            counts[i] = offset;
+            offset += count;
+        }
+
+        for (const auto& ref : refs) {
+            size_t& dst = counts[(ref.nodeKey >> shift) & RADIX_MASK];
+            scratch[dst++] = ref;
+        }
+
+        refs.swap(scratch);
+    }
+}
 
 // Read all shard files, collect entry references, sort by nodeKey,
 // merge into per-leaf contiguous polygons.dat + leaves.idx, build octree.
@@ -48,24 +81,39 @@ inline MergeResult execute(
     fs::path leavesIdxPath  = mergeDir / "leaves.idx";
     fs::path polygonsDatPath = mergeDir / "polygons.dat";
 
-    // ---- Step 1: Scan all shard files, collect entry references ----
+    auto scanStart = std::chrono::steady_clock::now();
+
+    // ---- Step 1: Scan all shard files and load polygon payloads ----
+    // The old implementation kept file offsets and performed one seek/read
+    // for every sorted reference. That turns a sequential shard scan into a
+    // large random-I/O workload. Since merge memory is available, keep the
+    // serialized polygon bytes in one arena and sort references to that arena.
     std::vector<ShardEntryRef> refs;
+    std::vector<char> payloadArena;
     uint64_t totalPolygons = 0;
+
+    if (clipResult.totalPolygonsClipped <= refs.max_size())
+        refs.reserve((size_t)clipResult.totalPolygonsClipped);
 
     std::cout << "  [Merge] Scanning " << clipResult.shardFiles.size()
               << " shard files..." << std::endl;
 
-    // Keep all shard files open for Step 3 data copy
-    std::vector<std::ifstream> shardStreams;
-    shardStreams.reserve(clipResult.shardFiles.size());
+    // Reserve an upper bound to avoid repeatedly moving a multi-GB arena.
+    uint64_t payloadCapacity = 0;
+    for (const auto& shardPath : clipResult.shardFiles) {
+        std::error_code ec;
+        uint64_t fileSize = fs::file_size(shardPath, ec);
+        if (!ec && fileSize > sizeof(PolygonSerializer::ShardHeader))
+            payloadCapacity += fileSize - sizeof(PolygonSerializer::ShardHeader);
+    }
+    if (payloadCapacity <= payloadArena.max_size())
+        payloadArena.reserve((size_t)payloadCapacity);
 
     for (uint32_t si = 0; si < (uint32_t)clipResult.shardFiles.size(); si++) {
         std::ifstream in(clipResult.shardFiles[si], std::ios::binary);
         if (!in) {
             std::cerr << "  [Merge] WARNING: cannot open shard "
                       << clipResult.shardFiles[si] << std::endl;
-            // Push a dummy stream to keep indices aligned
-            shardStreams.emplace_back();
             continue;
         }
 
@@ -73,49 +121,55 @@ inline MergeResult execute(
         if (!PolygonSerializer::readShardHeader(in, hdr)) {
             std::cerr << "  [Merge] WARNING: invalid shard header in "
                       << clipResult.shardFiles[si] << std::endl;
-            shardStreams.emplace_back();
             continue;
         }
 
-        // Read all entries from this shard, recording their positions
+        // Read all entries from this shard sequentially.
         uint64_t nodeKey;
         uint32_t dataSize;
         while (true) {
-            std::streampos entryStart = in.tellg();
             if (!in.read(reinterpret_cast<char*>(&nodeKey), sizeof(uint64_t))) break;
             if (!in.read(reinterpret_cast<char*>(&dataSize), sizeof(uint32_t))) break;
 
+            uint64_t payloadOffset = payloadArena.size();
+            size_t oldSize = payloadArena.size();
+            payloadArena.resize(oldSize + dataSize);
+            if (!in.read(payloadArena.data() + oldSize, dataSize)) {
+                payloadArena.resize(oldSize);
+                std::cerr << "  [Merge] WARNING: truncated polygon payload in "
+                          << clipResult.shardFiles[si] << std::endl;
+                break;
+            }
+
             ShardEntryRef ref;
-            ref.nodeKey     = nodeKey;
-            ref.shardIdx    = si;
-            ref.shardOffset = (uint64_t)entryStart + sizeof(uint64_t);  // points to dataSize
-            ref.dataSize    = dataSize;
+            ref.nodeKey      = nodeKey;
+            ref.payloadOffset = payloadOffset;
+            ref.dataSize      = dataSize;
             refs.push_back(ref);
             totalPolygons++;
-
-            // Skip the serialized polygon bytes
-            in.seekg(dataSize, std::ios::cur);
         }
-
-        // Re-open for data reading in Step 3
-        in.close();
-        shardStreams.emplace_back(clipResult.shardFiles[si], std::ios::binary);
-        // Skip header in the reopened stream
-        shardStreams.back().seekg(sizeof(PolygonSerializer::ShardHeader));
     }
 
     std::cout << "  [Merge] Collected " << refs.size()
               << " polygon entry references" << std::endl;
+    std::cout << "  [Merge] Loaded " << payloadArena.size()
+              << " serialized payload bytes into memory" << std::endl;
+    auto scanEnd = std::chrono::steady_clock::now();
+    std::cout << "  [Merge] Scan/load time: "
+              << std::chrono::duration<double>(scanEnd - scanStart).count()
+              << "s" << std::endl;
 
     // ---- Step 2: Sort by nodeKey ----
-    std::cout << "  [Merge] Sorting by nodeKey..." << std::endl;
-    std::sort(refs.begin(), refs.end(),
-        [](const ShardEntryRef& a, const ShardEntryRef& b) {
-            return a.nodeKey < b.nodeKey;
-        });
+    std::cout << "  [Merge] Radix-sorting by nodeKey..." << std::endl;
+    auto sortStart = std::chrono::steady_clock::now();
+    radixSortRefs(refs);
+    auto sortEnd = std::chrono::steady_clock::now();
+    std::cout << "  [Merge] Sort time: "
+              << std::chrono::duration<double>(sortEnd - sortStart).count()
+              << "s" << std::endl;
 
     // ---- Step 3: Stream through sorted refs, group by nodeKey,
-    //              copy polygon data from shards to polygons.dat ----
+    //              copy polygon data to polygons.dat ----
     std::cout << "  [Merge] Merging into " << polygonsDatPath.filename().string()
               << "..." << std::endl;
 
@@ -128,8 +182,18 @@ inline MergeResult execute(
     std::vector<PolygonSerializer::LeafIndex> leafIndices;
     std::unordered_set<uint64_t> leafKeys;
 
-    // Buffer for reading polygon data from shard files
-    std::vector<char> readBuf;
+    // Large output buffer avoids one ostream write call per polygon.
+    constexpr size_t OUTPUT_BUFFER_SIZE = 4u * 1024u * 1024u;
+    std::vector<char> outputBuffer;
+    outputBuffer.reserve(OUTPUT_BUFFER_SIZE);
+    uint64_t outputOffset = 0;
+
+    auto flushOutputBuffer = [&]() {
+        if (outputBuffer.empty()) return;
+        polyOut.write(outputBuffer.data(), (std::streamsize)outputBuffer.size());
+        outputOffset += outputBuffer.size();
+        outputBuffer.clear();
+    };
 
     uint64_t currentKey = 0;
     uint64_t currentOffset = 0;
@@ -139,7 +203,7 @@ inline MergeResult execute(
     for (const auto& ref : refs) {
         if (firstGroup) {
             currentKey = ref.nodeKey;
-            currentOffset = (uint64_t)polyOut.tellp();
+            currentOffset = outputOffset + outputBuffer.size();
             currentCount = 0;
             firstGroup = false;
         } else if (ref.nodeKey != currentKey) {
@@ -149,23 +213,23 @@ inline MergeResult execute(
 
             // Start new leaf
             currentKey = ref.nodeKey;
-            currentOffset = (uint64_t)polyOut.tellp();
+            currentOffset = outputOffset + outputBuffer.size();
             currentCount = 0;
         }
 
-        // Copy polygon data from the shard file to polygons.dat
-        // The shard has: [nodeKey: u64][dataSize: u32][polygon data]
-        // We need to read just the polygon data (dataSize bytes after dataSize field)
-        auto& shardIn = shardStreams[ref.shardIdx];
-        shardIn.seekg(ref.shardOffset);  // position at dataSize field
-        uint32_t dataSize;
-        shardIn.read(reinterpret_cast<char*>(&dataSize), sizeof(uint32_t));
-
-        if (readBuf.size() < dataSize)
-            readBuf.resize(dataSize);
-        shardIn.read(readBuf.data(), dataSize);
-
-        polyOut.write(readBuf.data(), dataSize);
+        // Copy polygon data from the in-memory payload arena.
+        const char* payload = payloadArena.data() + ref.payloadOffset;
+        if (ref.dataSize > OUTPUT_BUFFER_SIZE) {
+            flushOutputBuffer();
+            polyOut.write(payload, ref.dataSize);
+            outputOffset += ref.dataSize;
+        } else {
+            if (outputBuffer.size() + ref.dataSize > OUTPUT_BUFFER_SIZE)
+                flushOutputBuffer();
+            size_t oldSize = outputBuffer.size();
+            outputBuffer.resize(oldSize + ref.dataSize);
+            std::memcpy(outputBuffer.data() + oldSize, payload, ref.dataSize);
+        }
         currentCount++;
     }
 
@@ -175,15 +239,21 @@ inline MergeResult execute(
         leafKeys.insert(currentKey);
     }
 
+    flushOutputBuffer();
     polyOut.close();
 
-    // Close all shard streams
-    for (auto& s : shardStreams)
-        if (s.is_open()) s.close();
+    auto writeEnd = std::chrono::steady_clock::now();
+    std::cout << "  [Merge] Merge/write time: "
+              << std::chrono::duration<double>(writeEnd - sortEnd).count()
+              << "s" << std::endl;
 
-    // ---- Step 4: Sort leaf indices by nodeKey and write leaves.idx ----
-    std::sort(leafIndices.begin(), leafIndices.end(),
-        [](const auto& a, const auto& b) { return a.nodeKey < b.nodeKey; });
+    // No longer needed after polygons.dat has been written.
+    std::vector<ShardEntryRef>().swap(refs);
+    std::vector<char>().swap(payloadArena);
+
+    // refs are already sorted by nodeKey, so leafIndices were emitted in
+    // sorted order while grouping. Avoid a second O(leafCount log leafCount)
+    // sort here.
 
     {
         std::ofstream idxOut(leavesIdxPath, std::ios::binary | std::ios::trunc);

@@ -10,6 +10,7 @@
 #include <mutex>
 #include <thread>
 #include <iostream>
+#include <cassert>
 
 class PolygonGenerator {
 public:
@@ -32,17 +33,50 @@ public:
     std::vector<uint32_t> mOctreeNodeCounts;
     uint32_t mOctreeMaxDepth = 0;
 
-    // Node key encoding: level (8 bits) | cell coords (10 bits each)
+    // Node key encoding v2:
+    //   bits [0..18]   : cell x (19 bits)
+    //   bits [19..37]  : cell y (19 bits)
+    //   bits [38..56]  : cell z (19 bits)
+    //   bits [57..61]  : level (5 bits)
+    //   bits [62..63]  : reserved
+    //
+    // The previous encoding used only 10 bits per coordinate, which caused
+    // collisions as soon as a leaf grid exceeded 1024^3 (maxDepth >= 11).
+    static constexpr uint NODE_KEY_COORD_BITS = 19;
+    static constexpr uint NODE_KEY_LEVEL_BITS = 5;
+    static constexpr uint NODE_KEY_LEVEL_SHIFT = NODE_KEY_COORD_BITS * 3;
+    static constexpr uint NODE_KEY_MAX_DEPTH = NODE_KEY_COORD_BITS;
+    static constexpr uint64_t NODE_KEY_COORD_MASK =
+        (uint64_t(1) << NODE_KEY_COORD_BITS) - 1;
+    static constexpr uint64_t NODE_KEY_LEVEL_MASK =
+        (uint64_t(1) << NODE_KEY_LEVEL_BITS) - 1;
+
+    static_assert(NODE_KEY_LEVEL_SHIFT + NODE_KEY_LEVEL_BITS <= 64);
+
     static uint64_t makeNodeKey(uint level, const int3& cellInt) {
+        assert(level <= NODE_KEY_MAX_DEPTH);
+        assert(cellInt.x >= 0 && cellInt.y >= 0 && cellInt.z >= 0);
+        const uint maxCoord = 1u << level;
+        assert((uint)cellInt.x < maxCoord &&
+               (uint)cellInt.y < maxCoord &&
+               (uint)cellInt.z < maxCoord);
+
         uint64_t ck = (uint64_t)(uint32_t)cellInt.x
-                    | ((uint64_t)(uint32_t)cellInt.y << 10)
-                    | ((uint64_t)(uint32_t)cellInt.z << 20);
-        return ((uint64_t)level << 32) | ck;
+                    | ((uint64_t)(uint32_t)cellInt.y << NODE_KEY_COORD_BITS)
+                    | ((uint64_t)(uint32_t)cellInt.z << (NODE_KEY_COORD_BITS * 2));
+        return ((uint64_t)level << NODE_KEY_LEVEL_SHIFT) | ck;
     }
-    static uint levelFromKey(uint64_t key) { return (uint)(key >> 32); }
+
+    static uint levelFromKey(uint64_t key) {
+        return (uint)((key >> NODE_KEY_LEVEL_SHIFT) & NODE_KEY_LEVEL_MASK);
+    }
+
     static int3 cellFromKey(uint64_t key) {
-        uint32_t ck = (uint32_t)(key & 0xFFFFFFFFull);
-        return int3((int)(ck & 0x3FF), (int)((ck >> 10) & 0x3FF), (int)((ck >> 20) & 0x3FF));
+        return int3(
+            (int)(key & NODE_KEY_COORD_MASK),
+            (int)((key >> NODE_KEY_COORD_BITS) & NODE_KEY_COORD_MASK),
+            (int)((key >> (NODE_KEY_COORD_BITS * 2)) & NODE_KEY_COORD_MASK)
+        );
     }
 
     explicit PolygonGenerator(GridData& gd) : gridData(gd) {}

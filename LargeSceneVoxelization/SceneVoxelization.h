@@ -54,6 +54,12 @@ public:
         setupGrid(scene);
 
         uint resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+        if (resolution > (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH)) {
+            std::cerr << "Grid resolution " << resolution
+                      << " exceeds nodeKey capacity (max "
+                      << (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH) << ")" << std::endl;
+            return false;
+        }
         mMaxDepth = 0;
         while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 
@@ -781,6 +787,12 @@ inline bool SceneVoxelization::processDisk(
     setupGrid(scene);
 
     uint32_t resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+    if (resolution > (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH)) {
+        std::cerr << "Grid resolution " << resolution
+                  << " exceeds nodeKey capacity (max "
+                  << (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH) << ")" << std::endl;
+        return false;
+    }
     mMaxDepth = 0;
     while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 

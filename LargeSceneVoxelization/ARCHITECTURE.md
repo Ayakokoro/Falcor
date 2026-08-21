@@ -1,5 +1,9 @@
 # SceneVoxelization 磁盘化流水线架构设计
 
+> NodeKey 当前格式为 v2：19 bit 的 x/y/z 坐标 + 5 bit level，支持到 maxDepth=19（最高 524288 网格）。旧的 10 bit 坐标格式和 version=1 的中间文件不可与当前实现混用。
+>
+> 当前 Merge 实现优先利用可用内存：顺序扫描 shard，将序列化 Polygon 放入内存 arena，使用 64-bit radix sort，并以 4 MiB 缓冲批量写出；hash-bucket 方案保留为内存不足时的后备设计。
+
 ## 一、当前架构分析
 
 ### 现有流程（全内存）
@@ -158,13 +162,13 @@ void clipWorker(int threadId,
 ┌────────────────────────────────────────────────────┐
 │ Header                                              │
 │   magic:       uint32  (0x564F5843 = "VOXC")       │
-│   version:     uint32  (1)                          │
+│   version:     uint32  (2)                          │
 │   threadId:    uint32                               │
 │   entryCount:  uint64  (记录总数，写完 header 后回填) │
 │   reserved:    uint64                               │
 ├────────────────────────────────────────────────────┤
 │ Entry 0                                             │
-│   nodeKey:     uint64  (level<<32 | cell编码)       │
+│   nodeKey:     uint64  (v2: 19-bit x/y/z + 5-bit level)│
 │   polyCount:   uint32                               │
 │   polygon[0..polyCount-1]: SerializedPolygon        │
 ├────────────────────────────────────────────────────┤
@@ -257,7 +261,7 @@ Round 2: Sort & Merge
 ┌─────────────────────────────────────────┐
 │ Header                                   │
 │   magic:        uint32  (0x49444C56)    │
-│   version:      uint32  (1)             │
+│   version:      uint32  (2)             │
 │   leafCount:    uint64                  │
 │   maxDepth:     uint32                  │
 │   reserved:     uint32                  │
@@ -350,7 +354,7 @@ void buildOctreeFromLeaves(
         uint64_t key = leaf.nodeKey;
         while (true) {
             occupiedNodes.insert(key);
-            uint level = key >> 32;
+            uint level = PolygonGenerator::levelFromKey(key);
             if (level == 0) break;
             int3 cell = cellFromKey(key);
             int3 parentCell = cell / 2;

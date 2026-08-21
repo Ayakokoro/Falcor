@@ -62,10 +62,10 @@ inline bool readShardEntry(std::istream& is, uint64_t& nodeKey, Polygon& poly) {
     return is.good();
 }
 
-// --- Shard file header (28 bytes) ---
+// --- Shard file header ---
 struct ShardHeader {
     uint32_t magic    = 0x564F5843;   // "VOXC"
-    uint32_t version  = 1;
+    uint32_t version  = 2;             // v2 uses the collision-free nodeKey encoding
     uint32_t threadId = 0;
     uint64_t entryCount = 0;          // patched after all writes
     uint64_t reserved = 0;
@@ -77,7 +77,7 @@ inline void writeShardHeader(std::ostream& os, const ShardHeader& hdr) {
 
 inline bool readShardHeader(std::istream& is, ShardHeader& hdr) {
     is.read(reinterpret_cast<char*>(&hdr), sizeof(ShardHeader));
-    return is.good() && hdr.magic == 0x564F5843 && hdr.version == 1;
+    return is.good() && hdr.magic == 0x564F5843 && hdr.version == 2;
 }
 
 // Patch entryCount in an already-written shard header
@@ -91,7 +91,7 @@ inline void patchShardEntryCount(std::ostream& os, uint64_t count) {
 // Followed by leafCount * LeafIndex (24 bytes each)
 
 constexpr uint32_t LEAVES_IDX_MAGIC   = 0x49444C56;  // "VLDI"
-constexpr uint32_t LEAVES_IDX_VERSION = 1;
+constexpr uint32_t LEAVES_IDX_VERSION = 2;  // v2 uses the collision-free nodeKey encoding
 
 struct LeafIndex {
     uint64_t nodeKey    = 0;
