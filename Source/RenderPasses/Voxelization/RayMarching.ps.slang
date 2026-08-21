@@ -13,14 +13,14 @@ import Utils.Sampling.UniformSampleGenerator;
 #define MAX_OCTREE_DEPTH 12
 #endif
 
+#ifndef RAY_MARCHING_BUFFER_COUNT
+#define RAY_MARCHING_BUFFER_COUNT 1
+#endif
+
 #define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
-StructuredBuffer<TEBSDF> gBuffer0;
-StructuredBuffer<TEBSDF> gBuffer1;
-StructuredBuffer<TEBSDF> gBuffer2;
-StructuredBuffer<Ellipsoid> pBuffer0;
-StructuredBuffer<Ellipsoid> pBuffer1;
-StructuredBuffer<Ellipsoid> pBuffer2;
+StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
+StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
 
 RWStructuredBuffer<float4> selectedVoxel;
@@ -48,8 +48,7 @@ cbuffer CB
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
-    uint gbSplit0;      // boundary between buffer [0] and [1]
-    uint gbSplit1;      // boundary between buffer [1] and [2]
+    uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
 }
 
@@ -81,24 +80,38 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
-TEBSDF loadGBuffer(uint globalIdx, uint split0, uint split1)
+uint getBufferIndex(uint globalIdx)
 {
-    if (globalIdx < split0) return gBuffer0[globalIdx];
-    else if (globalIdx < split1) return gBuffer1[globalIdx - split0];
-    else return gBuffer2[globalIdx - split1];
+    [unroll]
+    for (uint i = 0; i < RAY_MARCHING_BUFFER_COUNT; ++i)
+    {
+        if (globalIdx < gbSplits[i])
+            return i;
+    }
+    return RAY_MARCHING_BUFFER_COUNT - 1;
 }
 
-Ellipsoid loadPBuffer(uint globalIdx, uint split0, uint split1)
+uint getBufferOffset(uint globalIdx, uint bufferIndex)
 {
-    if (globalIdx < split0) return pBuffer0[globalIdx];
-    else if (globalIdx < split1) return pBuffer1[globalIdx - split0];
-    else return pBuffer2[globalIdx - split1];
+    return globalIdx - (bufferIndex == 0 ? 0 : gbSplits[bufferIndex - 1]);
+}
+
+TEBSDF loadGBuffer(uint globalIdx)
+{
+    uint bufferIndex = getBufferIndex(globalIdx);
+    return gBuffer[bufferIndex][getBufferOffset(globalIdx, bufferIndex)];
+}
+
+Ellipsoid loadPBuffer(uint globalIdx)
+{
+    uint bufferIndex = getBufferIndex(globalIdx);
+    return pBuffer[bufferIndex][getBufferOffset(globalIdx, bufferIndex)];
 }
 
 // Extract max roughness across all lobes of a TEBSDF at gbIndex
 float maxRoughness(uint gbIndex)
 {
-    TEBSDF bsdf = loadGBuffer(gbIndex, gbSplit0, gbSplit1);
+    TEBSDF bsdf = loadGBuffer(gbIndex);
     float r = 0;
     for (uint i = 0; i < bsdf.surface.lobeCount; i++)
         r = max(r, bsdf.surface.lobes[i].frostBite.rough);
@@ -142,7 +155,7 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 #if !CHECK_ELLIPSOID
     return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
 #else
-    Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
+    Ellipsoid ellipsoid = loadPBuffer(gbIndex);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
     if (hit.hit)
         return hit;
@@ -439,7 +452,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     float times = MAX_BOUNCE;
     while (times > 0)
     {
-        TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
+        TEBSDF bsdf = loadGBuffer(offset);
         coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend);
         if (coverage >= 1 - transmittanceThreshold)
         {
@@ -458,8 +471,8 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
-    TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
-    Ellipsoid e = loadPBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF bsdf = loadGBuffer(offset);
+    Ellipsoid e = loadPBuffer(offset);
     float result = 0;
     switch (drawMode)
     {
@@ -498,7 +511,7 @@ float3 debugShading(HitResult hit, float3 v)
 
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
-    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(offset);
     BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend);
     return lightColor * BSDF.eval(l, v, h);
 }
@@ -506,7 +519,7 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
-    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(offset);
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -537,7 +550,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     for (int i = 0; i < bounce; i++)
     {
         uint offset = hits[i].gbIndex;
-        TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+        TEBSDF BSDF = loadGBuffer(offset);
         float3 currentV = i == 0 ? v : -ls[i - 1];
         BSDF.updateCoverage(currentV, transmittanceThreshold, coverageBlend);
         BSDF.sample(currentV, ls[i], hs[i], sg);
@@ -636,7 +649,7 @@ float4 renderBackground(float3 direction)
 // LOD heatmap hue modulated by N·L and shadow.
 float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
 {
-    TEBSDF BSDF = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(hit.gbIndex);
     float3 posW = gridMin + hit.cell * voxelSize;
 
     LightSample ls = {};
@@ -727,8 +740,8 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
-            Ellipsoid e = loadPBuffer(hit.gbIndex, gbSplit0, gbSplit1);
-            TEBSDF bsdf = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+            Ellipsoid e = loadPBuffer(hit.gbIndex);
+            TEBSDF bsdf = loadGBuffer(hit.gbIndex);
 
             float bSum = abs(e.B[0][0]) + abs(e.B[0][1]) + abs(e.B[0][2])
                        + abs(e.B[1][0]) + abs(e.B[1][1]) + abs(e.B[1][2])

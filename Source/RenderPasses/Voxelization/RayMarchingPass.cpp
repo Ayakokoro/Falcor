@@ -3,15 +3,80 @@
 #include "Math/SphericalHarmonics.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/FalcorMath.h"
+#include <algorithm>
+#include <execution>
 #include <fstream>
 #include <filesystem>
+#include <limits>
 
 namespace
 {
 const std::string kShaderFile = "RenderPasses/Voxelization/RayMarching.ps.slang";
 const std::string kDisplayShaderFile = "RenderPasses/Voxelization/DisplayNDF.ps.slang";
-const std::string kPrepareProgramFile = "RenderPasses/Voxelization/PrepareShadingData.cs.slang";
 const std::string kOutputColor = "color";
+const std::string kBufferCountDefine = "RAY_MARCHING_BUFFER_COUNT";
+constexpr size_t kRayMarchingBufferByteLimit = size_t(1) << 30; // 1 GiB per resource.
+
+// Host-side conversion replicating TEBSDF::init + SurfaceBRDF::init + LobeBRDF::init
+// (Shading.slang) so the raw VoxelData never has to be staged on the GPU.
+inline void buildTBNHost(float3 n, float3& t, float3& b)
+{
+    float3 up = (std::abs(n.z) < 0.999f) ? float3(0, 0, 1) : float3(1, 0, 0);
+    t = normalize(cross(up, n));
+    b = cross(n, t);
+}
+
+TEBSDF convertVoxelData(const VoxelData& data)
+{
+    const float kMinRough = 0.01f;  // matches Shading.slang MinRough
+    TEBSDF gb{};
+    gb.area = data.ABSDF.area;
+    gb.coverage = 12345.0f;  // sentinel, matches PrepareShadingData.cs.slang
+
+    if (gb.area > 0)
+    {
+        gb.primitiveProjAreaFunc = data.primitiveProjAreaFunc;
+        gb.polygonsProjAreaFunc = data.polygonsProjAreaFunc;
+        gb.totalProjAreaFunc = data.totalProjAreaFunc;
+
+        SurfaceBRDF& surface = gb.surface;
+        uint lobeCount = 0;
+        for (uint i = 0; i < LOBE_COUNT; i++)
+        {
+            const ABSDFLobe& lobe = data.ABSDF.lobes[i];
+            if (lobe.weight > 0 && dot(lobe.normal, lobe.normal) > 0)
+            {
+                LobeBRDF& l = surface.lobes[lobeCount];
+                l.n = lobe.normal;
+                buildTBNHost(l.n, l.t, l.b);
+                float rough = max(lobe.rough, kMinRough);
+                l.frostBite.diffuse = lobe.diffuse;
+                l.frostBite.rough = rough;
+                l.cookTorrence.specular = lobe.specular;
+                l.cookTorrence.alpha = rough * rough;
+                float3 spec = l.cookTorrence.specular;
+                l.specularWeight = saturate((20 * (spec.x + spec.y + spec.z) / 3 + 1) / 21.0f);
+                surface.weights[lobeCount] = lobe.weight;
+                lobeCount++;
+            }
+        }
+        if (lobeCount == 0)
+        {
+            LobeBRDF& l = surface.lobes[0];
+            l.n = float3(0, 0, 1);
+            buildTBNHost(l.n, l.t, l.b);
+            l.frostBite.diffuse = float3(0);
+            l.frostBite.rough = kMinRough;
+            l.cookTorrence.specular = float3(0);
+            l.cookTorrence.alpha = kMinRough * kMinRough;
+            l.specularWeight = saturate(1.0f / 21.0f);
+            surface.weights[0] = 1.0f;
+            lobeCount = 1;
+        }
+        surface.lobeCount = lobeCount;
+    }
+    return gb;
+}
 } // namespace
 
 RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
@@ -78,18 +143,6 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
     if (!mComplete)
     {
-        if (!mPreparePass)
-        {
-            ProgramDesc desc;
-            desc.addShaderModules(mpScene->getShaderModules());
-            desc.addShaderLibrary(kPrepareProgramFile).csEntry("main");
-            desc.addTypeConformances(mpScene->getTypeConformances());
-
-            DefineList defines;
-            defines.add(mpScene->getSceneDefines());
-            mPreparePass = ComputePass::create(mpDevice, desc, defines, true);
-        }
-
         GridData& gd = VoxelizationBase::GlobalGridData;
 
         std::ifstream f;
@@ -198,157 +251,107 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // Split data across buffers to avoid D3D12 i32 offset overflow:
         // structured buffer byte offset = elementIndex * stride.
         // For 388-byte TEBSDF, max safe index per buffer = (2^31-1)/388 ≈ 5,534,751.
-        uint32_t totalVoxels = gd.solidVoxelCount;
-        const uint32_t kMaxSafeBytes = 0x7FFFFFFFu;  // 2^31 - 1
-        uint32_t maxElemsPerBuffer = kMaxSafeBytes / sizeof(TEBSDF);  // ~5.5M
-        uint32_t numSplits = (totalVoxels + maxElemsPerBuffer - 1) / maxElemsPerBuffer;
+        const uint32_t totalVoxels = gd.solidVoxelCount;
+        const size_t maxElemsPerBuffer = kRayMarchingBufferByteLimit / sizeof(TEBSDF);
+        FALCOR_CHECK(maxElemsPerBuffer > 0, "TEBSDF is larger than the ray-marching buffer limit.");
 
-        uint32_t count0 = min(maxElemsPerBuffer, totalVoxels);
-        uint32_t count1 = (totalVoxels > maxElemsPerBuffer) ? min(maxElemsPerBuffer, totalVoxels - maxElemsPerBuffer) : 0;
-        uint32_t count2 = (totalVoxels > maxElemsPerBuffer * 2) ? (totalVoxels - maxElemsPerBuffer * 2) : 0;
-        uint32_t gbSplit0 = count0;
-        uint32_t gbSplit1 = count0 + count1;
+        const size_t splitCount64 = totalVoxels == 0
+            ? 1
+            : (size_t(totalVoxels) + maxElemsPerBuffer - 1) / maxElemsPerBuffer;
+        FALCOR_CHECK(splitCount64 <= std::numeric_limits<uint32_t>::max(), "Too many ray-marching buffer splits.");
+        const uint32_t splitCount = static_cast<uint32_t>(splitCount64);
+
+        std::vector<uint32_t> counts(splitCount, 0);
+        std::vector<uint32_t> bases(splitCount, 0);
+        std::vector<uint32_t> splits(splitCount, 0);
+        size_t globalBase = 0;
+        for (uint32_t b = 0; b < splitCount; ++b)
+        {
+            bases[b] = static_cast<uint32_t>(globalBase);
+            const size_t count = std::min(maxElemsPerBuffer, size_t(totalVoxels) - globalBase);
+            counts[b] = static_cast<uint32_t>(count);
+            globalBase += count;
+            splits[b] = static_cast<uint32_t>(globalBase);
+        }
 
         // Debug: print struct sizes
         std::cout << "sizeof(VoxelData)=" << sizeof(VoxelData)
                   << " sizeof(TEBSDF)=" << sizeof(TEBSDF)
                   << " sizeof(Ellipsoid)=" << sizeof(Ellipsoid) << std::endl;
-        std::cout << "MaxElemsPerBuffer=" << maxElemsPerBuffer << " splits=" << numSplits << std::endl;
-        std::cout << "count0=" << count0 << " ("
-                  << (count0 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer0)"
-                  << std::endl;
-        if (count1 > 0)
-            std::cout << "count1=" << count1 << " ("
-                      << (count1 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer1)"
+        std::cout << "RayMarching buffers=" << splitCount
+                  << ", maxElementsPerBuffer=" << maxElemsPerBuffer
+                  << ", maxGBufferBytes=" << kRayMarchingBufferByteLimit << std::endl;
+        for (uint32_t b = 0; b < splitCount; ++b)
+        {
+            std::cout << "count[" << b << "]=" << counts[b]
+                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0))
+                      << " MB gBuffer)" << std::endl;
+        }
+
+        // Convert VoxelData -> TEBSDF on the CPU and upload only the final
+        // gBuffer (TEBSDF) + pBuffer (Ellipsoid), split into chunks to avoid
+        // the D3D12 2^31-1 byte-offset limit. The raw VoxelData is never staged
+        // on the GPU, keeping VRAM at gBuffer + pBuffer only.
+        std::vector<ref<Buffer>> gBuffers(splitCount);
+        std::vector<ref<Buffer>> pBuffers(splitCount);
+
+        for (uint32_t b = 0; b < splitCount; ++b)
+        {
+            if (counts[b] == 0)
+                continue;
+
+            std::vector<TEBSDF> gbChunk(counts[b]);
+            std::vector<Ellipsoid> pChunk(counts[b]);
+
+            // Conversion is pure/read-only with respect to voxelData, so let
+            // the standard parallel algorithm use the CPU worker threads.
+            // GPU resource creation and setBlob() stay on this render thread.
+            const auto sourceBegin = voxelData.begin() + bases[b];
+            const auto sourceEnd = sourceBegin + counts[b];
+            std::transform(
+                std::execution::par_unseq,
+                sourceBegin,
+                sourceEnd,
+                gbChunk.begin(),
+                [](const VoxelData& data) { return convertVoxelData(data); }
+            );
+            std::transform(
+                std::execution::par_unseq,
+                sourceBegin,
+                sourceEnd,
+                pChunk.begin(),
+                [](const VoxelData& data) { return data.ellipsoid; }
+            );
+
+            gBuffers[b] = mpDevice->createStructuredBuffer(
+                sizeof(TEBSDF), counts[b],
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                MemoryType::DeviceLocal
+            );
+            pBuffers[b] = mpDevice->createStructuredBuffer(
+                sizeof(Ellipsoid), counts[b],
+                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+                MemoryType::DeviceLocal
+            );
+            std::cout << "gBuffer[" << b << "]: " << (gBuffers[b] ? "OK" : "NULL!")
+                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB)"
                       << std::endl;
-        if (count2 > 0)
-            std::cout << "count2=" << count2 << " ("
-                      << (count2 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer2)"
+            std::cout << "pBuffer[" << b << "]: " << (pBuffers[b] ? "OK" : "NULL!")
+                      << " (" << (size_t(counts[b]) * sizeof(Ellipsoid) / (1024.0 * 1024.0)) << " MB)"
                       << std::endl;
-
-        auto pVoxelDataBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(VoxelData), count0, ResourceBindFlags::ShaderResource
-        );
-        std::cout << "voxelDataBuffer0: " << (pVoxelDataBuffer0 ? "OK" : "NULL!") << std::endl;
-        if (pVoxelDataBuffer0)
-            pVoxelDataBuffer0->setBlob(voxelData.data(), 0, count0 * sizeof(VoxelData));
-
-        ref<Buffer> pVoxelDataBuffer1 = nullptr, pVoxelDataBuffer2 = nullptr;
-        if (count1 > 0)
-        {
-            pVoxelDataBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(VoxelData), count1, ResourceBindFlags::ShaderResource
-            );
-            std::cout << "voxelDataBuffer1: " << (pVoxelDataBuffer1 ? "OK" : "NULL!") << std::endl;
-            if (pVoxelDataBuffer1)
-                pVoxelDataBuffer1->setBlob(voxelData.data() + count0, 0, count1 * sizeof(VoxelData));
-        }
-        if (count2 > 0)
-        {
-            pVoxelDataBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(VoxelData), count2, ResourceBindFlags::ShaderResource
-            );
-            std::cout << "voxelDataBuffer2: " << (pVoxelDataBuffer2 ? "OK" : "NULL!") << std::endl;
-            if (pVoxelDataBuffer2)
-                pVoxelDataBuffer2->setBlob(voxelData.data() + count0 + count1, 0, count2 * sizeof(VoxelData));
+            if (gBuffers[b])
+                gBuffers[b]->setBlob(gbChunk.data(), 0, size_t(counts[b]) * sizeof(TEBSDF));
+            if (pBuffers[b])
+                pBuffers[b]->setBlob(pChunk.data(), 0, size_t(counts[b]) * sizeof(Ellipsoid));
         }
 
-        auto pGBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(TEBSDF), count0,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-            MemoryType::DeviceLocal
-        );
-        std::cout << "gBuffer0: " << (pGBuffer0 ? "OK" : "NULL!") << std::endl;
-
-        ref<Buffer> pGBuffer1 = nullptr, pGBuffer2 = nullptr;
-        if (count1 > 0)
-        {
-            pGBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), count1,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "gBuffer1: " << (pGBuffer1 ? "OK" : "NULL!") << std::endl;
-        }
-        if (count2 > 0)
-        {
-            pGBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), count2,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "gBuffer2: " << (pGBuffer2 ? "OK" : "NULL!") << std::endl;
-        }
-
-        auto pPBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(Ellipsoid), count0,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-            MemoryType::DeviceLocal
-        );
-        std::cout << "pBuffer0: " << (pPBuffer0 ? "OK" : "NULL!") << std::endl;
-
-        ref<Buffer> pPBuffer1 = nullptr, pPBuffer2 = nullptr;
-        if (count1 > 0)
-        {
-            pPBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(Ellipsoid), count1,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "pBuffer1: " << (pPBuffer1 ? "OK" : "NULL!") << std::endl;
-        }
-        if (count2 > 0)
-        {
-            pPBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(Ellipsoid), count2,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "pBuffer2: " << (pPBuffer2 ? "OK" : "NULL!") << std::endl;
-        }
-
-        // Prepare pass: bind buffers and dispatch
-        ShaderVar var = mPreparePass->getRootVar();
-        var["voxelDataBuffer0"] = pVoxelDataBuffer0;
-        if (count1 > 0)
-            var["voxelDataBuffer1"] = pVoxelDataBuffer1;
-        if (count2 > 0)
-            var["voxelDataBuffer2"] = pVoxelDataBuffer2;
-        var["gBuffer0"] = pGBuffer0;
-        if (count1 > 0)
-            var["gBuffer1"] = pGBuffer1;
-        if (count2 > 0)
-            var["gBuffer2"] = pGBuffer2;
-        var["pBuffer0"] = pPBuffer0;
-        if (count1 > 0)
-            var["pBuffer1"] = pPBuffer1;
-        if (count2 > 0)
-            var["pBuffer2"] = pPBuffer2;
-
-        auto cb = var["CB"];
-        cb["voxelCount"] = totalVoxels;
-        cb["gbSplit0"] = gbSplit0;
-        cb["gbSplit1"] = gbSplit1;
-
-        const uint32_t kMaxThreads = 65535u * 256u;
-        for (uint32_t base = 0; base < totalVoxels; base += kMaxThreads)
-        {
-            uint32_t chunkVoxels = min(totalVoxels - base, kMaxThreads);
-            cb["baseOffset"] = base;
-            mPreparePass->execute(pRenderContext, uint3(chunkVoxels, 1, 1));
-        }
-
+        // Flush the uploads before Step 2 reads the buffers.
         pRenderContext->submit(true);
 
-        // Store as member variables
-        mGBuffer0 = pGBuffer0;
-        mGBuffer1 = pGBuffer1;
-        mGBuffer2 = pGBuffer2;
-        mPBuffer0 = pPBuffer0;
-        mPBuffer1 = pPBuffer1;
-        mPBuffer2 = pPBuffer2;
-        mGBufferSplit0 = gbSplit0;
-        mGBufferSplit1 = gbSplit1;
+        mGBuffers = std::move(gBuffers);
+        mPBuffers = std::move(pBuffers);
+        mGBufferSplits = std::move(splits);
+        mBufferCount = splitCount;
         mOctreeBuffer = pOctreeBuffer;
         mOctreeMaxDepth = maxDepth;
         mOctreeNodeCounts = std::move(nodeCounts);
@@ -378,7 +381,9 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             desc.addShaderLibrary(kShaderFile).psEntry("main");
             desc.setShaderModel(ShaderModel::SM6_5);
             desc.addTypeConformances(mpScene->getTypeConformances());
-            mpFullScreenPass = FullScreenPass::create(mpDevice, desc, mpScene->getSceneDefines());
+            DefineList defines = mpScene->getSceneDefines();
+            defines.add(kBufferCountDefine, std::to_string(mBufferCount));
+            mpFullScreenPass = FullScreenPass::create(mpDevice, desc, defines);
         }
         pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), float4(-1));
 
@@ -416,12 +421,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         if (pEnvMap)
             mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
 
-        var["gBuffer0"] = mGBuffer0;
-        var["gBuffer1"] = mGBuffer1;
-        var["gBuffer2"] = mGBuffer2;
-        var["pBuffer0"] = mPBuffer0;
-        var["pBuffer1"] = mPBuffer1;
-        var["pBuffer2"] = mPBuffer2;
+        for (size_t i = 0; i < mGBuffers.size(); ++i)
+        {
+            var["gBuffer"][i] = mGBuffers[i];
+            var["pBuffer"][i] = mPBuffers[i];
+        }
         var["octreeBuffer"] = mOctreeBuffer;
         var["selectedVoxel"] = mSelectedVoxel;
 
@@ -445,8 +449,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
-        cb["gbSplit0"] = mGBufferSplit0;
-        cb["gbSplit1"] = mGBufferSplit1;
+        for (size_t i = 0; i < mGBufferSplits.size(); ++i)
+            cb["gbSplits"][i] = mGBufferSplits[i];
         cb["coverageBlend"] = mCoverageBlend;
         mFrameIndex++;
 
@@ -460,18 +464,19 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             ProgramDesc desc;
             desc.addShaderLibrary(kDisplayShaderFile).psEntry("main");
             desc.setShaderModel(ShaderModel::SM6_5);
-            mpDisplayNDFPass = FullScreenPass::create(mpDevice, desc);
+            DefineList defines;
+            defines.add(kBufferCountDefine, std::to_string(mBufferCount));
+            mpDisplayNDFPass = FullScreenPass::create(mpDevice, desc, defines);
         }
         auto var = mpDisplayNDFPass->getRootVar();
-        var["gBuffer0"] = mGBuffer0;
-        var["gBuffer1"] = mGBuffer1;
-        var["gBuffer2"] = mGBuffer2;
+        for (size_t i = 0; i < mGBuffers.size(); ++i)
+            var["gBuffer"][i] = mGBuffers[i];
         var["selectedVoxel"] = mSelectedVoxel;
 
         auto cb = var["CB"];
         cb["clearColor"] = float4(mClearColor, 0);
-        cb["gbSplit0"] = mGBufferSplit0;
-        cb["gbSplit1"] = mGBufferSplit1;
+        for (size_t i = 0; i < mGBufferSplits.size(); ++i)
+            cb["gbSplits"][i] = mGBufferSplits[i];
 
         mpFbo->attachColorTarget(pOutputColor, 0);
         mpDisplayNDFPass->execute(pRenderContext, mpFbo);
@@ -543,6 +548,20 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
             f.close();
 
+            // The buffer count is part of the shader resource layout. Drop the
+            // old resources and passes before the next execute() computes the
+            // new count, otherwise a reload with a different scene size would
+            // use the previous fixed array layout.
+            mGBuffers.clear();
+            mPBuffers.clear();
+            mGBufferSplits.clear();
+            mOctreeBuffer = nullptr;
+            mOctreeMaxDepth = 0;
+            mOctreeNodeCounts.clear();
+            mBufferCount = 1;
+            mpFullScreenPass = nullptr;
+            mpDisplayNDFPass = nullptr;
+
             requestRecompile();
             mComplete = false;
             mOptionsChanged = true;
@@ -554,6 +573,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Grid Min: " + ToString(gridData.gridMin));
     widget.text("Solid Voxel Count: " + std::to_string(gridData.solidVoxelCount));
     widget.text("Solid Rate: " + std::to_string(gridData.solidVoxelCount / (float)gridData.totalVoxelCount()));
+    widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
 
@@ -652,7 +672,6 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mpScene = pScene;
     mpFullScreenPass = nullptr;
     mpDisplayNDFPass = nullptr;
-    mPreparePass = nullptr;
     mDebug = false;
     mUseEmissiveLight = false;
 }

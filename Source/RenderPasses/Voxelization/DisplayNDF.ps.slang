@@ -3,23 +3,35 @@
 #include "Voxel/VoxelGrid.slang"
 #include "VoxelizationShared.slang"
 
-StructuredBuffer<TEBSDF> gBuffer0;
-StructuredBuffer<TEBSDF> gBuffer1;
-StructuredBuffer<TEBSDF> gBuffer2;
+#ifndef RAY_MARCHING_BUFFER_COUNT
+#define RAY_MARCHING_BUFFER_COUNT 1
+#endif
+
+StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<float4> selectedVoxel; // 前三个分量表示相机指向体素的方向
 
 cbuffer CB
 {
     float4 clearColor;
-    uint gbSplit0;
-    uint gbSplit1;
+    uint gbSplits[RAY_MARCHING_BUFFER_COUNT];
 }
 
-TEBSDF loadGBuffer(uint globalIdx, uint split0, uint split1)
+uint getBufferIndex(uint globalIdx)
 {
-    if (globalIdx < split0) return gBuffer0[globalIdx];
-    else if (globalIdx < split1) return gBuffer1[globalIdx - split0];
-    else return gBuffer2[globalIdx - split1];
+    [unroll]
+    for (uint i = 0; i < RAY_MARCHING_BUFFER_COUNT; ++i)
+    {
+        if (globalIdx < gbSplits[i])
+            return i;
+    }
+    return RAY_MARCHING_BUFFER_COUNT - 1;
+}
+
+TEBSDF loadGBuffer(uint globalIdx)
+{
+    uint bufferIndex = getBufferIndex(globalIdx);
+    uint localIdx = globalIdx - (bufferIndex == 0 ? 0 : gbSplits[bufferIndex - 1]);
+    return gBuffer[bufferIndex][localIdx];
 }
 
 struct PsOut
@@ -27,9 +39,9 @@ struct PsOut
     float4 color : SV_Target0;
 };
 
-float3 calcColor(float2 localCoord, int offset, float3 v, uint gbSplit0, uint gbSplit1)
+float3 calcColor(float2 localCoord, int offset, float3 v)
 {
-    SurfaceBRDF BRDF = loadGBuffer(offset, gbSplit0, gbSplit1).surface;
+    SurfaceBRDF BRDF = loadGBuffer(offset).surface;
     float3 t, b;
     buildTBN(t, b, v);
 
@@ -53,7 +65,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         localCoord = localCoord * 2 - 1;                                                      // 映射到[-1,1]
         if (length(localCoord) <= 1)
         {
-            psOut.color = float4(calcColor(localCoord, (int)vo.w, vo.xyz, gbSplit0, gbSplit1), 1);
+            psOut.color = float4(calcColor(localCoord, (int)vo.w, vo.xyz), 1);
         }
     }
     return psOut;

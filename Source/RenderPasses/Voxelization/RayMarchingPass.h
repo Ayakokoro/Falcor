@@ -30,7 +30,6 @@ private:
     ref<Device> mpDevice;
     ref<FullScreenPass> mpFullScreenPass;
     ref<FullScreenPass> mpDisplayNDFPass;
-    ref<ComputePass> mPreparePass;
     ref<Sampler> mpPointSampler;
     ref<Buffer> mSelectedVoxel;
     ref<Buffer> mpSelectedVoxelStaging;
@@ -66,15 +65,13 @@ private:
     uint2 mSelectedPixel;
     uint mSelectedResolution;
 
-    // Triple buffer to avoid i32 overflow (>2³¹ bytes per buffer with 388-byte stride)
-    ref<Buffer> mGBuffer0;
-    ref<Buffer> mGBuffer1;
-    ref<Buffer> mGBuffer2;
-    ref<Buffer> mPBuffer0;
-    ref<Buffer> mPBuffer1;
-    ref<Buffer> mPBuffer2;
-    uint32_t mGBufferSplit0 = 0;
-    uint32_t mGBufferSplit1 = 0;
+    // Dynamically-sized split buffers keep each resource below the byte-offset limit.
+    // The data index stored in the octree remains a global voxel index. The
+    // buffers below contain consecutive ranges of that index space.
+    std::vector<ref<Buffer>> mGBuffers;
+    std::vector<ref<Buffer>> mPBuffers;
+    std::vector<uint32_t> mGBufferSplits; // Exclusive global end index per buffer.
+    uint32_t mBufferCount = 1;
     ref<Buffer> mOctreeBuffer;
     uint32_t mOctreeMaxDepth = 0;
     std::vector<uint32_t> mOctreeNodeCounts;

@@ -1,20 +1,17 @@
 #include "Shading.slang"
 
-StructuredBuffer<VoxelData> voxelDataBuffer0;
-StructuredBuffer<VoxelData> voxelDataBuffer1;
-StructuredBuffer<VoxelData> voxelDataBuffer2;
-RWStructuredBuffer<TEBSDF> gBuffer0;
-RWStructuredBuffer<TEBSDF> gBuffer1;
-RWStructuredBuffer<TEBSDF> gBuffer2;
-RWStructuredBuffer<Ellipsoid> pBuffer0;
-RWStructuredBuffer<Ellipsoid> pBuffer1;
-RWStructuredBuffer<Ellipsoid> pBuffer2;
+#ifndef RAY_MARCHING_BUFFER_COUNT
+#define RAY_MARCHING_BUFFER_COUNT 1
+#endif
+
+StructuredBuffer<VoxelData> voxelDataBuffer[RAY_MARCHING_BUFFER_COUNT];
+RWStructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
+RWStructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 
 cbuffer CB
 {
     uint voxelCount;
-    uint gbSplit0;     // boundary between buffer [0] and [1]
-    uint gbSplit1;     // boundary between buffer [1] and [2]
+    uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     uint baseOffset;   // start index for this dispatch chunk
 }
 
@@ -25,30 +22,22 @@ void main(uint3 tid: SV_DispatchThreadID)
     if (offset >= voxelCount)
         return;
 
-    if (offset < gbSplit0)
+    uint bufferIndex = 0;
+    [unroll]
+    for (uint i = 0; i < RAY_MARCHING_BUFFER_COUNT; ++i)
     {
-        TEBSDF gb;
-        gb.init(voxelDataBuffer0[offset]);
-        gb.coverage = 12345.0f;  // sentinel
-        gBuffer0[offset] = gb;
-        pBuffer0[offset] = voxelDataBuffer0[offset].ellipsoid;
+        if (offset < gbSplits[i])
+        {
+            bufferIndex = i;
+            break;
+        }
     }
-    else if (offset < gbSplit1)
-    {
-        uint idx = offset - gbSplit0;
-        TEBSDF gb;
-        gb.init(voxelDataBuffer1[idx]);
-        gb.coverage = 12345.0f;
-        gBuffer1[idx] = gb;
-        pBuffer1[idx] = voxelDataBuffer1[idx].ellipsoid;
-    }
-    else
-    {
-        uint idx = offset - gbSplit1;
-        TEBSDF gb;
-        gb.init(voxelDataBuffer2[idx]);
-        gb.coverage = 12345.0f;
-        gBuffer2[idx] = gb;
-        pBuffer2[idx] = voxelDataBuffer2[idx].ellipsoid;
-    }
+    uint localIndex = offset - (bufferIndex == 0 ? 0 : gbSplits[bufferIndex - 1]);
+    VoxelData data = voxelDataBuffer[bufferIndex][localIndex];
+
+    TEBSDF gb;
+    gb.init(data);
+    gb.coverage = 12345.0f;  // sentinel
+    gBuffer[bufferIndex][localIndex] = gb;
+    pBuffer[bufferIndex][localIndex] = data.ellipsoid;
 }
