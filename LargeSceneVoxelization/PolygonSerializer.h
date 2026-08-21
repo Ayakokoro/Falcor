@@ -86,59 +86,59 @@ inline void patchShardEntryCount(std::ostream& os, uint64_t count) {
     os.write(reinterpret_cast<const char*>(&count), sizeof(uint64_t));
 }
 
-// --- leaves.idx ---
-// Header: magic|version|leafCount|maxDepth|reserved
-// Followed by leafCount * LeafIndex (24 bytes each)
+// --- nodes.idx ---
+// Header: magic|version|nodeCount|maxDepth|reserved
+// Followed by nodeCount * NodeIndex (24 bytes each)
 
-constexpr uint32_t LEAVES_IDX_MAGIC   = 0x49444C56;  // "VLDI"
-constexpr uint32_t LEAVES_IDX_VERSION = 1;
+constexpr uint32_t NODES_IDX_MAGIC   = 0x49444C56;  // "VLDI"
+constexpr uint32_t NODES_IDX_VERSION = 1;
 
-struct LeafIndex {
+struct NodeIndex {
     uint64_t nodeKey    = 0;
     uint64_t dataOffset = 0;    // offset into polygons.dat
     uint32_t polyCount  = 0;
     uint32_t padding    = 0;
 };
 
-struct LeavesIdxHeader {
-    uint32_t magic     = LEAVES_IDX_MAGIC;
-    uint32_t version   = LEAVES_IDX_VERSION;
-    uint64_t leafCount = 0;
+struct NodesIdxHeader {
+    uint32_t magic     = NODES_IDX_MAGIC;
+    uint32_t version   = NODES_IDX_VERSION;
+    uint64_t nodeCount = 0;
     uint32_t maxDepth  = 0;
     uint32_t reserved  = 0;
 };
 
-inline void writeLeavesIdxHeader(std::ostream& os, const LeavesIdxHeader& hdr) {
-    os.write(reinterpret_cast<const char*>(&hdr), sizeof(LeavesIdxHeader));
+inline void writeNodesIdxHeader(std::ostream& os, const NodesIdxHeader& hdr) {
+    os.write(reinterpret_cast<const char*>(&hdr), sizeof(NodesIdxHeader));
 }
 
-inline bool readLeavesIdxHeader(std::istream& is, LeavesIdxHeader& hdr) {
-    is.read(reinterpret_cast<char*>(&hdr), sizeof(LeavesIdxHeader));
-    return is.good() && hdr.magic == LEAVES_IDX_MAGIC && hdr.version == LEAVES_IDX_VERSION;
+inline bool readNodesIdxHeader(std::istream& is, NodesIdxHeader& hdr) {
+    is.read(reinterpret_cast<char*>(&hdr), sizeof(NodesIdxHeader));
+    return is.good() && hdr.magic == NODES_IDX_MAGIC && hdr.version == NODES_IDX_VERSION;
 }
 
-inline void writeLeafIndices(std::ostream& os, const std::vector<LeafIndex>& indices) {
+inline void writeNodeIndices(std::ostream& os, const std::vector<NodeIndex>& indices) {
     os.write(reinterpret_cast<const char*>(indices.data()),
-             indices.size() * sizeof(LeafIndex));
+             indices.size() * sizeof(NodeIndex));
 }
 
-inline void readLeafIndices(std::istream& is, std::vector<LeafIndex>& indices, uint64_t count) {
+inline void readNodeIndices(std::istream& is, std::vector<NodeIndex>& indices, uint64_t count) {
     indices.resize(count);
-    is.read(reinterpret_cast<char*>(indices.data()), count * sizeof(LeafIndex));
+    is.read(reinterpret_cast<char*>(indices.data()), count * sizeof(NodeIndex));
 }
 
 // --- polygons.dat ---
-// Each leaf block: [polyCount: u32][serializedPolygon[polyCount]]
-// Leaves are stored in bucket-hash order; leaves.idx provides the offset mapping.
+// Each node block: [serializedPolygon[polyCount]].  nodes.idx provides the
+// offset and count for every occupied octree node.
 
-inline void writeLeafBlock(std::ostream& os, const std::vector<Polygon>& polys) {
+inline void writeNodeBlock(std::ostream& os, const std::vector<Polygon>& polys) {
     uint32_t count = (uint32_t)polys.size();
     os.write(reinterpret_cast<const char*>(&count), sizeof(uint32_t));
     for (const auto& poly : polys)
         writePolygon(os, poly);
 }
 
-inline uint32_t readLeafBlock(std::istream& is, std::vector<Polygon>& polys) {
+inline uint32_t readNodeBlock(std::istream& is, std::vector<Polygon>& polys) {
     uint32_t count;
     is.read(reinterpret_cast<char*>(&count), sizeof(uint32_t));
     polys.resize(count);

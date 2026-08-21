@@ -50,6 +50,48 @@ inline uint32_t maskCountBits(const uint32_t mask[PROJ_WORDS]) {
     return sum;
 }
 
+// Rasterize one projected triangle and keep the nearest interpolated depth.
+// This is the CPU counterpart of Projection.slang::rasterizeTriDepth().
+inline void rasterizeTriDepth(const float2& a, const float2& b, const float2& c,
+                              float d0, float d1, float d2, uint32_t triId,
+                              float depth[PROJ_RES * PROJ_RES],
+                              uint32_t ids[PROJ_RES * PROJ_RES]) {
+    float2 mn = glm::min(a, glm::min(b, c));
+    float2 mx = glm::max(a, glm::max(b, c));
+    int ix0 = clampInt((int)std::floor((mn.x + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE), 0, PROJ_RES - 1);
+    int iy0 = clampInt((int)std::floor((mn.y + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE), 0, PROJ_RES - 1);
+    int ix1 = clampInt((int)std::floor((mx.x + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE), 0, PROJ_RES - 1);
+    int iy1 = clampInt((int)std::floor((mx.y + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE), 0, PROJ_RES - 1);
+
+    float denom = edgeFunc(a, b, c);
+    if (std::abs(denom) < 1e-8f)
+        return;
+    float invDenom = 1.0f / denom;
+
+    for (int iy = iy0; iy <= iy1; ++iy) {
+        float y = -PROJ_HALF_SIZE + (float(iy) + 0.5f) * PROJ_PIXEL_SIZE;
+        for (int ix = ix0; ix <= ix1; ++ix) {
+            float x = -PROJ_HALF_SIZE + (float(ix) + 0.5f) * PROJ_PIXEL_SIZE;
+            float2 p(x, y);
+            float e0 = edgeFunc(b, c, p);
+            float e1 = edgeFunc(c, a, p);
+            float e2 = edgeFunc(a, b, p);
+            const float eps = 1e-6f;
+            bool hasNeg = (e0 < -eps) || (e1 < -eps) || (e2 < -eps);
+            bool hasPos = (e0 > eps) || (e1 > eps) || (e2 > eps);
+            if (hasNeg && hasPos)
+                continue;
+
+            float interpolatedDepth = (e0 * d0 + e1 * d1 + e2 * d2) * invDenom;
+            uint32_t index = (uint32_t)iy * PROJ_RES + (uint32_t)ix;
+            if (interpolatedDepth < depth[index]) {
+                depth[index] = interpolatedDepth;
+                ids[index] = triId;
+            }
+        }
+    }
+}
+
 inline void rasterizeTriToMask(const float2& a, const float2& b, const float2& c, uint32_t mask[PROJ_WORDS]) {
     float2 mn = glm::min(a, glm::min(b, c));
     float2 mx = glm::max(a, glm::max(b, c));
@@ -120,5 +162,31 @@ struct PolygonRange {
 
     float calcVisibleProjAreaRaster(const std::vector<Polygon>& polygons, const float3& direction) const {
         return float(calcVisibleProjCellsRaster(polygons, direction)) * (PROJ_PIXEL_SIZE * PROJ_PIXEL_SIZE);
+    }
+
+    void rasterizeDepth(const std::vector<Polygon>& polygons, const float3& direction,
+                        float depth[PROJ_RES * PROJ_RES],
+                        uint32_t ids[PROJ_RES * PROJ_RES]) const {
+        Basis2 b = orthonormal_basis(safeNormalize(direction));
+        float3 ref = float3(cellInt) + float3(0.5f);
+
+        for (uint s = 0; s < count; ++s) {
+            const Polygon& poly = polygons[localHead + s];
+            if (poly.count < 3)
+                continue;
+
+            float2 projected[MAX_VERTEX_COUNT];
+            float depths[MAX_VERTEX_COUNT];
+            for (uint k = 0; k < poly.count; ++k) {
+                float3 p = poly.vertices[k] - ref;
+                projected[k] = float2(dot(p, b.u), dot(p, b.w));
+                depths[k] = -dot(p, direction);
+            }
+
+            for (uint k = 1; k + 1 < poly.count; ++k)
+                rasterizeTriDepth(projected[0], projected[k], projected[k + 1],
+                                   depths[0], depths[k], depths[k + 1],
+                                   localHead + s, depth, ids);
+        }
     }
 };

@@ -19,11 +19,14 @@ public:
     std::vector<std::vector<Polygon>> polygonArrays;
     std::vector<PolygonRange> polygonRangeBuffer;
 
-    // Hierarchical clip: per-node polygon storage (leaf-only after modification)
+    // Hierarchical clip: every occupied node owns the polygons clipped at that
+    // level.  The polygon vertices are in the node's normalized voxel space
+    // (nodeCell .. nodeCell + 1), matching the renderer's Polygon buffer.
     std::unordered_map<uint64_t, std::vector<Polygon>> mNodePolygonMap;
 
-    // Occupied node set: marks which octree nodes exist (have geometry in subtree).
-    // Used by finalizeBFS for structure traversal; mNodePolygonMap holds leaf-only polygon data.
+    // Occupied node set: marks nodes that survived hierarchical clipping.
+    // It is kept separately from the polygon map so a per-node safety cap does
+    // not accidentally remove the node from the octree.
     std::unordered_set<uint64_t> mOccupiedNodes;
 
     struct BFSNodeInfo { int3 cellInt; uint level; };
@@ -32,7 +35,13 @@ public:
     std::vector<uint32_t> mOctreeNodeCounts;
     uint32_t mOctreeMaxDepth = 0;
 
-    // Node key encoding: level (8 bits) | cell coords (10 bits each)
+    // Node key encoding: level (8 bits) | cell coords (10 bits each).
+    // This is the same compact key used by VoxelizationPass.  Consequently a
+    // 1024^3 grid is the largest grid addressable by this standalone tool.
+    static constexpr uint NODE_KEY_COORD_BITS = 10;
+    static constexpr uint NODE_KEY_MAX_DEPTH = NODE_KEY_COORD_BITS;
+    static constexpr uint NODE_KEY_MAX_RESOLUTION = 1u << NODE_KEY_MAX_DEPTH;
+
     static uint64_t makeNodeKey(uint level, const int3& cellInt) {
         uint64_t ck = (uint64_t)(uint32_t)cellInt.x
                     | ((uint64_t)(uint32_t)cellInt.y << 10)
@@ -73,8 +82,12 @@ private:
     void flushPending(std::vector<PendingHierClip>& pending) {
         if (pending.empty()) return;
         std::lock_guard<std::mutex> lock(mNodeMapMutex);
-        for (auto& p : pending)
-            mNodePolygonMap[p.nodeKey].push_back(p.poly);
+        for (auto& p : pending) {
+            mOccupiedNodes.insert(p.nodeKey);
+            auto& polygons = mNodePolygonMap[p.nodeKey];
+            if (polygons.size() < SAFE_PER_NODE_POLYGON_LIMIT)
+                polygons.push_back(p.poly);
+        }
         pending.clear();
     }
 
@@ -98,15 +111,8 @@ private:
         polygon.triRef.triangleID = triangleID;
         polygon.triRef.materialID = mesh.materialID;
 
-        {
-            uint64_t nodeKey = makeNodeKey(level, nodeCell);
-            // Mark node as occupied (needed for finalizeBFS which checks mOccupiedNodes)
-            mOccupiedNodes.insert(nodeKey);
-            auto it = mNodePolygonMap.find(nodeKey);
-            uint currentCount = (it != mNodePolygonMap.end()) ? (uint)it->second.size() : 0u;
-            if (currentCount < SAFE_PER_NODE_POLYGON_LIMIT)
-                pending.push_back({nodeKey, polygon});
-        }
+        uint64_t nodeKey = makeNodeKey(level, nodeCell);
+        pending.push_back({nodeKey, polygon});
 
         if (level >= maxDepth) return;
 
@@ -175,6 +181,7 @@ public:
             numThreads = std::max(1u, std::thread::hardware_concurrency());
 
         mNodePolygonMap.clear();
+        mOccupiedNodes.clear();
 
         uint totalTriangles = 0;
         for (auto& m : meshList) totalTriangles += m.triangleCount;
@@ -202,7 +209,8 @@ public:
         finalizeBFS(maxDepth);
     }
 
-    // BFS: build octree node array, gBuffer, polygonArrays from clip result
+    // BFS: build octree node array, gBuffer, polygonArrays and polygon ranges
+    // from the all-level hierarchical clip result.
     void finalizeBFS(uint maxDepth, uint rootLevel = 0, const int3& rootCell_ = int3(0, 0, 0)) {
         mBFSOrder.clear(); mOctreeNodes.clear();
         mOctreeNodeCounts.assign(maxDepth + 1, 0);
@@ -242,12 +250,11 @@ public:
         uint bfsIdx = 0;
         for (auto& bfsItem : mBFSOrder) {
             uint64_t nodeKey = makeNodeKey(bfsItem.level, bfsItem.cellInt);
-            // Only leaf nodes have polygon data in mNodePolygonMap
             auto mapIt = mNodePolygonMap.find(nodeKey);
             if (mapIt != mNodePolygonMap.end() && !mapIt->second.empty())
                 polygonArrays.push_back(std::move(mapIt->second));
             else
-                polygonArrays.emplace_back();  // empty for non-leaf nodes
+                polygonArrays.emplace_back();
 
             PolygonRange range;
             range.init(bfsItem.cellInt);

@@ -594,7 +594,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
                 // Clamp fireflies from low-pdf BSDF samples:
                 // a lit diffuse surface is ~0.25, so 10.0 catches spikes
                 // while leaving normal indirect paths untouched.
-                incidentLight = min(incidentLight, 10.0);
+                // incidentLight = min(incidentLight, 10.0);
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
         }

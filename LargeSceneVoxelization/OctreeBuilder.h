@@ -9,8 +9,8 @@
 
 namespace OctreeBuilder {
 
-// Output of building the octree from a set of occupied node keys.
-// Mirrors the relevant outputs of PolygonGenerator after finalizeBFS().
+// Output of building the octree from the occupied node keys produced by the
+// all-level hierarchical clip.  This mirrors PolygonGenerator::finalizeBFS().
 struct OctreeResult {
     // BFS traversal order: one entry per occupied node
     std::vector<PolygonGenerator::BFSNodeInfo> bfsOrder;
@@ -18,18 +18,15 @@ struct OctreeResult {
     // Octree connectivity, parallel to bfsOrder
     std::vector<OctreeNode> octreeNodes;
 
-    // Per-node voxel data, parallel to bfsOrder (zeroed on construction)
-    // Leaf entries are filled by AnalyzePhase; non-leaf by aggregateParents.
+    // Per-node voxel data, parallel to bfsOrder.  Every entry is filled by
+    // AnalyzePhase from that node's own polygon block.
     std::vector<VoxelData> gBuffer;
 
     // Per-level node counts, indexed by level [0..maxDepth]
     std::vector<uint32_t> levelNodeCounts;
 
-    // Maps nodeKey -> bfsIndex for leaf nodes only.
-    // Used by AnalyzePhase to know where to write analysis results.
-    std::unordered_map<uint64_t, uint32_t> leafKeyToBFSIndex;
-
-    // All occupied keys -> bfsIndex (for parent aggregation child lookups)
+    // All occupied keys -> BFS index.
+    std::unordered_map<uint64_t, uint32_t> nodeKeyToBFSIndex;
     std::unordered_map<uint64_t, uint32_t> keyToBFSIndex;
 
     uint32_t maxDepth = 0;
@@ -37,16 +34,17 @@ struct OctreeResult {
     uint32_t totalNodes() const { return (uint32_t)gBuffer.size(); }
 };
 
-// Build octree from a set of occupied leaf node keys.
-// Automatically derives ancestor keys up to root.
-inline OctreeResult buildFromLeafKeys(
-    const std::unordered_set<uint64_t>& leafKeys,
+// Build octree from a set of occupied node keys.  Ancestors are added as a
+// safety net so the result remains a valid tree even if a caller supplies
+// sparse input.  The normal clip path already emits every ancestor itself.
+inline OctreeResult buildFromNodeKeys(
+    const std::unordered_set<uint64_t>& nodeKeys,
     uint32_t maxDepth)
 {
-    // Step 1: Collect all occupied nodes (leaves + all ancestors)
+    // Step 1: Collect all occupied nodes and their ancestors.
     std::unordered_set<uint64_t> occupiedNodes;
-    for (uint64_t leafKey : leafKeys) {
-        uint64_t key = leafKey;
+    for (uint64_t nodeKey : nodeKeys) {
+        uint64_t key = nodeKey;
         while (true) {
             occupiedNodes.insert(key);
             uint32_t level = PolygonGenerator::levelFromKey(key);
@@ -57,7 +55,6 @@ inline OctreeResult buildFromLeafKeys(
         }
     }
 
-    //
     OctreeResult result;
     result.maxDepth = maxDepth;
     result.levelNodeCounts.assign(maxDepth + 1, 0);
@@ -96,13 +93,13 @@ inline OctreeResult buildFromLeafKeys(
         }
     }
 
-    // Step 3: Allocate octree nodes and gBuffer
+    // Step 2: Allocate octree nodes and gBuffer.
     uint32_t totalNodes = (uint32_t)result.bfsOrder.size();
     result.octreeNodes.resize(totalNodes);
     result.gBuffer.resize(totalNodes);
     for (auto& vd : result.gBuffer) vd.init();
 
-    // Step 4: Build OctreeNode linkage (childBase, childMask, dataIndex)
+    // Step 3: Build OctreeNode linkage (childBase, childMask, dataIndex).
     for (uint32_t bfsIdx = 0; bfsIdx < totalNodes; bfsIdx++) {
         auto& item = result.bfsOrder[bfsIdx];
         OctreeNode& oct = result.octreeNodes[bfsIdx];
@@ -126,16 +123,8 @@ inline OctreeResult buildFromLeafKeys(
         }
     }
 
-    // Step 5: Build leafKey -> bfsIndex mapping for AnalyzePhase
-    for (uint32_t bfsIdx = 0; bfsIdx < totalNodes; bfsIdx++) {
-        auto& item = result.bfsOrder[bfsIdx];
-        if (item.level == maxDepth) {
-            uint64_t key = PolygonGenerator::makeNodeKey(item.level, item.cellInt);
-            if (leafKeys.find(key) != leafKeys.end())
-                result.leafKeyToBFSIndex[key] = bfsIdx;
-        }
-    }
-
+    // Step 4: Expose the node-key lookup used by the analysis phase.
+    result.nodeKeyToBFSIndex = allKeyToBFS;
     result.keyToBFSIndex = std::move(allKeyToBFS);
 
     std::cout << "  [OctreeBuilder] " << totalNodes << " nodes (";

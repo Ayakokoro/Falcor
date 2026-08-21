@@ -24,9 +24,9 @@ struct VoxelizationConfig {
     uint sampleFrequency = 1024;   // rays per Lebedev direction
 };
 
-// CPU scene voxelization — instanced loading, single hierarchical clip pass,
-// leaf-only polygon storage, bottom-up parent aggregation.
-// No tile subdivision — one full octree over the scene.
+// CPU scene voxelization: instanced loading, single hierarchical clip pass,
+// all-level polygon storage and independent per-node analysis.
+// No tile subdivision: one full octree over the scene.
 class SceneVoxelization {
 public:
     SceneVoxelization(const VoxelizationConfig& cfg) : mConfig(cfg) {}
@@ -36,7 +36,7 @@ public:
     void setNumThreads(uint32_t n)          { mNumThreads = n; }
     void setKeepTemp(bool keep)             { mKeepTemp = keep; }
 
-    // Existing in-memory pipeline (unchanged)
+    // In-memory pipeline: hierarchical clip, per-node analysis, then BFS/output.
     bool process(const std::string& fbxPath, const std::string& outputPath) {
         // ---- Phase 0: Load scene (instanced mode: unique meshes + transforms) ----
         std::cout << "Loading (instanced): " << fbxPath << std::endl;
@@ -54,6 +54,12 @@ public:
         setupGrid(scene);
 
         uint resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+        if (resolution > PolygonGenerator::NODE_KEY_MAX_RESOLUTION) {
+            std::cerr << "Resolution " << resolution
+                      << " exceeds the standalone node-key limit of "
+                      << PolygonGenerator::NODE_KEY_MAX_RESOLUTION << "^3." << std::endl;
+            return false;
+        }
         mMaxDepth = 0;
         while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 
@@ -62,7 +68,7 @@ public:
         std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
                   << "  maxDepth=" << mMaxDepth << std::endl;
 
-        // ---- Phase 1: Hierarchical clip (leaf-only polygon storage) ----
+        // ---- Phase 1: Hierarchical clip (all-level polygon storage) ----
         PolygonGenerator gen(mGrid);
         gen.reset();
 
@@ -95,270 +101,41 @@ public:
             }
         }
 
-        // ---- mem: after clip (before BFS, mNodePolygonMap has leaf entries) ----
+        // ---- mem: after clip (before BFS, every occupied node has entries) ----
         {
-            uint totalPoly = 0, maxPolyPerNode = 0, nonEmptyNodes = 0;
-            for (auto& kv : gen.mNodePolygonMap) {
+            uint64_t totalPoly = 0;
+            uint32_t maxPolyPerNode = 0;
+            for (const auto& kv : gen.mNodePolygonMap) {
                 uint n = (uint)kv.second.size();
                 totalPoly += n;
-                maxPolyPerNode = std::max(maxPolyPerNode, n);
-                if (n > 0) nonEmptyNodes++;
+                maxPolyPerNode = std::max(maxPolyPerNode, (uint32_t)n);
             }
-            std::cout << "  [Mem] after-clip: leafNodes=" << gen.mNodePolygonMap.size()
+            std::cout << "  [Mem] after-clip: nodes=" << gen.mNodePolygonMap.size()
                       << " totalPoly=" << totalPoly
                       << " maxPolyPerNode=" << maxPolyPerNode << std::endl;
         }
 
         gen.finalizeBFS(mMaxDepth, 0, int3(0, 0, 0));
 
-        // ---- Phase 2: Per-node analysis (reverse BFS: leaves first) ----
-        for (int nodeIdx = (int)gen.gBuffer.size() - 1; nodeIdx >= 0; nodeIdx--) {
-            uint level = gen.mBFSOrder[nodeIdx].level;
-
-            if (level == mMaxDepth) {
-                // ── LEAF: analyze from own polygon data ──
-                VoxelData& vd = gen.gBuffer[nodeIdx];
-                PolygonRange& range = gen.polygonRangeBuffer[nodeIdx];
-
-                for (uint pi = 0; pi < range.count; pi++) {
-                    const Polygon& poly = gen.polygonArrays[nodeIdx][pi];
-
-                    uint localTid   = poly.triRef.triangleID;
-                    uint meshID     = poly.triRef.meshID;
-                    uint instIdx    = poly.triRef.instanceIdx;
-                    const MeshGeometry& mesh = scene.meshes[meshID];
-                    uint matID = mesh.materialID;
-
-                    // Reconstruct original triangle in voxel space
-                    uint3 localIdx = mesh.triangles[localTid];
-                    const glm::mat4& worldM = scene.instances[instIdx].transform;
-
-                    float3 tv0 = localToVoxel(mesh.positions[localIdx.x], worldM, mGrid.gridMin, invVoxelSize);
-                    float3 tv1 = localToVoxel(mesh.positions[localIdx.y], worldM, mGrid.gridMin, invVoxelSize);
-                    float3 tv2 = localToVoxel(mesh.positions[localIdx.z], worldM, mGrid.gridMin, invVoxelSize);
-
-                    Triangle origTri;
-                    origTri.vertices[0] = tv0; origTri.vertices[1] = tv1; origTri.vertices[2] = tv2;
-                    origTri.uvs[0] = mesh.texCoords[localIdx.x];
-                    origTri.uvs[1] = mesh.texCoords[localIdx.y];
-                    origTri.uvs[2] = mesh.texCoords[localIdx.z];
-                    origTri.buildTBN();
-
-                    // Polygon centroid
-                    float dummy;
-                    float3 centroid = poly.calcCentroid(dummy);
-                    float3 leafCentroid = centroid * range.nodeScale;
-
-                    // Interpolate UV on polygon vertices
-                    float2 polyUVs[MAX_VERTEX_COUNT];
-                    for (uint vi = 0; vi < poly.count; vi++) {
-                        float3 leafVertex = poly.vertices[vi] * range.nodeScale;
-                        polyUVs[vi] = origTri.lerpUV(leafVertex);
-                    }
-                    float2 uvCenter(0);
-                    for (uint vi = 0; vi < poly.count; vi++)
-                        uvCenter += polyUVs[vi];
-                    uvCenter /= (float)poly.count;
-
-                    float uvArea = 0;
-                    for (uint vi = 0; vi < poly.count; vi++) {
-                        const float2& a = polyUVs[vi];
-                        const float2& b = polyUVs[(vi + 1) % poly.count];
-                        uvArea += a.x * b.y - a.y * b.x;
-                    }
-                    uvArea = 0.5f * std::abs(uvArea);
-
-                    // Interpolate normal
-                    float3 bary = origTri.barycentricCoordinates(leafCentroid);
-                    float3 n0 = transformNormal(mesh.normals[localIdx.x], worldM);
-                    float3 n1 = transformNormal(mesh.normals[localIdx.y], worldM);
-                    float3 n2 = transformNormal(mesh.normals[localIdx.z], worldM);
-                    float3 interpolatedNormal = safeNormalize(n0 * bary.x + n1 * bary.y + n2 * bary.z);
-
-                    // Sample textures
-                    const MaterialData& mat = scene.materials[matID];
-                    float4 baseColorVal = float4(mat.baseColor, 1.0f);
-
-                    // --- Roughness + Metallic ---
-                    float roughnessVal = mat.specular.g;
-                    float metallicVal  = mat.specular.b;
-
-                    if (mat.isSpecGloss)
-                    {
-                        // SpecGloss: specular texture is RGB spec color + A gloss
-                        float4 sgVal = mat.specular;
-                        if (matID < mSpecularTextures.size() && mSpecularTextures[matID].width > 0) {
-                            sgVal = sampleTextureArea(mSpecularTextures[matID], uvCenter, uvArea,
-                                                       float4(mat.specular.x, 1.0f, 0.0f, sgVal.w));
-                        }
-                        float specLum = sgVal.x * 0.2126f + sgVal.y * 0.7152f + sgVal.z * 0.0722f;
-                        roughnessVal = 1.0f - sgVal.w;          // gloss → roughness
-                        metallicVal  = std::min(specLum * 2.0f, 1.0f);
-                    }
-                    else
-                    {
-                        // MetalRough: roughness from specular (ORM) texture G channel
-                        if (matID < mSpecularTextures.size() && mSpecularTextures[matID].width > 0) {
-                            float4 r = sampleTextureArea(mSpecularTextures[matID], uvCenter, uvArea,
-                                                         float4(0.0f, roughnessVal, metallicVal, 1.0f));
-                            roughnessVal = r.y;
-                            // If no separate metallic texture, use ORM B channel
-                            if (matID >= mMetallicTextures.size() || mMetallicTextures[matID].width == 0)
-                                metallicVal = r.z;
-                        }
-                        // Separate metallic texture (FBX Blender PBR) → R channel
-                        if (matID < mMetallicTextures.size() && mMetallicTextures[matID].width > 0) {
-                            float4 m = sampleTextureArea(mMetallicTextures[matID], uvCenter, uvArea,
-                                                         float4(metallicVal, 0.0f, 0.0f, 1.0f));
-                            metallicVal = m.x;
-                        }
-                    }
-
-                    float4 specVal = float4(mat.specular.x, roughnessVal, metallicVal, 1.0f);
-
-                    if (matID < mBaseColorTextures.size() &&
-                        mBaseColorTextures[matID].width > 0) {
-                        baseColorVal = sampleTextureArea(
-                            mBaseColorTextures[matID], uvCenter,
-                            uvArea, float4(mat.baseColor, 1.0f));
-                    }
-
-                    float3 shadingNormal = interpolatedNormal;
-                    if (matID < mNormalMapTextures.size() &&
-                        mNormalMapTextures[matID].width > 0) {
-                        float4 nm = sampleTextureArea(mNormalMapTextures[matID], uvCenter, uvArea,
-                                                      float4(0.5f, 0.5f, 1.0f, 1.0f));
-                        float3 tn = safeNormalize(float3(nm.x * 2.0f - 1.0f, nm.y * 2.0f - 1.0f, nm.z * 2.0f - 1.0f));
-                        float3 T = float3(origTri.TBN[0].x, origTri.TBN[1].x, origTri.TBN[2].x);
-                        float3 B = float3(origTri.TBN[0].y, origTri.TBN[1].y, origTri.TBN[2].y);
-                        float3 Ns = float3(origTri.TBN[0].z, origTri.TBN[1].z, origTri.TBN[2].z);
-                        shadingNormal = safeNormalize(T * tn.x + B * tn.y + Ns * tn.z);
-                    }
-
-                    ABSDFInput input = { float3(baseColorVal), specVal, shadingNormal, poly.calcArea() };
-                    vd.ABSDF.accumulate(input);
-                }
-                vd.ABSDF.normalizeSelf();
-
-                if (vd.isSolid()) {
-                    vd.ellipsoid.fit(gen.polygonArrays[nodeIdx], range);
-
-                    SphericalFunc polyF = vd.polygonsProjAreaFunc;
-                    SphericalFunc primF = vd.primitiveProjAreaFunc;
-                    SphericalFunc totalF = vd.totalProjAreaFunc;
-
-                    Estimate(vd.ellipsoid, range, polyF, primF, totalF,
-                             gen.polygonArrays[nodeIdx], mConfig.sampleFrequency);
-
-                    vd.polygonsProjAreaFunc = polyF;
-                    vd.primitiveProjAreaFunc = primF;
-                    vd.totalProjAreaFunc = totalF;
-                }
-
-            } else {
-                // ── NON-LEAF: aggregate from children's VoxelData ──
-                VoxelData& vd = gen.gBuffer[nodeIdx];
-                vd.init();
-
-                const OctreeNode& oct = gen.mOctreeNodes[nodeIdx];
-                if (!oct.childMask) continue;
-
-                float rawLobeWeight[LOBE_COUNT] = {};
-                float3 rawDiffuse[LOBE_COUNT] = {};
-                float3 rawSpecular[LOBE_COUNT] = {};
-                float rawRough[LOBE_COUNT] = {};
-                float3 rawNormal[LOBE_COUNT] = {};
-
-                {
-                    uint childBFS = oct.childBase;
-                    for (uint ci = 0; ci < 8; ci++) {
-                        if (!(oct.childMask & (1u << ci))) continue;
-                        VoxelData& childVd = gen.gBuffer[childBFS];
-                        float childArea = childVd.ABSDF.area;
-
-                        vd.ABSDF.area += childArea;
-
-                        for (int li = 0; li < LOBE_COUNT; li++) {
-                            float lobeArea = childVd.ABSDF.lobes[li].weight * childArea;
-                            if (lobeArea <= 0) continue;
-
-                            rawLobeWeight[li] += lobeArea;
-                            rawDiffuse[li]   += childVd.ABSDF.lobes[li].diffuse * lobeArea;
-                            rawSpecular[li]  += childVd.ABSDF.lobes[li].specular * lobeArea;
-                            rawRough[li]     += childVd.ABSDF.lobes[li].rough * lobeArea;
-                            rawNormal[li]    += childVd.ABSDF.lobes[li].normal * lobeArea;
-                        }
-
-                        // SH: sum children coefficients (placeholder for full leaf iteration)
-                        for (int si = 0; si < EVEN_SH_COUNT; si++) {
-                            vd.polygonsProjAreaFunc.coefficients[si]  += childVd.polygonsProjAreaFunc.coefficients[si];
-                            vd.primitiveProjAreaFunc.coefficients[si] += childVd.primitiveProjAreaFunc.coefficients[si];
-                            vd.totalProjAreaFunc.coefficients[si]     += childVd.totalProjAreaFunc.coefficients[si];
-                        }
-
-                        childBFS++;
-                    }
-                }
-
-                for (int li = 0; li < LOBE_COUNT; li++) {
-                    if (rawLobeWeight[li] <= 0) continue;
-                    vd.ABSDF.lobes[li].diffuse  = rawDiffuse[li] / rawLobeWeight[li];
-                    vd.ABSDF.lobes[li].specular = rawSpecular[li] / rawLobeWeight[li];
-                    vd.ABSDF.lobes[li].rough    = rawRough[li] / rawLobeWeight[li];
-                    vd.ABSDF.lobes[li].normal   = safeNormalize(rawNormal[li]);
-                    vd.ABSDF.lobes[li].weight   = rawLobeWeight[li] / vd.ABSDF.area;
-                }
-
-                if (!vd.isSolid()) continue;
-
-                // Ellipsoid: approximate from child ellipsoid extreme points
-                {
-                    std::vector<float3> extPoints;
-
-                    uint childBFS = oct.childBase;
-                    for (uint ci = 0; ci < 8; ci++) {
-                        if (!(oct.childMask & (1u << ci))) continue;
-                        VoxelData& childVd = gen.gBuffer[childBFS];
-                        Ellipsoid& childE = childVd.ellipsoid;
-                        if (childE.B[0][0] == 0 && childE.B[1][1] == 0 && childE.B[2][2] == 0) {
-                            childBFS++; continue;
-                        }
-
-                        int3 childCell = gen.mBFSOrder[childBFS].cellInt;
-                        float3 childCenter = float3(childCell) + childE.center;
-
-                        float3x3 R;
-                        float3 evals;
-                        Ellipsoid::eigenSym3_Jacobi(childE.B, R, evals);
-
-                        for (int a = 0; a < 3; a++) {
-                            if (evals[a] <= 0) continue;
-                            float extent = 1.0f / std::sqrt(evals[a]);
-                            float3 dir(R[a].x, R[a].y, R[a].z);
-
-                            float3 p1 = (childCenter + dir * extent) * 0.5f - float3(gen.mBFSOrder[nodeIdx].cellInt);
-                            float3 p2 = (childCenter - dir * extent) * 0.5f - float3(gen.mBFSOrder[nodeIdx].cellInt);
-                            extPoints.push_back(p1);
-                            extPoints.push_back(p2);
-                        }
-
-                        childBFS++;
-                    }
-
-                    if (extPoints.size() >= 6)
-                        vd.ellipsoid.fitFromPoints(extPoints, gen.mBFSOrder[nodeIdx].cellInt);
-                }
-            }
+        // ---- Phase 2: Analyze every occupied node from its own polygons ----
+        AnalyzePhase::AnalyzeContext actx{
+            scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
+            mBaseColorTextures, mSpecularTextures,
+            mMetallicTextures, mNormalMapTextures
+        };
+        for (uint32_t nodeIdx = 0;
+             nodeIdx < (uint32_t)gen.gBuffer.size(); ++nodeIdx) {
+            AnalyzePhase::analyzeNode(gen, nodeIdx, actx);
         }
 
         // ---- Phase 3: Write output ----
         std::cout << "Writing output: " << outputPath << std::endl;
         writeOutput(outputPath, gen);
 
-        // Free polygon data
         gen.polygonArrays.clear();
         gen.polygonArrays.shrink_to_fit();
         gen.mNodePolygonMap.clear();
+        gen.mOccupiedNodes.clear();
 
         std::cout << "Done." << std::endl;
         return true;
@@ -432,7 +209,7 @@ private:
         std::cout << "  [Grid] bounds min=(" << sceneMin.x << "," << sceneMin.y << "," << sceneMin.z
                   << ") max=(" << sceneMax.x << "," << sceneMax.y << "," << sceneMax.z << ")" << std::endl;
 
-        uint N = mConfig.baseResolution;
+        uint N = std::max(mConfig.baseResolution, 1u);
         N--; N |= N >> 1; N |= N >> 2; N |= N >> 4;
         N |= N >> 8; N |= N >> 16; N++;
         mGrid.voxelCount = uint3(N, N, N);
@@ -440,7 +217,7 @@ private:
         float maxDim = std::max(diag.z, std::max(diag.x, diag.y));
         float s = maxDim / (float)N;
         mGrid.voxelSize = float3(s);
-        mGrid.gridMin = center - 0.5f * s * float3(N);
+        mGrid.gridMin = center - 0.5f * s * float3((float)N);
 
         std::cout << "  [Grid] N=" << N << " maxDim=" << maxDim << " voxelSize=" << s << std::endl;
     }
@@ -462,9 +239,10 @@ private:
         }
     }
 
-    // ---- Hierarchical clip (leaf-only polygon storage) ----
+    // ---- Hierarchical clip (all-level polygon storage) ----
     // Exact BoxClipTriangle at every level for correct AABB test.
-    // Polygon is stored ONLY at leaf level (direct push to mNodePolygonMap).
+    // Polygon vertices are normalized by the current node scale and retained
+    // at every occupied level.
 
     static void clipHierarchical(
         uint meshID, uint materialID, uint triangleID, uint instanceIdx,
@@ -492,12 +270,9 @@ private:
         uint64_t nodeKey = PolygonGenerator::makeNodeKey(level, nodeCell);
         gen.mOccupiedNodes.insert(nodeKey);
 
-        if (level == maxDepth) {
-            // Leaf: directly push polygon to map
-            auto& polys = gen.mNodePolygonMap[nodeKey];
-            if (polys.size() < SAFE_PER_NODE_POLYGON_LIMIT)
-                polys.push_back(polygon);
-        }
+        auto& polys = gen.mNodePolygonMap[nodeKey];
+        if (polys.size() < SAFE_PER_NODE_POLYGON_LIMIT)
+            polys.push_back(polygon);
 
         if (level >= maxDepth) return;
 
@@ -656,108 +431,6 @@ private:
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
     }
 
-    // ---- Phase 4: Parent aggregation from children's VoxelData ----
-    // Works identically for both in-memory (PolygonGenerator) and disk (OctreeResult) paths.
-    static void aggregateParents(OctreeBuilder::OctreeResult& octree, uint32_t maxDepth) {
-        int totalNodes = (int)octree.totalNodes();
-        for (int nodeIdx = totalNodes - 1; nodeIdx >= 0; nodeIdx--) {
-            uint32_t level = octree.bfsOrder[nodeIdx].level;
-
-            if (level == maxDepth) continue;  // leaves already filled
-
-            VoxelData& vd = octree.gBuffer[nodeIdx];
-            vd.init();
-
-            const OctreeNode& oct = octree.octreeNodes[nodeIdx];
-            if (!oct.childMask) continue;
-
-            float rawLobeWeight[LOBE_COUNT] = {};
-            float3 rawDiffuse[LOBE_COUNT] = {};
-            float3 rawSpecular[LOBE_COUNT] = {};
-            float rawRough[LOBE_COUNT] = {};
-            float3 rawNormal[LOBE_COUNT] = {};
-
-            {
-                uint32_t childBFS = oct.childBase;
-                for (uint32_t ci = 0; ci < 8; ci++) {
-                    if (!(oct.childMask & (1u << ci))) continue;
-                    VoxelData& childVd = octree.gBuffer[childBFS];
-                    float childArea = childVd.ABSDF.area;
-
-                    vd.ABSDF.area += childArea;
-
-                    for (int li = 0; li < LOBE_COUNT; li++) {
-                        float lobeArea = childVd.ABSDF.lobes[li].weight * childArea;
-                        if (lobeArea <= 0) continue;
-
-                        rawLobeWeight[li] += lobeArea;
-                        rawDiffuse[li]   += childVd.ABSDF.lobes[li].diffuse * lobeArea;
-                        rawSpecular[li]  += childVd.ABSDF.lobes[li].specular * lobeArea;
-                        rawRough[li]     += childVd.ABSDF.lobes[li].rough * lobeArea;
-                        rawNormal[li]    += childVd.ABSDF.lobes[li].normal * lobeArea;
-                    }
-
-                    for (int si = 0; si < EVEN_SH_COUNT; si++) {
-                        vd.polygonsProjAreaFunc.coefficients[si]  += childVd.polygonsProjAreaFunc.coefficients[si];
-                        vd.primitiveProjAreaFunc.coefficients[si] += childVd.primitiveProjAreaFunc.coefficients[si];
-                        vd.totalProjAreaFunc.coefficients[si]     += childVd.totalProjAreaFunc.coefficients[si];
-                    }
-
-                    childBFS++;
-                }
-            }
-
-            for (int li = 0; li < LOBE_COUNT; li++) {
-                if (rawLobeWeight[li] <= 0) continue;
-                vd.ABSDF.lobes[li].diffuse  = rawDiffuse[li] / rawLobeWeight[li];
-                vd.ABSDF.lobes[li].specular = rawSpecular[li] / rawLobeWeight[li];
-                vd.ABSDF.lobes[li].rough    = rawRough[li] / rawLobeWeight[li];
-                vd.ABSDF.lobes[li].normal   = safeNormalize(rawNormal[li]);
-                vd.ABSDF.lobes[li].weight   = rawLobeWeight[li] / vd.ABSDF.area;
-            }
-
-            if (!vd.isSolid()) continue;
-
-            // Ellipsoid: approximate from child ellipsoid extreme points
-            {
-                std::vector<float3> extPoints;
-
-                uint32_t childBFS = oct.childBase;
-                for (uint32_t ci = 0; ci < 8; ci++) {
-                    if (!(oct.childMask & (1u << ci))) continue;
-                    VoxelData& childVd = octree.gBuffer[childBFS];
-                    Ellipsoid& childE = childVd.ellipsoid;
-                    if (childE.B[0][0] == 0 && childE.B[1][1] == 0 && childE.B[2][2] == 0) {
-                        childBFS++; continue;
-                    }
-
-                    int3 childCell = octree.bfsOrder[childBFS].cellInt;
-                    float3 childCenter = float3(childCell) + childE.center;
-
-                    float3x3 R;
-                    float3 evals;
-                    Ellipsoid::eigenSym3_Jacobi(childE.B, R, evals);
-
-                    for (int a = 0; a < 3; a++) {
-                        if (evals[a] <= 0) continue;
-                        float extent = 1.0f / std::sqrt(evals[a]);
-                        float3 dir(R[a].x, R[a].y, R[a].z);
-
-                        float3 p1 = (childCenter + dir * extent) * 0.5f - float3(octree.bfsOrder[nodeIdx].cellInt);
-                        float3 p2 = (childCenter - dir * extent) * 0.5f - float3(octree.bfsOrder[nodeIdx].cellInt);
-                        extPoints.push_back(p1);
-                        extPoints.push_back(p2);
-                    }
-
-                    childBFS++;
-                }
-
-                if (extPoints.size() >= 6)
-                    vd.ellipsoid.fitFromPoints(extPoints, octree.bfsOrder[nodeIdx].cellInt);
-            }
-        }
-    }
-
 };
 
 // ---- processDisk: disk-backed pipeline implementation ----
@@ -781,6 +454,12 @@ inline bool SceneVoxelization::processDisk(
     setupGrid(scene);
 
     uint32_t resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+    if (resolution > PolygonGenerator::NODE_KEY_MAX_RESOLUTION) {
+        std::cerr << "Resolution " << resolution
+                  << " exceeds the standalone node-key limit of "
+                  << PolygonGenerator::NODE_KEY_MAX_RESOLUTION << "^3." << std::endl;
+        return false;
+    }
     mMaxDepth = 0;
     while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 
@@ -789,7 +468,7 @@ inline bool SceneVoxelization::processDisk(
     std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
               << "  maxDepth=" << mMaxDepth << std::endl;
 
-    // ---- Phase 1: Multi-threaded clip → shard files ----
+    // ---- Phase 1: Multi-threaded clip -> shard files ----
     std::cout << "\n=== Phase 1: Multi-threaded Clip ===" << std::endl;
     auto clipResult = ClipPhase::execute(scene, mGrid, mMaxDepth,
                                           mTmpDir, mNumThreads);
@@ -798,40 +477,36 @@ inline bool SceneVoxelization::processDisk(
         return false;
     }
 
-    // ---- Phase 2: Merge shards → leaves.idx + polygons.dat + octree ----
+    // ---- Phase 2: Merge shards -> nodes.idx + polygons.dat + octree ----
     std::cout << "\n=== Phase 2: Merge ===" << std::endl;
     auto mergeResult = MergePhase::execute(clipResult, mTmpDir, mMaxDepth);
-    if (mergeResult.totalLeaves == 0) {
-        std::cerr << "Merge phase produced no leaves." << std::endl;
+    if (mergeResult.totalNodes == 0) {
+        std::cerr << "Merge phase produced no occupied nodes." << std::endl;
         return false;
     }
 
-    // ---- Phase 3: Stream-based leaf analysis ----
+    // ---- Phase 3: Stream-based per-node analysis ----
     std::cout << "\n=== Phase 3: Analyze ===" << std::endl;
     AnalyzePhase::AnalyzeContext actx{
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
         mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
     };
-    AnalyzePhase::execute(mergeResult, actx);
+    AnalyzePhase::execute(mergeResult, actx, mNumThreads);
 
-    // ---- Phase 4: Parent aggregation ----
-    std::cout << "\n=== Phase 4: Parent Aggregation ===" << std::endl;
-    auto& octree = const_cast<OctreeBuilder::OctreeResult&>(mergeResult.octree);
-    aggregateParents(octree, mMaxDepth);
-
-    // ---- Phase 5: Write output ----
-    std::cout << "\n=== Phase 5: Write Output ===" << std::endl;
-    // maxPolyPerNode: scan leaf indices for the max
+    // ---- Phase 4: Write output ----
+    std::cout << "\n=== Phase 4: Write Output ===" << std::endl;
+    const auto& octree = mergeResult.octree;
+    // maxPolyPerNode: scan node indices for the max
     // (we could track this during merge, but scanning is fast)
     uint32_t maxPolyPerNode = 0;
     {
-        std::ifstream idxIn(mergeResult.leavesIdxPath, std::ios::binary);
-        PolygonSerializer::LeavesIdxHeader idxHdr;
-        if (PolygonSerializer::readLeavesIdxHeader(idxIn, idxHdr)) {
-            std::vector<PolygonSerializer::LeafIndex> leaves;
-            PolygonSerializer::readLeafIndices(idxIn, leaves, idxHdr.leafCount);
-            for (auto& li : leaves)
-                maxPolyPerNode = std::max(maxPolyPerNode, li.polyCount);
+        std::ifstream idxIn(mergeResult.nodesIdxPath, std::ios::binary);
+        PolygonSerializer::NodesIdxHeader idxHdr;
+        if (PolygonSerializer::readNodesIdxHeader(idxIn, idxHdr)) {
+            std::vector<PolygonSerializer::NodeIndex> nodes;
+            PolygonSerializer::readNodeIndices(idxIn, nodes, idxHdr.nodeCount);
+            for (auto& ni : nodes)
+                maxPolyPerNode = std::max(maxPolyPerNode, ni.polyCount);
         }
     }
     writeOutputDisk(outputPath, octree, mergeResult.totalPolygons, maxPolyPerNode);

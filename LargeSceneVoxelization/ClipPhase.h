@@ -41,10 +41,10 @@ static inline float3 transformNormal(const float3& localNormal, const glm::mat4&
     return safeNormalize(float3(wn.x, wn.y, wn.z));
 }
 
-// ---- Recursive hierarchical clip, writes leaf polygons to stream ----
-// Identical algorithm to SceneVoxelization::clipHierarchical, but outputs
-// to a binary stream instead of mNodePolygonMap.
-// Returns the number of leaf entries written.
+// ---- Recursive hierarchical clip, writes every level to the stream ----
+// Identical algorithm to the renderer's hierarchical clip, but outputs to a
+// binary stream instead of mNodePolygonMap.  Each successful clip creates one
+// entry for the current node and then recursively clips the children.
 
 // TODO:Maybe cause stack overflow
 static uint64_t clipHierarchicalToStream(
@@ -71,13 +71,9 @@ static uint64_t clipHierarchicalToStream(
     polygon.triRef.materialID  = materialID;
     polygon.triRef.instanceIdx = instanceIdx;
 
-    uint64_t written = 0;
-
-    if (level == maxDepth) {
-        uint64_t nodeKey = PolygonGenerator::makeNodeKey(level, nodeCell);
-        PolygonSerializer::writeShardEntry(out, nodeKey, polygon);
-        written = 1;
-    }
+    uint64_t nodeKey = PolygonGenerator::makeNodeKey(level, nodeCell);
+    PolygonSerializer::writeShardEntry(out, nodeKey, polygon);
+    uint64_t written = 1;
 
     if (level >= maxDepth) return written;
 
@@ -180,7 +176,7 @@ static void clipWorker(
 
     std::cout << "  [Clip] Thread " << threadId
               << " done: " << triCount << " triangles, "
-              << entryCount << " leaf polygon entries" << std::endl;
+              << entryCount << " node polygon entries" << std::endl;
 }
 
 // ---- Main entry point ----
@@ -257,7 +253,7 @@ inline ClipResult execute(
     }
 
     std::cout << "  [Clip] Phase complete: " << result.totalPolygonsClipped
-              << " total leaf polygon entries across "
+              << " total node polygon entries across "
               << result.shardFiles.size() << " shard files" << std::endl;
 
     return result;

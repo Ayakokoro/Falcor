@@ -2,7 +2,7 @@
 #include "Types.h"
 #include "Triangle.h"
 
-#define LOBE_COUNT 4
+#define LOBE_COUNT 8
 
 inline uint NormalIndex(const float3& n) {
     float ax = std::abs(n.x), az = std::abs(n.z);
@@ -15,11 +15,20 @@ inline uint NormalIndex(const float3& n) {
     else      return (n.z >= 0.0f) ? 2u : 3u;
 }
 
+// The renderer stores both hemispheres explicitly.  The lower hemisphere is
+// folded onto the upper one for the lobe lookup and then offset by four.
+inline uint NormalIndex8(const float3& n) {
+    uint hemi = n.y < 0.0f ? 4u : 0u;
+    float3 up = hemi != 0u ? -n : n;
+    return hemi + NormalIndex(up);
+}
+
 struct ABSDFInput {
     float3 baseColor;
     float4 specular;    // .g = roughness, .b = metallic
     float3 normal;
-    float area;
+    float area;         // geometric surface area
+    float projArea;     // visible projected area used for material fitting
 };
 
 struct ABSDFLobe {
@@ -35,20 +44,21 @@ struct ABSDFLobe {
         float IoR = 1.5f;
         float f = (IoR - 1.0f) / (IoR + 1.0f);
         float F0 = f * f;
-        diffuse  += input.area * lerp(input.baseColor, float3(0.0f), input.specular.b);
-        specular += input.area * lerp(float3(F0), input.baseColor, input.specular.b);
-        rough    += input.area * input.specular.g;
-        normal   += input.area * input.normal;
-        weight   += input.area;
+        float w = input.projArea;
+        diffuse  += w * lerp(input.baseColor, float3(0.0f), input.specular.b);
+        specular += w * lerp(float3(F0), input.baseColor, input.specular.b);
+        rough    += w * input.specular.g;
+        normal   += w * input.normal;
+        weight   += w;
     }
 
-    void normalizeSelf(float totalArea) {
+    void normalizeSelf(float visibleProjectedAreaSum) {
         if (weight > 0) {
             normal = safeNormalize(normal);
             diffuse /= weight;
             specular /= weight;
             rough /= weight;
-            weight /= totalArea;
+            weight /= visibleProjectedAreaSum;
         }
     }
 
@@ -65,15 +75,28 @@ struct ABSDF {
     }
 
     void accumulate(const ABSDFInput& input) {
-        float3 n = input.normal;
-        if (n.y < 0) n = -n;
-        lobes[NormalIndex(n)].accumulate(input);
-        area += input.area;
+        lobes[NormalIndex8(input.normal)].accumulate(input);
     }
 
     void normalizeSelf() {
         if (area == 0) return;
+        float totalVisibleProjectedArea = 0.0f;
         for (int i = 0; i < LOBE_COUNT; i++)
-            lobes[i].normalizeSelf(area);
+            totalVisibleProjectedArea += lobes[i].weight;
+        for (int i = 0; i < LOBE_COUNT; i++)
+            lobes[i].normalizeSelf(totalVisibleProjectedArea);
     }
+
+    void normalizeWeightsOnly() {
+        float totalWeight = 0.0f;
+        for (uint i = 0; i < LOBE_COUNT; ++i)
+            totalWeight += lobes[i].weight;
+        if (totalWeight <= 0.0f) return;
+
+        float scale = 2.0f / totalWeight; // two-sided material: +n and -n
+        for (uint i = 0; i < LOBE_COUNT; ++i)
+            lobes[i].weight *= scale;
+    }
+
+    bool isSolid() const { return area > 0.0f; }
 };

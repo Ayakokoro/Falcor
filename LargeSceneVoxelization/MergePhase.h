@@ -15,11 +15,11 @@
 namespace MergePhase {
 
 struct MergeResult {
-    std::filesystem::path leavesIdxPath;
+    std::filesystem::path nodesIdxPath;
     std::filesystem::path polygonsDatPath;
     OctreeBuilder::OctreeResult octree;
     uint64_t totalPolygons  = 0;
-    uint64_t totalLeaves    = 0;
+    uint64_t totalNodes     = 0;
 };
 
 // Lightweight reference to a polygon entry in a shard file.
@@ -35,7 +35,8 @@ struct ShardEntryRef {
 };
 
 // Read all shard files, collect entry references, sort by nodeKey,
-// merge into per-leaf contiguous polygons.dat + leaves.idx, build octree.
+// merge into per-node contiguous polygons.dat + nodes.idx, build the BFS
+// octree and keep the same node ordering as the renderer.
 inline MergeResult execute(
     const ClipPhase::ClipResult& clipResult,
     const std::filesystem::path& tmpDir,
@@ -45,7 +46,7 @@ inline MergeResult execute(
     fs::path mergeDir = tmpDir / "merge";
     fs::create_directories(mergeDir);
 
-    fs::path leavesIdxPath  = mergeDir / "leaves.idx";
+    fs::path nodesIdxPath   = mergeDir / "nodes.idx";
     fs::path polygonsDatPath = mergeDir / "polygons.dat";
 
     // ---- Step 1: Scan all shard files, collect entry references ----
@@ -125,8 +126,8 @@ inline MergeResult execute(
         return {};
     }
 
-    std::vector<PolygonSerializer::LeafIndex> leafIndices;
-    std::unordered_set<uint64_t> leafKeys;
+    std::vector<PolygonSerializer::NodeIndex> nodeIndices;
+    std::unordered_set<uint64_t> nodeKeys;
 
     // Buffer for reading polygon data from shard files
     std::vector<char> readBuf;
@@ -143,11 +144,11 @@ inline MergeResult execute(
             currentCount = 0;
             firstGroup = false;
         } else if (ref.nodeKey != currentKey) {
-            // Finalize previous leaf
-            leafIndices.push_back({currentKey, currentOffset, currentCount, 0});
-            leafKeys.insert(currentKey);
+            // Finalize previous node.
+            nodeIndices.push_back({currentKey, currentOffset, currentCount, 0});
+            nodeKeys.insert(currentKey);
 
-            // Start new leaf
+            // Start new node.
             currentKey = ref.nodeKey;
             currentOffset = (uint64_t)polyOut.tellp();
             currentCount = 0;
@@ -171,8 +172,8 @@ inline MergeResult execute(
 
     // Flush last group
     if (currentCount > 0) {
-        leafIndices.push_back({currentKey, currentOffset, currentCount, 0});
-        leafKeys.insert(currentKey);
+        nodeIndices.push_back({currentKey, currentOffset, currentCount, 0});
+        nodeKeys.insert(currentKey);
     }
 
     polyOut.close();
@@ -181,25 +182,23 @@ inline MergeResult execute(
     for (auto& s : shardStreams)
         if (s.is_open()) s.close();
 
-    // ---- Step 4: Sort leaf indices by nodeKey and write leaves.idx ----
-    std::sort(leafIndices.begin(), leafIndices.end(),
-        [](const auto& a, const auto& b) { return a.nodeKey < b.nodeKey; });
+    // refs are already sorted by nodeKey, so nodeIndices are already ordered.
 
     {
-        std::ofstream idxOut(leavesIdxPath, std::ios::binary | std::ios::trunc);
-        PolygonSerializer::LeavesIdxHeader idxHdr;
-        idxHdr.leafCount = leafIndices.size();
+        std::ofstream idxOut(nodesIdxPath, std::ios::binary | std::ios::trunc);
+        PolygonSerializer::NodesIdxHeader idxHdr;
+        idxHdr.nodeCount = nodeIndices.size();
         idxHdr.maxDepth  = maxDepth;
-        PolygonSerializer::writeLeavesIdxHeader(idxOut, idxHdr);
-        PolygonSerializer::writeLeafIndices(idxOut, leafIndices);
+        PolygonSerializer::writeNodesIdxHeader(idxOut, idxHdr);
+        PolygonSerializer::writeNodeIndices(idxOut, nodeIndices);
         idxOut.close();
     }
 
-    std::cout << "  [Merge] Wrote " << leafIndices.size() << " leaves, "
+    std::cout << "  [Merge] Wrote " << nodeIndices.size() << " nodes, "
               << totalPolygons << " total polygons." << std::endl;
 
-    // ---- Step 5: Build octree from leaf keys ----
-    auto octree = OctreeBuilder::buildFromLeafKeys(leafKeys, maxDepth);
+    // ---- Step 5: Build octree from all occupied node keys ----
+    auto octree = OctreeBuilder::buildFromNodeKeys(nodeKeys, maxDepth);
 
     // ---- Step 6: Cleanup shard files (always deleted after merge) ----
     for (auto& shardPath : clipResult.shardFiles)
@@ -209,11 +208,11 @@ inline MergeResult execute(
     fs::remove(clipDir, ec);  // will fail if not empty, which is fine
 
     return MergeResult{
-        leavesIdxPath,
+        nodesIdxPath,
         polygonsDatPath,
         std::move(octree),
         totalPolygons,
-        (uint64_t)leafIndices.size()
+        (uint64_t)nodeIndices.size()
     };
 }
 
