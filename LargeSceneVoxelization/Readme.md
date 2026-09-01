@@ -2,6 +2,9 @@ example use
 
 cmake --build . --config Release
 
+# 默认按 MetalRough 解释材质；只有显式传入 --spec-gloss 才使用 SpecGloss 转换
+.\build\Release\LargeSceneVoxelization.exe "..\Scene\SimplePlane\simpleplane.fbx" --spec-gloss
+
 # 只生成最精细层级（LOD 0）；默认使用原有安全的单节点多边形上限
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Old tree\OldTree.fbx" -o "..\resource\OldTree.bin" -r 128 -s 256 -t 2
 

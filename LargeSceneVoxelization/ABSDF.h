@@ -65,9 +65,14 @@ struct ABSDF {
     }
 
     void accumulate(const ABSDFInput& input) {
-        float3 n = input.normal;
-        if (n.y < 0) n = -n;
-        lobes[NormalIndex(n)].accumulate(input);
+        // Keep the stored lobe normal consistent with the GPU implementation.
+        // The GPU canonicalizes the input normal before both lobe selection and
+        // accumulation; pass the canonicalized normal to the lobe as well.
+        ABSDFInput canonicalInput = input;
+        if (canonicalInput.normal.y < 0)
+            canonicalInput.normal = -canonicalInput.normal;
+
+        lobes[NormalIndex(canonicalInput.normal)].accumulate(canonicalInput);
         area += input.area;
     }
 

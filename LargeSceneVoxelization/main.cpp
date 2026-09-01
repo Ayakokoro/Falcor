@@ -16,6 +16,7 @@ int main(int argc, char* argv[]) {
     std::string tmpDir = "./tmp";
     bool keepTemp = true;              // default: preserve temp files
     bool useInMemory = false;
+    bool useSpecGlossMaterials = false; // default matches Falcor FBX import
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -50,6 +51,8 @@ int main(int argc, char* argv[]) {
             keepTemp = false;
         } else if (arg == "--in-memory") {
             useInMemory = true;
+        } else if (arg == "--spec-gloss") {
+            useSpecGlossMaterials = true;
         } else if (arg[0] != '-') {
             inputPath = arg;
         }
@@ -68,7 +71,8 @@ int main(int argc, char* argv[]) {
                   << "  --tmp-dir <path>  Temp directory for intermediate files (default: ./tmp/)\n"
                   << "  --keep-temp       Keep temp files after completion (default)\n"
                   << "  --clean           Delete temp files after completion\n"
-                  << "  --in-memory       Use original in-memory pipeline (default: disk-backed)\n";
+                  << "  --in-memory       Use original in-memory pipeline (default: disk-backed)\n"
+                  << "  --spec-gloss      Explicitly use SpecGloss input conversion (default: MetalRough)\n";
         return 0;
     }
 
@@ -83,6 +87,7 @@ int main(int argc, char* argv[]) {
     VoxelizationConfig config;
     config.baseResolution = resolution;
     config.sampleFrequency = sampleFrequency;
+    config.useSpecGlossMaterials = useSpecGlossMaterials;
     config.lodLevels = lodLevels;
     config.lodMode = lodMode;
     config.maxPolygonsPerNode = maxPolygonsPerNode;
@@ -100,6 +105,7 @@ int main(int argc, char* argv[]) {
               << (maxPolygonsPerNode == 0 ? " (unlimited)" : "") << std::endl;
     std::cout << "  Threads:     " << numThreads << std::endl;
     std::cout << "  Mode:        " << (useInMemory ? "in-memory" : "disk-backed") << std::endl;
+    std::cout << "  Materials:   " << (useSpecGlossMaterials ? "SpecGloss" : "MetalRough") << std::endl;
     if (!useInMemory) {
         std::cout << "  Temp dir:    " << tmpDir << std::endl;
         std::cout << "  Keep temp:   " << (keepTemp ? "yes" : "no") << std::endl;

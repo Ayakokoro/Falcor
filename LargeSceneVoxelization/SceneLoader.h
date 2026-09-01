@@ -23,12 +23,21 @@ struct MeshData {
 struct MaterialData {
     uint materialID = 0;
     float3 baseColor = float3(1.0f);
-    float4 specular = float4(0.04f, 1.0f, 0.0f, 1.0f); // F0, roughness, metallic, _
+    // Same storage as Falcor's BasicMaterialData. In the default Assimp
+    // import path (including FBX), the GPU importer writes Phong
+    // SpecularColor to RGB and Shininess to A without converting it to PBR.
+    float4 specular = float4(0.0f); // default BasicMaterialData value
     std::string texBaseColor;    // path to base color texture
     std::string texSpecular;     // path to ORM combined / roughness-only / Phong specular
     std::string texMetallic;     // path to separate metallic texture (FBX Blender PBR)
     std::string texNormalMap;
-    bool isSpecGloss = false;    // true = Phong/SpecGloss model → convert to metal-rough
+    bool isSpecGloss = false;    // Explicitly selected SpecGloss input; converted to metal-rough for ABSDF
+};
+
+enum class MaterialImportMode {
+    Default,
+    OBJ,
+    GLTF2,
 };
 
 struct LoadedScene {
@@ -86,6 +95,9 @@ struct InstancedScene {
 // same MeshData::meshID but produce separate geometry instances.
 class SceneLoader {
 public:
+    explicit SceneLoader(bool useSpecGlossMaterials = false)
+        : mUseSpecGlossMaterials(useSpecGlossMaterials) {}
+
     bool load(const std::string& filePath, LoadedScene& scene) {
         Assimp::Importer importer;
         // Match Falcor's AssimpImporter flags exactly
@@ -113,8 +125,9 @@ public:
 
         mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
 
-        // Phase 1: Collect materials
-        loadMaterials(ai, scene.materials);
+        // Phase 1: Collect materials. Keep the same format-specific branches
+        // as Falcor's AssimpImporter.
+        loadMaterials(ai, scene.materials, getImportMode(filePath));
 
         // Phase 2: Traverse nodes, collect mesh instances with transforms
         std::vector<InstanceInfo> instances;
@@ -138,7 +151,9 @@ public:
             auto& mat = scene.materials[i];
             std::cout << "    mat[" << i << "] baseColor=(" << mat.baseColor.x << ","
                       << mat.baseColor.y << "," << mat.baseColor.z
-                      << ") roughness=" << mat.specular.g
+                      << ") specular=(" << mat.specular.x << ","
+                      << mat.specular.y << "," << mat.specular.z << ","
+                      << mat.specular.w << ") roughness=" << mat.specular.g
                       << " metallic=" << mat.specular.b << std::endl;
         }
 
@@ -188,7 +203,7 @@ public:
         mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
 
         // Phase 1: Load materials
-        loadMaterials(ai, outScene.materials);
+        loadMaterials(ai, outScene.materials, getImportMode(filePath));
 
         // Phase 2: Collect all instances (aiMeshIndex, transform, materialID)
         struct RawInstance { uint meshIndex; aiMatrix4x4 transform; uint materialID; };
@@ -271,6 +286,7 @@ public:
 private:
     std::string mError;
     std::string mSceneDir;
+    bool mUseSpecGlossMaterials = false;
 
     // Cache of extracted embedded textures (Assimp *N paths → temp file paths)
     std::unordered_map<int, std::string> mEmbeddedTempFiles;
@@ -332,41 +348,76 @@ private:
         uint materialID;
     };
 
-    void loadMaterials(const aiScene* ai, std::vector<MaterialData>& materials) {
+    static MaterialImportMode getImportMode(const std::string& filePath) {
+        std::string extension = std::filesystem::path(filePath).extension().string();
+        for (char& c : extension)
+            c = (char)std::tolower((unsigned char)c);
+
+        if (extension == ".obj")  return MaterialImportMode::OBJ;
+        if (extension == ".gltf" || extension == ".glb") return MaterialImportMode::GLTF2;
+        return MaterialImportMode::Default;
+    }
+
+    void loadMaterials(const aiScene* ai, std::vector<MaterialData>& materials,
+                       MaterialImportMode importMode) {
         for (uint i = 0; i < ai->mNumMaterials; i++) {
             aiMaterial* aimat = ai->mMaterials[i];
             MaterialData mat;
             mat.materialID = i;
 
-            aiColor4D col;
-            if (aimat->Get(AI_MATKEY_COLOR_DIFFUSE, col) == AI_SUCCESS)
-                mat.baseColor = srgbToLinear(float3(col.r, col.g, col.b));
+            // Match AssimpImporter::createMaterial() ordering and value space.
+            // Falcor stores imported material colors directly; texture samples
+            // are decoded separately by the texture system when appropriate.
+            aiColor3D color;
+            if (aimat->Get(AI_MATKEY_COLOR_DIFFUSE, color) == AI_SUCCESS)
+                mat.baseColor = float3(color.r, color.g, color.b);
 
-            // PBR roughness: prefer explicit roughness factor, fall back to shininess
-            float roughness = 1.0f;
-            bool hasPbrRoughness = (aimat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS);
-            if (!hasPbrRoughness)
-            {
-                float shininess = 0;
-                if (aimat->Get(AI_MATKEY_SHININESS, shininess) == AI_SUCCESS)
-                    roughness = 1.0f - std::sqrt(shininess / 1000.0f);
-            }
-            mat.specular.g = roughness;
-
-            // Metallic: PBR metallic factor, or detect SpecGloss from Phong specular color
-            float metallic = 0;
-            bool hasPbrMetallic = (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS);
-            if (hasPbrMetallic) {
-                mat.specular.b = metallic;
-            } else {
-                // No PBR metallic → check for SpecGloss (Phong) model
-                aiColor4D specColor;
-                if (aimat->Get(AI_MATKEY_COLOR_SPECULAR, specColor) == AI_SUCCESS) {
-                    mat.isSpecGloss = true;
-                    float specLum = specColor.r * 0.2126f + specColor.g * 0.7152f + specColor.b * 0.0722f;
-                    mat.specular.x = std::max(0.04f, specLum);      // F0 override
-                    mat.specular.b = std::min(specLum * 2.0f, 1.0f); // metallic hint from spec intensity
+            float shininess = 0.0f;
+            bool hasShininess = (aimat->Get(AI_MATKEY_SHININESS, shininess) == AI_SUCCESS);
+            if (hasShininess) {
+                // This is the only special conversion performed by the GPU
+                // importer, and it is only for OBJ/MTL.
+                if (importMode == MaterialImportMode::OBJ) {
+                    float roughness = std::clamp(std::sqrt(2.0f / (shininess + 2.0f)), 0.0f, 1.0f);
+                    shininess = 1.0f - roughness;
                 }
+                mat.specular.w = shininess;
+            }
+
+            if (aimat->Get(AI_MATKEY_COLOR_SPECULAR, color) == AI_SUCCESS)
+                mat.specular = float4(color.r, color.g, color.b, mat.specular.w);
+
+            // GLTF2 is the only path in Falcor's importer that reads explicit
+            // metallic/roughness factors and the PBR base-color factor.
+            if (importMode == MaterialImportMode::GLTF2) {
+                if (aimat->Get(AI_MATKEY_BASE_COLOR, color) == AI_SUCCESS)
+                    mat.baseColor = float3(color.r, color.g, color.b);
+
+                float metallic = 0.0f;
+                if (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS)
+                    mat.specular.b = metallic;
+
+                float roughness = 0.0f;
+                if (aimat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS)
+                    mat.specular.g = roughness;
+            }
+
+            if (mUseSpecGlossMaterials) {
+                // SpecGloss is opt-in, analogous to Falcor's
+                // SceneBuilder::Flags::UseSpecGlossMaterials. Store the source
+                // representation correctly: RGB = specular color, A = glossiness.
+                aiColor4D specColor;
+                float3 specularColor(0.04f);
+                if (aimat->Get(AI_MATKEY_COLOR_SPECULAR, specColor) == AI_SUCCESS)
+                    specularColor = float3(specColor.r, specColor.g, specColor.b);
+
+                float roughness = 1.0f;
+                bool hasPbrRoughness = (aimat->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness) == AI_SUCCESS);
+                if (!hasPbrRoughness && hasShininess)
+                    roughness = 1.0f - std::sqrt(shininess / 1000.0f);
+
+                mat.isSpecGloss = true;
+                mat.specular = float4(specularColor, 1.0f - roughness);
             }
 
             // Texture paths: handle both relative and absolute paths from Assimp.
@@ -385,7 +436,10 @@ private:
                 return mSceneDir + "/" + s;
             };
 
-            // Enumerate all texture slots (Assimp may classify PBR textures under various types)
+            // Enumerate texture slots. For the Default path, keep the exact
+            // mappings used by AssimpImporter::kTextureMappings[Default].
+            // GLTF/OBJ retain the broader legacy handling below.
+            const bool useGpuDefaultTextureMapping = (importMode == MaterialImportMode::Default);
             for (uint texType = 0; texType <= aiTextureType_UNKNOWN; texType++) {
                 uint texCount = aimat->GetTextureCount((aiTextureType)texType);
                 for (uint slot = 0; slot < texCount; slot++) {
@@ -394,17 +448,21 @@ private:
                         continue;
                     std::string rawPath(texPath.C_Str());
 
-                    if (texType == aiTextureType_DIFFUSE || texType == aiTextureType_BASE_COLOR) {
+                    if (texType == aiTextureType_DIFFUSE ||
+                        (!useGpuDefaultTextureMapping && texType == aiTextureType_BASE_COLOR)) {
                         if (mat.texBaseColor.empty())
                             mat.texBaseColor = resolvePath(texPath);
-                    } else if (texType == aiTextureType_NORMALS || texType == aiTextureType_HEIGHT || texType == aiTextureType_DISPLACEMENT) {
+                    } else if (texType == aiTextureType_NORMALS ||
+                               (!useGpuDefaultTextureMapping &&
+                                (texType == aiTextureType_HEIGHT || texType == aiTextureType_DISPLACEMENT))) {
                         if (mat.texNormalMap.empty())
                             mat.texNormalMap = resolvePath(texPath);
-                    } else if (texType == aiTextureType_SPECULAR || texType == aiTextureType_SHININESS
-                               || texType == aiTextureType_METALNESS) {
+                    } else if (texType == aiTextureType_SPECULAR ||
+                               (!useGpuDefaultTextureMapping &&
+                                (texType == aiTextureType_SHININESS || texType == aiTextureType_METALNESS))) {
                         if (mat.texSpecular.empty())
                             mat.texSpecular = resolvePath(texPath);
-                    } else if (texType == aiTextureType_UNKNOWN) {
+                    } else if (!useGpuDefaultTextureMapping && texType == aiTextureType_UNKNOWN) {
                         // Heuristic: match by filename keywords.
                         // For embedded textures (*N), use the original filename from aiScene.
                         std::string matchName = rawPath;
@@ -431,8 +489,10 @@ private:
                 }
             }
 
-            // Try $raw custom properties (Blender FBX exporter uses these for PBR)
-            {
+            // Try $raw custom properties only outside the GPU-compatible
+            // Default path. Falcor's AssimpImporter does not inspect these
+            // properties for FBX/other Default imports.
+            if (!useGpuDefaultTextureMapping) {
                 aiString raw;
                 if (aimat->Get("$raw.basecolor_texture", 0, 0, raw) == AI_SUCCESS && mat.texBaseColor.empty())
                     mat.texBaseColor = resolvePath(raw);

@@ -92,7 +92,10 @@ protected:
     uint32_t mValidationLOD = 0;
     bool mValidationRequested = false;
 
-    bool mLerpNormal;
+    // Match the CPU path: use interpolated vertex normals when no normal map
+    // is present. Explicit initialization also keeps shader compilation and
+    // voxelization deterministic before the UI has written this value.
+    bool mLerpNormal = true;
 
     // Spherical function visualization state
     bool mShowSphericalFunc = false;

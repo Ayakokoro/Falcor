@@ -753,24 +753,9 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             Ellipsoid e = loadPBuffer(hit.gbIndex);
             TEBSDF bsdf = loadGBuffer(hit.gbIndex);
 
-            float bSum = abs(e.B[0][0]) + abs(e.B[0][1]) + abs(e.B[0][2])
-                       + abs(e.B[1][0]) + abs(e.B[1][1]) + abs(e.B[1][2])
-                       + abs(e.B[2][0]) + abs(e.B[2][1]) + abs(e.B[2][2]);
+            SurfaceBRDF surface = bsdf.surface;
 
-            bool pbufOK = (bSum > 0);
-            bool gbufArea = (bsdf.area > 0);
-            bool sentinel = (bsdf.coverage == 12345.0f);  // set by Prepare shader
 
-            if (!pbufOK)
-                color = float3(1, 0, 1);       // magenta: pBuffer also zero
-            else if (sentinel && gbufArea)
-                color = float3(0, 1, 0);       // green: sentinel OK, area OK
-            else if (sentinel && !gbufArea)
-                color = float3(0, 0, 1);       // blue: sentinel OK but area==0 (init() bug!)
-            else if (!sentinel && gbufArea)
-                color = float3(1, 0.5, 0);     // orange: sentinel LOST but area OK
-            else
-                color = float3(1, 0, 0);       // red: sentinel LOST and area==0 (UAV write lost!)
         }
             break;
         case ABSDFDrawMode::LODLevel:

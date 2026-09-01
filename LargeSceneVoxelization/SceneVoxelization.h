@@ -30,6 +30,10 @@ struct VoxelizationConfig {
     uint baseResolution = 512;     // N = 2^D
     uint sampleFrequency = 1024;   // rays per Lebedev direction
 
+    // Match Falcor's SceneBuilder::Flags::UseSpecGlossMaterials behavior.
+    // FBX/GLTF materials use MetalRough by default; SpecGloss is opt-in.
+    bool useSpecGlossMaterials = false;
+
     // Number of additional coarser levels. LOD 0 is the leaf data;
     // lodLevels=1 additionally generates tree level maxDepth-1, etc.
     uint lodLevels = 0;
@@ -55,7 +59,7 @@ public:
     bool process(const std::string& fbxPath, const std::string& outputPath) {
         // ---- Phase 0: Load scene (instanced mode: unique meshes + transforms) ----
         std::cout << "Loading (instanced): " << fbxPath << std::endl;
-        SceneLoader loader;
+        SceneLoader loader(mConfig.useSpecGlossMaterials);
         InstancedScene scene;
         if (!loader.loadMeshInstances(fbxPath, scene)) {
             std::cerr << "Failed to load: " << loader.getError() << std::endl;
@@ -837,7 +841,7 @@ inline bool SceneVoxelization::processDisk(
 
     // ---- Phase 0: Load scene (same as in-memory path) ----
     std::cout << "Loading (instanced): " << fbxPath << std::endl;
-    SceneLoader loader;
+    SceneLoader loader(mConfig.useSpecGlossMaterials);
     InstancedScene scene;
     if (!loader.loadMeshInstances(fbxPath, scene)) {
         std::cerr << "Failed to load: " << loader.getError() << std::endl;
