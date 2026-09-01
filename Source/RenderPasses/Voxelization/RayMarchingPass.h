@@ -4,6 +4,7 @@
 #include <Core/Pass/FullScreenPass.h>
 #include <fstream>
 #include <filesystem>
+#include <string>
 
 using namespace Falcor;
 
@@ -75,6 +76,11 @@ private:
     ref<Buffer> mOctreeBuffer;
     uint32_t mOctreeMaxDepth = 0;
     std::vector<uint32_t> mOctreeNodeCounts;
+    uint32_t mAvailableLODLevels = 0;
+    uint32_t mVoxelFormatVersion = 0;
+    std::string mVoxelLodMode;
+    std::string mVoxelProducer;
+    bool mHasVoxelMetadata = false;
 
     bool mOptionsChanged;
     uint mFrameIndex;

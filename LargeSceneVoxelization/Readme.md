@@ -16,6 +16,9 @@ cmake --build . --config Release
 # 取消单节点多边形截断（可能显著增加当前层 Merge 的内存和磁盘占用）
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Old tree\OldTree.fbx" -o "..\resource\OldTree_unlimited.bin" -r 128 -s 256 -t 2 --max-polygons-per-node 0
 
+# 每个输出 bin 会同时生成同名文本 sidecar：OldTree.bin.meta
+# sidecar 记录版本、maxDepth、generatedLodLevels、lodMode、producer 等信息。
+
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Old tree\OldTree.fbx" -o "..\resource\OldTree.bin" -r 128 -t 2 -s 256 -j 20
 
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Old tree\OldTree.fbx" -o "..\resource\OldTree.bin" -r 256 -s 256
@@ -23,4 +26,3 @@ cmake --build . --config Release
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Metropolis\Metropolis.fbx" -o "..\resource\Metropolis_1.bin" -r 256 -s 1024
 
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\RainbowCoralReef\coral_reef.glb" -o "..\resource\Coral_reef_appx.bin" -r 512 -s 1024 --lod-levels 2 --lod-mode approximate
-

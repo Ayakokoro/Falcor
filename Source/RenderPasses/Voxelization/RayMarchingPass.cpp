@@ -1,4 +1,5 @@
 #include "RayMarchingPass.h"
+#include "VoxelizationMetadata.h"
 #include "Shading.slang"
 #include "Math/SphericalHarmonics.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
@@ -167,6 +168,56 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         uint32_t totalNodes = 0;
         for (uint32_t i = 0; i <= maxDepth; i++)
             totalNodes += nodeCounts[i];
+
+        // The binary layout is shared with the original voxelization pass.
+        // The optional text sidecar carries the producer/version and, for
+        // CPU-generated files, how many parent LOD levels contain data.
+        VoxelizationMetadata::Metadata metadata;
+        const auto& binaryPath = filePaths[selectedFile];
+        std::error_code metadataEc;
+        const bool hasSidecar = std::filesystem::exists(
+            VoxelizationMetadata::sidecarPath(binaryPath), metadataEc);
+        if (VoxelizationMetadata::read(binaryPath, metadata) &&
+            metadata.maxDepth == maxDepth &&
+            (metadata.totalNodes == 0 || metadata.totalNodes == totalNodes))
+        {
+            mHasVoxelMetadata = true;
+            mVoxelFormatVersion = metadata.version;
+            mVoxelLodMode = metadata.lodMode;
+            mVoxelProducer = metadata.producer;
+            mAvailableLODLevels = std::min(metadata.generatedLodLevels, maxDepth);
+            std::cout << "Voxel metadata: version=" << mVoxelFormatVersion
+                      << ", producer=" << mVoxelProducer
+                      << ", lodMode=" << mVoxelLodMode
+                      << ", availableLODLevels=" << mAvailableLODLevels << std::endl;
+        }
+        else if (hasSidecar)
+        {
+            // A present but invalid sidecar is not treated as a legacy file:
+            // conservatively expose leaves only instead of stopping at a
+            // possibly unavailable parent node.
+            mHasVoxelMetadata = false;
+            mVoxelFormatVersion = 0;
+            mVoxelLodMode.clear();
+            mVoxelProducer.clear();
+            mAvailableLODLevels = 0;
+            std::cerr << "Voxel metadata is missing, invalid, or does not "
+                      << "match the binary: "
+                      << VoxelizationMetadata::sidecarPath(binaryPath)
+                      << ". Falling back to leaf-only LOD." << std::endl;
+        }
+        else
+        {
+            // Files written before sidecar support generated data for every
+            // tree level, so preserve their historical behavior.
+            mHasVoxelMetadata = false;
+            mVoxelFormatVersion = 0;
+            mVoxelLodMode = "legacy";
+            mVoxelProducer = "legacy";
+            mAvailableLODLevels = maxDepth;
+            std::cout << "No voxel metadata sidecar; treating file as legacy "
+                      << "with all LOD levels available." << std::endl;
+        }
 
         std::cout << "Octree: maxDepth=" << maxDepth << ", totalNodes=" << totalNodes;
 
@@ -449,6 +500,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
+        cb["availableLODLevels"] = mAvailableLODLevels;
         for (size_t i = 0; i < mGBufferSplits.size(); ++i)
             cb["gbSplits"][i] = mGBufferSplits[i];
         cb["coverageBlend"] = mCoverageBlend;
@@ -523,7 +575,10 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         filePaths.clear();
         for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
         {
-            if (std::filesystem::is_regular_file(entry))
+            // Metadata is a sidecar (<file>.bin.meta), not a selectable voxel
+            // data file. Keep the dropdown restricted to binary voxel files.
+            if (std::filesystem::is_regular_file(entry) &&
+                entry.path().extension() == ".bin")
             {
                 filePaths.push_back(entry.path());
             }
@@ -558,6 +613,11 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             mOctreeBuffer = nullptr;
             mOctreeMaxDepth = 0;
             mOctreeNodeCounts.clear();
+            mAvailableLODLevels = 0;
+            mVoxelFormatVersion = 0;
+            mVoxelLodMode.clear();
+            mVoxelProducer.clear();
+            mHasVoxelMetadata = false;
             mBufferCount = 1;
             mpFullScreenPass = nullptr;
             mpDisplayNDFPass = nullptr;
@@ -580,6 +640,13 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     if (mOctreeMaxDepth > 0)
     {
         widget.text("Octree Max Depth: " + std::to_string(mOctreeMaxDepth));
+        widget.text("Available LOD Levels: " + std::to_string(mAvailableLODLevels));
+        if (mHasVoxelMetadata)
+        {
+            widget.text("Voxel Format Version: " + std::to_string(mVoxelFormatVersion));
+            widget.text("Voxel Producer: " + mVoxelProducer);
+            widget.text("LOD Build Mode: " + mVoxelLodMode);
+        }
         uint32_t totalNodes = 0;
         for (auto c : mOctreeNodeCounts)
             totalNodes += c;
@@ -591,7 +658,9 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (mDebug)
     {
-        int maxLOD = (int)mOctreeMaxDepth;
+        int maxLOD = (int)std::min(mOctreeMaxDepth, mAvailableLODLevels);
+        mForcedLOD = std::min(mForcedLOD, maxLOD);
+        mMaxLODLevel = std::min(mMaxLODLevel, maxLOD);
         if (widget.slider("Forced LOD", mForcedLOD, -1, maxLOD))
             mOptionsChanged = true;
         if (mForcedLOD >= 0)

@@ -13,6 +13,7 @@
 #include "MergePhase.h"
 #include "AnalyzePhase.h"
 #include "OctreeBuilder.h"
+#include "../Source/RenderPasses/Voxelization/VoxelizationMetadata.h"
 #include <vector>
 #include <memory>
 #include <fstream>
@@ -80,6 +81,7 @@ public:
         loadTextures(scene.materials);
 
         uint generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
+        mGeneratedLodLevels = generatedLodLevels;
         if (mConfig.lodLevels > mMaxDepth)
             std::cout << "  LOD level count clamped from " << mConfig.lodLevels
                       << " to " << mMaxDepth << std::endl;
@@ -408,6 +410,7 @@ private:
     VoxelizationConfig mConfig;
     GridData mGrid;
     uint mMaxDepth = 0;
+    uint mGeneratedLodLevels = 0;
 
     // Loaded textures: materialID -> texture
     std::vector<Texture2D> mBaseColorTextures;
@@ -626,6 +629,15 @@ private:
         f.write((const char*)gen.gBuffer.data(), totalNodes * sizeof(VoxelData));
 
         f.close();
+        VoxelizationMetadata::Metadata metadata;
+        metadata.maxDepth = mMaxDepth;
+        metadata.generatedLodLevels = mGeneratedLodLevels;
+        metadata.lodMode = mConfig.lodMode == LODBuildMode::Approximate
+            ? "approximate" : "brute-force";
+        metadata.producer = "LargeSceneVoxelization";
+        metadata.totalNodes = totalNodes;
+        if (!VoxelizationMetadata::write(outputPath, metadata))
+            std::cerr << "  [Output] WARNING: failed to write metadata sidecar." << std::endl;
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
     }
 
@@ -692,6 +704,15 @@ private:
         f.write((const char*)octree.gBuffer.data(), totalNodes * sizeof(VoxelData));
 
         f.close();
+        VoxelizationMetadata::Metadata metadata;
+        metadata.maxDepth = mMaxDepth;
+        metadata.generatedLodLevels = mGeneratedLodLevels;
+        metadata.lodMode = mConfig.lodMode == LODBuildMode::Approximate
+            ? "approximate" : "brute-force";
+        metadata.producer = "LargeSceneVoxelization";
+        metadata.totalNodes = totalNodes;
+        if (!VoxelizationMetadata::write(outputPath, metadata))
+            std::cerr << "  [Output] WARNING: failed to write metadata sidecar." << std::endl;
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
     }
 
@@ -841,6 +862,7 @@ inline bool SceneVoxelization::processDisk(
     loadTextures(scene.materials);
 
     uint32_t generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
+    mGeneratedLodLevels = generatedLodLevels;
     if (mConfig.lodLevels > mMaxDepth)
         std::cout << "  LOD level count clamped from " << mConfig.lodLevels
                   << " to " << mMaxDepth << std::endl;

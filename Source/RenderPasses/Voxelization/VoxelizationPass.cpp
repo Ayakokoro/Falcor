@@ -1,4 +1,5 @@
 #include "VoxelizationPass.h"
+#include "VoxelizationMetadata.h"
 #include <fstream>
 #include <algorithm>
 #include <iomanip>
@@ -759,6 +760,16 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer)
     f.write(reinterpret_cast<const char*>(pGBuffer), polygonGenerator.gBuffer.size() * sizeof(VoxelData));
 
     f.close();
+    VoxelizationMetadata::Metadata metadata;
+    metadata.maxDepth = polygonGenerator.mOctreeMaxDepth;
+    // The GPU pass uses hierarchical clipping and analyzes every populated
+    // tree level in one dispatch sequence, so all levels are available.
+    metadata.generatedLodLevels = polygonGenerator.mOctreeMaxDepth;
+    metadata.lodMode = "gpu-hierarchical";
+    metadata.producer = "VoxelizationPass";
+    metadata.totalNodes = polygonGenerator.gBuffer.size();
+    if (!VoxelizationMetadata::write(std::filesystem::path(s), metadata))
+        std::cerr << "[Voxelization] WARNING: failed to write metadata sidecar." << std::endl;
     VoxelizationBase::FileUpdated = true;
 }
 

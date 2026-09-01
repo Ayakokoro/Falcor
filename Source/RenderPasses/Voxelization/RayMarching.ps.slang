@@ -48,6 +48,7 @@ cbuffer CB
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
+    uint availableLODLevels; // generated parent levels; 0 means leaf data only
     uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
 }
@@ -310,8 +311,16 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             uint nodeLOD     = octreeMaxDepth - octreeDepth;     // 0 at leaf
             uint nodeSize    = 1u << nodeLOD;                    // 1 at leaf
 
-            bool forcedStop  = (forcedLOD > 0 && (int)nodeLOD == forcedLOD)
-                            || (fixedLod >= 0 && (int)nodeLOD == fixedLod);
+            // Structural ancestor nodes are present even when the CPU
+            // voxelizer was asked to generate leaves only. Never stop at
+            // such a node. The area check also protects the CHECK_ELLIPSOID=0
+            // path, where rayHitVoxel would otherwise accept an empty node.
+            TEBSDF nodeData = loadGBuffer(childNode.dataIndex);
+            bool nodeHasData = (nodeLOD <= availableLODLevels) && (nodeData.area > 0.0f);
+
+            bool forcedStop  = nodeHasData &&
+                            ((forcedLOD > 0 && (int)nodeLOD == forcedLOD)
+                          || (fixedLod >= 0 && (int)nodeLOD == fixedLod));
 
             // Dynamic LOD: compare ray-footprint radius with node size.
             // Only active for primary rays (fixedLod < 0); secondary bounces,
@@ -323,9 +332,10 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             float worldDist = (tc_max - t_entry) * float(rootSize);
             float footprint = cone.bias + max(worldDist, 0.0f) * cone.tanHalfAngle;
             bool lodLevelOK  = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
-            bool dynamicStop = (fixedLod < 0) && lodLevelOK && (footprint > (float)nodeSize);
+            bool dynamicStop = nodeHasData && (fixedLod < 0) && lodLevelOK &&
+                               (footprint > (float)nodeSize);
 
-            bool shouldStop = isLeaf || forcedStop || dynamicStop;
+            bool shouldStop = nodeHasData && (isLeaf || forcedStop || dynamicStop);
 
             // --- Hit test when a stopping condition is met ---
             if (shouldStop && t_min <= tv_max)
@@ -358,9 +368,9 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             }
 
             // --- PUSH: descend into child ---
-            // Push when: internal node AND not force-stopped.
-            // (dynamicStop nodes that missed the ellipsoid also push — their
-            //  forcedStop is false, so !isLeaf && !forcedStop holds.)
+            // Unavailable internal nodes also come through this path because
+            // forcedStop is gated by nodeHasData. Dynamic-stop nodes that miss
+            // the ellipsoid likewise continue descending.
             bool wantPush = (!isLeaf && !forcedStop) && (t_min <= tv_max);
 
             if (wantPush)
