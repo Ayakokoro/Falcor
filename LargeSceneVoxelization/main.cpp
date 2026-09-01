@@ -9,6 +9,9 @@ int main(int argc, char* argv[]) {
     std::string outputPath;
     uint32_t resolution = 512;
     uint32_t sampleFrequency = 1024;
+    uint32_t lodLevels = 0;
+    LODBuildMode lodMode = LODBuildMode::Approximate;
+    uint32_t maxPolygonsPerNode = SAFE_PER_NODE_POLYGON_LIMIT;
     uint32_t numThreads = 0;           // 0 = auto-detect
     std::string tmpDir = "./tmp";
     bool keepTemp = true;              // default: preserve temp files
@@ -22,6 +25,21 @@ int main(int argc, char* argv[]) {
             resolution = (uint32_t)std::stoul(argv[++i]);
         } else if (arg == "-s" && i + 1 < argc) {
             sampleFrequency = (uint32_t)std::stoul(argv[++i]);
+        } else if ((arg == "-l" || arg == "--lod-levels") && i + 1 < argc) {
+            lodLevels = (uint32_t)std::stoul(argv[++i]);
+        } else if ((arg == "--lod-mode" || arg == "--lod-method") && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "approximate" || mode == "approx") {
+                lodMode = LODBuildMode::Approximate;
+            } else if (mode == "brute-force" || mode == "bruteforce" || mode == "exact") {
+                lodMode = LODBuildMode::BruteForce;
+            } else {
+                std::cerr << "Unknown LOD mode: " << mode
+                          << " (expected approximate or brute-force)\n";
+                return 1;
+            }
+        } else if (arg == "--max-polygons-per-node" && i + 1 < argc) {
+            maxPolygonsPerNode = (uint32_t)std::stoul(argv[++i]);
         } else if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
             numThreads = (uint32_t)std::stoul(argv[++i]);
         } else if (arg == "--tmp-dir" && i + 1 < argc) {
@@ -43,6 +61,9 @@ int main(int argc, char* argv[]) {
                   << "  -o <path>         Output file (default: <input>_voxelized.bin)\n"
                   << "  -r <N>            Grid resolution (default: 512)\n"
                   << "  -s <N>            Sample frequency per Lebedev direction (default: 1024)\n"
+                  << "  -l, --lod-levels <N>  Additional coarse LOD levels (0 = leaves only)\n"
+                  << "  --lod-mode <mode>     approximate or brute-force (default: approximate)\n"
+                  << "  --max-polygons-per-node <N>  Per-node cap; 0 = unlimited\n"
                   << "  -t, --threads <N> Number of clip threads (default: auto-detect)\n"
                   << "  --tmp-dir <path>  Temp directory for intermediate files (default: ./tmp/)\n"
                   << "  --keep-temp       Keep temp files after completion (default)\n"
@@ -62,12 +83,21 @@ int main(int argc, char* argv[]) {
     VoxelizationConfig config;
     config.baseResolution = resolution;
     config.sampleFrequency = sampleFrequency;
+    config.lodLevels = lodLevels;
+    config.lodMode = lodMode;
+    config.maxPolygonsPerNode = maxPolygonsPerNode;
 
     std::cout << "=== LargeSceneVoxelization ===" << std::endl;
     std::cout << "  Input:       " << inputPath << std::endl;
     std::cout << "  Output:      " << outputPath << std::endl;
     std::cout << "  Resolution:  " << resolution << std::endl;
     std::cout << "  Samples:     " << sampleFrequency << std::endl;
+    std::cout << "  LOD levels:  " << lodLevels << std::endl;
+    std::cout << "  LOD mode:    "
+              << (lodMode == LODBuildMode::Approximate ? "approximate" : "brute-force")
+              << std::endl;
+    std::cout << "  Poly cap:    " << maxPolygonsPerNode
+              << (maxPolygonsPerNode == 0 ? " (unlimited)" : "") << std::endl;
     std::cout << "  Threads:     " << numThreads << std::endl;
     std::cout << "  Mode:        " << (useInMemory ? "in-memory" : "disk-backed") << std::endl;
     if (!useInMemory) {

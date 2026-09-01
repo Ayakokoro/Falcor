@@ -14,12 +14,15 @@
 #include <atomic>
 #include <iostream>
 #include <algorithm>
+#include <string>
 
 namespace ClipPhase {
 
 struct ClipResult {
     std::vector<std::filesystem::path> shardFiles;
+    std::filesystem::path shardDir;
     uint64_t totalPolygonsClipped = 0;
+    uint32_t targetLevel = 0;
 };
 
 // ---- Transform helpers (mirror SceneVoxelization private statics) ----
@@ -41,16 +44,19 @@ static inline float3 transformNormal(const float3& localNormal, const glm::mat4&
     return safeNormalize(float3(wn.x, wn.y, wn.z));
 }
 
-// ---- Recursive hierarchical clip, writes leaf polygons to stream ----
+// ---- Recursive hierarchical clip, writes one selected tree level ----
 // Identical algorithm to SceneVoxelization::clipHierarchical, but outputs
-// to a binary stream instead of mNodePolygonMap.
-// Returns the number of leaf entries written.
+// to a binary stream instead of mNodePolygonMap.  The traversal still starts
+// at the root for every triangle, but stops as soon as targetLevel is reached.
+// This is what lets the caller run one independent pass per exact LOD level.
+// Returns the number of node polygon entries written.
 
 // TODO:Maybe cause stack overflow
 static uint64_t clipHierarchicalToStream(
     uint32_t meshID, uint32_t materialID, uint32_t triangleID, uint32_t instanceIdx,
     Triangle& tri, const AABBInt& triAABB, const int3& nodeCell,
     uint32_t level, uint32_t maxDepth,
+    uint32_t targetLevel,
     std::ostream& out)
 {
     uint32_t scale = 1u << (maxDepth - level);
@@ -73,10 +79,14 @@ static uint64_t clipHierarchicalToStream(
 
     uint64_t written = 0;
 
-    if (level == maxDepth) {
+    if (level == targetLevel) {
         uint64_t nodeKey = PolygonGenerator::makeNodeKey(level, nodeCell);
         PolygonSerializer::writeShardEntry(out, nodeKey, polygon);
         written = 1;
+
+        // This pass owns only one tree level.  Do not descend to finer
+        // levels; the next exact LOD pass will rescan the scene separately.
+        return written;
     }
 
     if (level >= maxDepth) return written;
@@ -95,7 +105,7 @@ static uint64_t clipHierarchicalToStream(
 
         written += clipHierarchicalToStream(
             meshID, materialID, triangleID, instanceIdx,
-            tri, triAABB, childCell, level + 1, maxDepth, out);
+            tri, triAABB, childCell, level + 1, maxDepth, targetLevel, out);
     }
     return written;
 }
@@ -112,6 +122,7 @@ static void clipWorker(
     const InstancedScene& scene,
     const GridData& grid,
     uint32_t maxDepth,
+    uint32_t targetLevel,
     const std::filesystem::path& clipDir,
     const std::vector<uint32_t>& assignedInstances,
     std::atomic<uint64_t>& globalTriangleCounter,
@@ -163,7 +174,7 @@ static void clipWorker(
             entryCount += clipHierarchicalToStream(
                 inst.meshID, matID, localTid, instIdx,
                 tri, tri.calcAABBInt(),
-                int3(0, 0, 0), 0, maxDepth, out);
+                int3(0, 0, 0), 0, maxDepth, targetLevel, out);
 
             triCount++;
             globalTriangleCounter.fetch_add(1, std::memory_order_relaxed);
@@ -180,20 +191,29 @@ static void clipWorker(
 
     std::cout << "  [Clip] Thread " << threadId
               << " done: " << triCount << " triangles, "
-              << entryCount << " leaf polygon entries" << std::endl;
+              << entryCount << " level-" << targetLevel
+              << " polygon entries" << std::endl;
 }
 
 // ---- Main entry point ----
 
-inline ClipResult execute(
+inline ClipResult executeLevel(
     const InstancedScene& scene,
     const GridData& grid,
     uint32_t maxDepth,
+    uint32_t targetLevel,
     const std::filesystem::path& tmpDir,
-    uint32_t numThreads)
+    uint32_t numThreads,
+    const std::string& phaseName)
 {
     namespace fs = std::filesystem;
-    fs::path clipDir = tmpDir / "clip";
+    if (targetLevel > maxDepth) {
+        std::cerr << "  [Clip] ERROR: target level " << targetLevel
+                  << " exceeds maxDepth " << maxDepth << std::endl;
+        return {};
+    }
+
+    fs::path clipDir = tmpDir / phaseName;
     fs::create_directories(clipDir);
 
     uint32_t numInstances = (uint32_t)scene.instances.size();
@@ -227,7 +247,8 @@ inline ClipResult execute(
 
     for (uint32_t t = 0; t < numThreads; t++) {
         threads.emplace_back(clipWorker, t,
-            std::cref(scene), std::cref(grid), maxDepth,
+        std::cref(scene), std::cref(grid), maxDepth,
+            targetLevel,
             std::cref(clipDir),
             std::cref(assignments[t]),
             std::ref(globalCounter),
@@ -251,16 +272,31 @@ inline ClipResult execute(
 
     // Build result
     ClipResult result;
+    result.shardDir = clipDir;
+    result.targetLevel = targetLevel;
     for (uint32_t t = 0; t < numThreads; t++) {
         result.shardFiles.push_back(clipDir / ("thread_" + PolygonSerializer::pad4(t) + ".bin"));
         result.totalPolygonsClipped += stats[t].entriesWritten;
     }
 
-    std::cout << "  [Clip] Phase complete: " << result.totalPolygonsClipped
-              << " total leaf polygon entries across "
+    std::cout << "  [Clip] Level " << targetLevel << " phase complete: "
+              << result.totalPolygonsClipped
+              << " total polygon entries across "
               << result.shardFiles.size() << " shard files" << std::endl;
 
     return result;
+}
+
+// Backward-compatible leaf-only entry point used by existing callers.
+inline ClipResult execute(
+    const InstancedScene& scene,
+    const GridData& grid,
+    uint32_t maxDepth,
+    const std::filesystem::path& tmpDir,
+    uint32_t numThreads)
+{
+    return executeLevel(scene, grid, maxDepth, maxDepth, tmpDir,
+                        numThreads, "clip");
 }
 
 } // namespace ClipPhase

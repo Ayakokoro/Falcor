@@ -19,10 +19,11 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <string>
 
 namespace AnalyzePhase {
 
-// Context carrying all scene data needed for leaf analysis
+// Context carrying all scene data needed for per-node analysis.
 struct AnalyzeContext {
     const InstancedScene& scene;
     const GridData& grid;
@@ -52,24 +53,26 @@ static inline float3 transformNormal(const float3& localNormal, const glm::mat4&
     return safeNormalize(float3(wn.x, wn.y, wn.z));
 }
 
-// ---- Process a single leaf node ----
-// Extracted from SceneVoxelization::process() leaf analysis block (lines 108-217).
+// ---- Process a single node ----
+// The same analysis is valid for a leaf or for an exact-clipped internal LOD
+// node.  Polygon coordinates are local to the node, and rangeScale restores
+// them to voxel space for UV/normal reconstruction.
 
-inline void analyzeLeaf(
+inline void analyzeNode(
     OctreeBuilder::OctreeResult& octree,
     uint32_t bfsIndex,
-    const std::vector<Polygon>& leafPolys,
+    const std::vector<Polygon>& nodePolys,
     const AnalyzeContext& ctx)
 {
     auto& bfsItem = octree.bfsOrder[bfsIndex];
     float rangeScale = (float)(1u << (ctx.maxDepth - bfsItem.level));
 
     // Build a temporary PolygonRange for Ellipsoid::fit and Estimate APIs.
-    // localHead = 0 because leafPolys is our local contiguous buffer.
+    // localHead = 0 because nodePolys is our local contiguous buffer.
     PolygonRange range;
     range.init(bfsItem.cellInt);
     range.nodeScale = rangeScale;
-    range.count = (uint32_t)leafPolys.size();
+    range.count = (uint32_t)nodePolys.size();
 
     VoxelData& vd = octree.gBuffer[bfsIndex];
     vd.init();
@@ -78,8 +81,8 @@ inline void analyzeLeaf(
                          1.0f / ctx.grid.voxelSize.y,
                          1.0f / ctx.grid.voxelSize.z);
 
-    for (uint32_t pi = 0; pi < leafPolys.size(); pi++) {
-        const Polygon& poly = leafPolys[pi];
+    for (uint32_t pi = 0; pi < nodePolys.size(); pi++) {
+        const Polygon& poly = nodePolys[pi];
 
         uint32_t localTid = poly.triRef.triangleID;
         uint32_t meshID   = poly.triRef.meshID;
@@ -201,15 +204,15 @@ inline void analyzeLeaf(
 
     if (vd.isSolid()) {
         // Ellipsoid::fit accesses polygons via range.localHead offset into the buffer.
-        // Since leafPolys is a contiguous local buffer, localHead=0 works correctly.
-        vd.ellipsoid.fit(leafPolys, range);
+        // Since nodePolys is a contiguous local buffer, localHead=0 works correctly.
+        vd.ellipsoid.fit(nodePolys, range);
 
         SphericalFunc polyF  = vd.polygonsProjAreaFunc;
         SphericalFunc primF  = vd.primitiveProjAreaFunc;
         SphericalFunc totalF = vd.totalProjAreaFunc;
 
         Estimate(vd.ellipsoid, range, polyF, primF, totalF,
-                 leafPolys, ctx.sampleFrequency);
+                 nodePolys, ctx.sampleFrequency);
 
         vd.polygonsProjAreaFunc  = polyF;
         vd.primitiveProjAreaFunc = primF;
@@ -217,117 +220,108 @@ inline void analyzeLeaf(
     }
 }
 
-// ---- Main entry point: stream through leaves.idx, analyze each leaf ----
-// Partitions leafIndices across numThreads workers. Each worker opens
-// its own read-only ifstream on polygons.dat so seeks don't conflict.
-// gBuffer writes are naturally disjoint (unique bfsIndex per leaf).
-
-inline void execute(
-    const MergePhase::MergeResult& mergeResult,
+// Analyze a generic node-index file. The leaf path and every exact LOD path
+// share the same index/polygon layout; keyToBFSIndex resolves both leaves and
+// internal nodes in the one octree built by the leaf merge.
+inline void executeNodes(
+    const std::filesystem::path& indexPath,
+    const std::filesystem::path& polygonsDatPath,
+    OctreeBuilder::OctreeResult& octree,
     const AnalyzeContext& ctx,
-    uint32_t numThreads = 0)
+    uint32_t numThreads = 0,
+    const std::string& label = "nodes")
 {
-    // Read leaves.idx (single-threaded, fast)
-    std::ifstream idxIn(mergeResult.leavesIdxPath, std::ios::binary);
+    std::ifstream idxIn(indexPath, std::ios::binary);
     if (!idxIn) {
-        std::cerr << "  [Analyze] ERROR: cannot open " << mergeResult.leavesIdxPath << std::endl;
+        std::cerr << "  [Analyze] ERROR: cannot open " << indexPath << std::endl;
         return;
     }
 
-    PolygonSerializer::LeavesIdxHeader idxHdr;
-    if (!PolygonSerializer::readLeavesIdxHeader(idxIn, idxHdr)) {
-        std::cerr << "  [Analyze] ERROR: invalid leaves.idx header" << std::endl;
+    PolygonSerializer::NodesIdxHeader idxHdr;
+    if (!PolygonSerializer::readNodesIdxHeader(idxIn, idxHdr)) {
+        std::cerr << "  [Analyze] ERROR: invalid node index " << indexPath << std::endl;
         return;
     }
 
-    std::vector<PolygonSerializer::LeafIndex> leafIndices;
-    PolygonSerializer::readLeafIndices(idxIn, leafIndices, idxHdr.leafCount);
+    std::vector<PolygonSerializer::NodeIndex> nodeIndices;
+    PolygonSerializer::readNodeIndices(idxIn, nodeIndices, idxHdr.leafCount);
     idxIn.close();
 
-    uint64_t totalLeaves = leafIndices.size();
-    std::cout << "  [Analyze] " << totalLeaves << " leaves to process" << std::endl;
+    uint64_t totalNodes = nodeIndices.size();
+    std::cout << "  [Analyze] " << label << ": " << totalNodes
+              << " nodes to process" << std::endl;
 
-    if (totalLeaves == 0) return;
+    if (totalNodes == 0) return;
 
-    // Determine thread count
     if (numThreads == 0)
         numThreads = std::max(1u, std::thread::hardware_concurrency());
-    numThreads = std::min(numThreads, (uint32_t)totalLeaves);
+    numThreads = std::min(numThreads, (uint32_t)totalNodes);
 
-    auto& octree = const_cast<OctreeBuilder::OctreeResult&>(mergeResult.octree);
-
-    // Shared atomic counters
     std::atomic<uint64_t> processed{0};
     std::atomic<uint64_t> skipped{0};
 
-    // Worker function: processes a contiguous slice of leafIndices
     auto worker = [&](uint64_t start, uint64_t end, uint32_t threadId) {
-        // Each thread opens its own file handle for independent seeking
-        std::ifstream polyIn(mergeResult.polygonsDatPath, std::ios::binary);
+        std::ifstream polyIn(polygonsDatPath, std::ios::binary);
         if (!polyIn) {
             std::cerr << "  [Analyze] ERROR: thread " << threadId
-                      << " cannot open " << mergeResult.polygonsDatPath << std::endl;
+                      << " cannot open " << polygonsDatPath << std::endl;
             return;
         }
 
-        // Progress reporting: only thread 0 prints progress
         uint64_t nextReport = 5000;
 
-        for (uint64_t li = start; li < end; li++) {
-            const auto& leafIdx = leafIndices[li];
+        for (uint64_t ni = start; ni < end; ni++) {
+            const auto& nodeIndex = nodeIndices[ni];
 
-            // Seek to this leaf's polygon block
-            polyIn.seekg(leafIdx.dataOffset);
+            polyIn.seekg(nodeIndex.dataOffset);
             if (!polyIn) {
-                std::cerr << "  [Analyze] ERROR: seek to offset " << leafIdx.dataOffset
-                          << " failed (thread " << threadId << ")" << std::endl;
+                std::cerr << "  [Analyze] ERROR: seek to offset "
+                          << nodeIndex.dataOffset << " failed (thread "
+                          << threadId << ")" << std::endl;
                 skipped.fetch_add(1, std::memory_order_relaxed);
                 processed.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
-            // Read polygon block
-            std::vector<Polygon> leafPolys(leafIdx.polyCount);
-            for (uint32_t pi = 0; pi < leafIdx.polyCount; pi++) {
-                leafPolys[pi].init();
-                PolygonSerializer::readPolygon(polyIn, leafPolys[pi]);
+            std::vector<Polygon> nodePolys(nodeIndex.polyCount);
+            for (uint32_t pi = 0; pi < nodeIndex.polyCount; pi++) {
+                nodePolys[pi].init();
+                PolygonSerializer::readPolygon(polyIn, nodePolys[pi]);
             }
 
-            if (leafPolys.empty()) {
+            if (nodePolys.empty()) {
                 skipped.fetch_add(1, std::memory_order_relaxed);
                 processed.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
-            // Find BFS index for this leaf
-            auto bfsIt = octree.leafKeyToBFSIndex.find(leafIdx.nodeKey);
-            if (bfsIt == octree.leafKeyToBFSIndex.end()) {
+            auto bfsIt = octree.keyToBFSIndex.find(nodeIndex.nodeKey);
+            if (bfsIt == octree.keyToBFSIndex.end()) {
+                std::cerr << "  [Analyze] WARNING: nodeKey " << nodeIndex.nodeKey
+                          << " is not present in the octree" << std::endl;
                 skipped.fetch_add(1, std::memory_order_relaxed);
                 processed.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
-            analyzeLeaf(octree, bfsIt->second, leafPolys, ctx);
+            analyzeNode(octree, bfsIt->second, nodePolys, ctx);
 
-            // Atomic progress update
             uint64_t p = processed.fetch_add(1, std::memory_order_relaxed) + 1;
-
-            // Thread 0 handles progress reporting
             if (threadId == 0 && p >= nextReport) {
-                std::cout << "\r  [Analyze] " << p << "/" << totalLeaves
-                          << " leaves (" << (p * 100 / totalLeaves) << "%)" << std::flush;
+                std::cout << "\r  [Analyze] " << label << ": " << p << "/"
+                          << totalNodes << " nodes ("
+                          << (p * 100 / totalNodes) << "%)" << std::flush;
                 nextReport = p + 5000;
             }
         }
     };
 
-    // Partition work and launch threads
     std::vector<std::thread> threads;
-    uint64_t chunkSize = (totalLeaves + numThreads - 1) / numThreads;
+    uint64_t chunkSize = (totalNodes + numThreads - 1) / numThreads;
 
     for (uint32_t t = 0; t < numThreads; t++) {
         uint64_t start = t * chunkSize;
-        uint64_t end = std::min(start + chunkSize, totalLeaves);
+        uint64_t end = std::min(start + chunkSize, totalNodes);
         if (start >= end) break;
         threads.emplace_back(worker, start, end, t);
     }
@@ -335,10 +329,30 @@ inline void execute(
     for (auto& t : threads)
         t.join();
 
-    std::cout << "\r  [Analyze] " << processed.load() << "/" << totalLeaves
-              << " leaves (100%)";
-    if (skipped.load() > 0) std::cout << "  skipped=" << skipped.load();
+    std::cout << "\r  [Analyze] " << label << ": " << processed.load()
+              << "/" << totalNodes << " nodes (100%)";
+    if (skipped.load() > 0)
+        std::cout << "  skipped=" << skipped.load();
     std::cout << std::endl;
+}
+
+// Backward-compatible leaf entry point.
+inline void execute(
+    const MergePhase::MergeResult& mergeResult,
+    const AnalyzeContext& ctx,
+    uint32_t numThreads = 0)
+{
+    if (!mergeResult.octree) {
+        std::cerr << "  [Analyze] ERROR: merge result has no octree" << std::endl;
+        return;
+    }
+
+    executeNodes(mergeResult.leavesIdxPath,
+                 mergeResult.polygonsDatPath,
+                 *mergeResult.octree,
+                 ctx,
+                 numThreads,
+                 "leaves");
 }
 
 } // namespace AnalyzePhase

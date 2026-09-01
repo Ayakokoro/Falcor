@@ -86,9 +86,14 @@ inline void patchShardEntryCount(std::ostream& os, uint64_t count) {
     os.write(reinterpret_cast<const char*>(&count), sizeof(uint64_t));
 }
 
-// --- leaves.idx ---
-// Header: magic|version|leafCount|maxDepth|reserved
-// Followed by leafCount * LeafIndex (24 bytes each)
+// --- node index files ---
+// Header: magic|version|nodeCount|maxDepth|reserved
+// Followed by nodeCount * NodeIndex (24 bytes each).
+//
+// The original disk pipeline called these entries LeafIndex and stored them
+// in leaves.idx.  The same on-disk layout is also used for an independently
+// generated internal LOD level, so keep the old names as aliases for backward
+// compatibility while exposing the level-neutral names below.
 
 constexpr uint32_t LEAVES_IDX_MAGIC   = 0x49444C56;  // "VLDI"
 constexpr uint32_t LEAVES_IDX_VERSION = 2;  // v2 uses the collision-free nodeKey encoding
@@ -100,6 +105,8 @@ struct LeafIndex {
     uint32_t padding    = 0;
 };
 
+using NodeIndex = LeafIndex;
+
 struct LeavesIdxHeader {
     uint32_t magic     = LEAVES_IDX_MAGIC;
     uint32_t version   = LEAVES_IDX_VERSION;
@@ -107,6 +114,8 @@ struct LeavesIdxHeader {
     uint32_t maxDepth  = 0;
     uint32_t reserved  = 0;
 };
+
+using NodesIdxHeader = LeavesIdxHeader;
 
 inline void writeLeavesIdxHeader(std::ostream& os, const LeavesIdxHeader& hdr) {
     os.write(reinterpret_cast<const char*>(&hdr), sizeof(LeavesIdxHeader));
@@ -127,9 +136,26 @@ inline void readLeafIndices(std::istream& is, std::vector<LeafIndex>& indices, u
     is.read(reinterpret_cast<char*>(indices.data()), count * sizeof(LeafIndex));
 }
 
+inline void writeNodesIdxHeader(std::ostream& os, const NodesIdxHeader& hdr) {
+    writeLeavesIdxHeader(os, hdr);
+}
+
+inline bool readNodesIdxHeader(std::istream& is, NodesIdxHeader& hdr) {
+    return readLeavesIdxHeader(is, hdr);
+}
+
+inline void writeNodeIndices(std::ostream& os, const std::vector<NodeIndex>& indices) {
+    writeLeafIndices(os, indices);
+}
+
+inline void readNodeIndices(std::istream& is, std::vector<NodeIndex>& indices, uint64_t count) {
+    readLeafIndices(is, indices, count);
+}
+
 // --- polygons.dat ---
-// Each leaf block: [polyCount: u32][serializedPolygon[polyCount]]
-// Leaves are stored in bucket-hash order; leaves.idx provides the offset mapping.
+// Each node block: [polyCount: u32][serializedPolygon[polyCount]].
+// The node index file stores the count and offset mapping; leaf blocks retain
+// the historical layout.
 
 inline void writeLeafBlock(std::ostream& os, const std::vector<Polygon>& polys) {
     uint32_t count = (uint32_t)polys.size();

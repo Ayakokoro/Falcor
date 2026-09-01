@@ -18,10 +18,24 @@
 #include <fstream>
 #include <iostream>
 #include <filesystem>
+#include <string>
+
+enum class LODBuildMode {
+    Approximate,
+    BruteForce
+};
 
 struct VoxelizationConfig {
     uint baseResolution = 512;     // N = 2^D
     uint sampleFrequency = 1024;   // rays per Lebedev direction
+
+    // Number of additional coarser levels. LOD 0 is the leaf data;
+    // lodLevels=1 additionally generates tree level maxDepth-1, etc.
+    uint lodLevels = 0;
+    LODBuildMode lodMode = LODBuildMode::Approximate;
+
+    // 0 means unlimited. The default preserves the existing safety limit.
+    uint maxPolygonsPerNode = SAFE_PER_NODE_POLYGON_LIMIT;
 };
 
 // CPU scene voxelization — instanced loading, single hierarchical clip pass,
@@ -65,6 +79,17 @@ public:
 
         loadTextures(scene.materials);
 
+        uint generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
+        if (mConfig.lodLevels > mMaxDepth)
+            std::cout << "  LOD level count clamped from " << mConfig.lodLevels
+                      << " to " << mMaxDepth << std::endl;
+
+        if (mConfig.lodMode == LODBuildMode::BruteForce && generatedLodLevels > 0) {
+            std::cerr << "Brute-force LOD generation is implemented by the disk-backed "
+                      << "pipeline. Remove --in-memory for exact LOD passes." << std::endl;
+            return false;
+        }
+
         std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
                   << "  maxDepth=" << mMaxDepth << std::endl;
 
@@ -97,7 +122,8 @@ public:
 
                 clipHierarchical(inst.meshID, matID, localTid, instIdx,
                                 tri, tri.calcAABBInt(),
-                                int3(0, 0, 0), 0, mMaxDepth, gen);
+                                int3(0, 0, 0), 0, mMaxDepth, gen,
+                                mConfig.maxPolygonsPerNode);
             }
         }
 
@@ -261,7 +287,8 @@ public:
                     vd.totalProjAreaFunc = totalF;
                 }
 
-            } else {
+            } else if (mConfig.lodMode == LODBuildMode::Approximate &&
+                       level >= mMaxDepth - generatedLodLevels) {
                 // ── NON-LEAF: aggregate from children's VoxelData ──
                 VoxelData& vd = gen.gBuffer[nodeIdx];
                 vd.init();
@@ -354,6 +381,10 @@ public:
                     if (extPoints.size() >= 6)
                         vd.ellipsoid.fitFromPoints(extPoints, gen.mBFSOrder[nodeIdx].cellInt);
                 }
+            } else {
+                // Keep the structural node, but leave its data unavailable
+                // when this level was not requested.
+                gen.gBuffer[nodeIdx].init();
             }
         }
 
@@ -476,7 +507,8 @@ private:
         uint meshID, uint materialID, uint triangleID, uint instanceIdx,
         Triangle& tri, const AABBInt& triAABB, const int3& nodeCell,
         uint level, uint maxDepth,
-        PolygonGenerator& gen) {
+        PolygonGenerator& gen,
+        uint maxPolygonsPerNode) {
 
         uint scale = 1u << (maxDepth - level);
         float3 minPoint = float3(nodeCell) * (float)scale;
@@ -501,7 +533,7 @@ private:
         if (level == maxDepth) {
             // Leaf: directly push polygon to map
             auto& polys = gen.mNodePolygonMap[nodeKey];
-            if (polys.size() < SAFE_PER_NODE_POLYGON_LIMIT)
+            if (maxPolygonsPerNode == 0 || polys.size() < maxPolygonsPerNode)
                 polys.push_back(polygon);
         }
 
@@ -517,7 +549,8 @@ private:
                 triAABB.zMax < childMin.z || triAABB.zMin > childMax.z)
                 continue;
             clipHierarchical(meshID, materialID, triangleID, instanceIdx, tri, triAABB,
-                            childCell, level + 1, maxDepth, gen);
+                            childCell, level + 1, maxDepth, gen,
+                            maxPolygonsPerNode);
         }
     }
 
@@ -662,9 +695,15 @@ private:
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
     }
 
-    // ---- Phase 4: Parent aggregation from children's VoxelData ----
-    // Works identically for both in-memory (PolygonGenerator) and disk (OctreeResult) paths.
-    static void aggregateParents(OctreeBuilder::OctreeResult& octree, uint32_t maxDepth) {
+    // ---- Parent aggregation from children's VoxelData ----
+    // Works identically for both in-memory (PolygonGenerator) and disk
+    // (OctreeResult) paths. Only the requested number of parent levels is
+    // populated; the remaining structural nodes keep initialized empty data.
+    static void aggregateParents(OctreeBuilder::OctreeResult& octree,
+                                 uint32_t maxDepth,
+                                 uint32_t generatedLodLevels) {
+        generatedLodLevels = std::min(generatedLodLevels, maxDepth);
+        uint32_t firstGeneratedLevel = maxDepth - generatedLodLevels;
         int totalNodes = (int)octree.totalNodes();
         for (int nodeIdx = totalNodes - 1; nodeIdx >= 0; nodeIdx--) {
             uint32_t level = octree.bfsOrder[nodeIdx].level;
@@ -673,6 +712,9 @@ private:
 
             VoxelData& vd = octree.gBuffer[nodeIdx];
             vd.init();
+
+            if (level < firstGeneratedLevel)
+                continue;
 
             const OctreeNode& oct = octree.octreeNodes[nodeIdx];
             if (!oct.childMask) continue;
@@ -798,13 +840,24 @@ inline bool SceneVoxelization::processDisk(
 
     loadTextures(scene.materials);
 
+    uint32_t generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
+    if (mConfig.lodLevels > mMaxDepth)
+        std::cout << "  LOD level count clamped from " << mConfig.lodLevels
+                  << " to " << mMaxDepth << std::endl;
+
+    const char* lodModeName =
+        mConfig.lodMode == LODBuildMode::Approximate ? "approximate" : "brute-force";
+    std::cout << "  LODs: " << generatedLodLevels
+              << " additional levels, mode=" << lodModeName << std::endl;
+
     std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
               << "  maxDepth=" << mMaxDepth << std::endl;
 
     // ---- Phase 1: Multi-threaded clip → shard files ----
     std::cout << "\n=== Phase 1: Multi-threaded Clip ===" << std::endl;
-    auto clipResult = ClipPhase::execute(scene, mGrid, mMaxDepth,
-                                          mTmpDir, mNumThreads);
+    auto clipResult = ClipPhase::executeLevel(
+        scene, mGrid, mMaxDepth, mMaxDepth,
+        mTmpDir, mNumThreads, "clip");
     if (clipResult.shardFiles.empty()) {
         std::cerr << "Clip phase produced no output." << std::endl;
         return false;
@@ -812,7 +865,8 @@ inline bool SceneVoxelization::processDisk(
 
     // ---- Phase 2: Merge shards → leaves.idx + polygons.dat + octree ----
     std::cout << "\n=== Phase 2: Merge ===" << std::endl;
-    auto mergeResult = MergePhase::execute(clipResult, mTmpDir, mMaxDepth);
+    auto mergeResult = MergePhase::execute(
+        clipResult, mTmpDir, mMaxDepth, mConfig.maxPolygonsPerNode);
     if (mergeResult.totalLeaves == 0) {
         std::cerr << "Merge phase produced no leaves." << std::endl;
         return false;
@@ -824,32 +878,77 @@ inline bool SceneVoxelization::processDisk(
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
         mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
     };
-    AnalyzePhase::execute(mergeResult, actx);
+    AnalyzePhase::execute(mergeResult, actx, mNumThreads);
 
-    // ---- Phase 4: Parent aggregation ----
-    std::cout << "\n=== Phase 4: Parent Aggregation ===" << std::endl;
-    auto& octree = const_cast<OctreeBuilder::OctreeResult&>(mergeResult.octree);
-    aggregateParents(octree, mMaxDepth);
+    // ---- Phase 4: Parent LOD generation ----
+    auto& octree = *mergeResult.octree;
+
+    if (mConfig.lodMode == LODBuildMode::Approximate) {
+        std::cout << "\n=== Phase 4: Approximate Parent Aggregation ===" << std::endl;
+        aggregateParents(octree, mMaxDepth, generatedLodLevels);
+    } else if (generatedLodLevels > 0) {
+        std::cout << "\n=== Phase 4: Brute-Force Parent LODs ===" << std::endl;
+
+        // Each exact LOD is deliberately an independent scene scan.  Its
+        // shard/index/polygon files have a unique directory and are released
+        // before the next level starts, keeping peak memory per level.
+        for (uint32_t lod = 1; lod <= generatedLodLevels; lod++) {
+            uint32_t targetLevel = mMaxDepth - lod;
+            std::string suffix = "lod_" + std::to_string(lod);
+            std::string clipPhaseName = "clip_" + suffix;
+            fs::path levelMergeDir = fs::path(mTmpDir) / ("merge_" + suffix);
+
+            std::cout << "\n--- Exact LOD " << lod
+                      << " (tree level " << targetLevel << ") ---" << std::endl;
+
+            auto lodClipResult = ClipPhase::executeLevel(
+                scene, mGrid, mMaxDepth, targetLevel,
+                mTmpDir, mNumThreads, clipPhaseName);
+
+            if (lodClipResult.shardFiles.empty()) {
+                std::cerr << "  [LOD " << lod << "] clip produced no shards."
+                          << std::endl;
+                return false;
+            }
+
+            auto lodMergeResult = MergePhase::executeLevel(
+                lodClipResult, levelMergeDir, mMaxDepth, targetLevel,
+                mConfig.maxPolygonsPerNode);
+
+            if (lodMergeResult.totalNodes > 0) {
+                AnalyzePhase::executeNodes(
+                    lodMergeResult.nodesIdxPath,
+                    lodMergeResult.polygonsDatPath,
+                    octree,
+                    actx,
+                    mNumThreads,
+                    "LOD " + std::to_string(lod));
+            } else {
+                std::cerr << "  [LOD " << lod << "] merge produced no nodes."
+                          << std::endl;
+            }
+
+            // Polygon files are only needed until this level is analyzed.
+            if (!mKeepTemp) {
+                std::error_code ec;
+                fs::remove_all(levelMergeDir, ec);
+            }
+        }
+    }
 
     // ---- Phase 5: Write output ----
     std::cout << "\n=== Phase 5: Write Output ===" << std::endl;
-    // maxPolyPerNode: scan leaf indices for the max
-    // (we could track this during merge, but scanning is fast)
-    uint32_t maxPolyPerNode = 0;
-    {
-        std::ifstream idxIn(mergeResult.leavesIdxPath, std::ios::binary);
-        PolygonSerializer::LeavesIdxHeader idxHdr;
-        if (PolygonSerializer::readLeavesIdxHeader(idxIn, idxHdr)) {
-            std::vector<PolygonSerializer::LeafIndex> leaves;
-            PolygonSerializer::readLeafIndices(idxIn, leaves, idxHdr.leafCount);
-            for (auto& li : leaves)
-                maxPolyPerNode = std::max(maxPolyPerNode, li.polyCount);
-        }
-    }
-    writeOutputDisk(outputPath, octree, mergeResult.totalPolygons, maxPolyPerNode);
+    writeOutputDisk(outputPath, octree, mergeResult.totalPolygons,
+                    mergeResult.maxPolyPerNode);
 
-    // Clip shards already cleaned by MergePhase; merge data always kept.
-    std::cout << "Merge data kept in: " << mTmpDir << "/merge" << std::endl;
+    // Clip shards are cleaned by MergePhase. Merge data is kept by default
+    // for inspection and removed when --clean is selected.
+    if (!mKeepTemp) {
+        std::error_code ec;
+        fs::remove_all(fs::path(mTmpDir) / "merge", ec);
+    } else {
+        std::cout << "Merge data kept in: " << mTmpDir << "/merge" << std::endl;
+    }
 
     std::cout << "Done." << std::endl;
     return true;

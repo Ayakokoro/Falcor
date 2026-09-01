@@ -12,15 +12,32 @@
 #include <iostream>
 #include <cstring>
 #include <chrono>
+#include <memory>
+#include <string>
 
 namespace MergePhase {
 
 struct MergeResult {
     std::filesystem::path leavesIdxPath;
     std::filesystem::path polygonsDatPath;
-    OctreeBuilder::OctreeResult octree;
+    std::shared_ptr<OctreeBuilder::OctreeResult> octree;
     uint64_t totalPolygons  = 0;
     uint64_t totalLeaves    = 0;
+    uint32_t maxPolyPerNode = 0;
+    uint64_t truncatedPolygons = 0;
+};
+
+// Result for one independently merged tree level.  Unlike MergeResult this
+// does not own an octree: the leaf pass builds the octree once and all exact
+// LOD passes write their analyzed data into that same gBuffer.
+struct LevelMergeResult {
+    std::filesystem::path nodesIdxPath;
+    std::filesystem::path polygonsDatPath;
+    uint32_t targetLevel = 0;
+    uint64_t totalPolygons = 0;
+    uint64_t totalNodes = 0;
+    uint32_t maxPolyPerNode = 0;
+    uint64_t truncatedPolygons = 0;
 };
 
 // Lightweight reference to a polygon entry in the in-memory payload arena.
@@ -67,18 +84,22 @@ inline void radixSortRefs(std::vector<ShardEntryRef>& refs) {
     }
 }
 
-// Read all shard files, collect entry references, sort by nodeKey,
-// merge into per-leaf contiguous polygons.dat + leaves.idx, build octree.
-inline MergeResult execute(
+// Read all shard files, collect entry references, sort by nodeKey, and merge
+// one selected tree level into a contiguous polygon data file.  The current
+// implementation intentionally keeps one level in memory during this step;
+// SceneVoxelization invokes it separately for every exact LOD level so the
+// peak is bounded by the largest individual level rather than all levels.
+inline LevelMergeResult executeLevel(
     const ClipPhase::ClipResult& clipResult,
-    const std::filesystem::path& tmpDir,
-    uint32_t maxDepth)
+    const std::filesystem::path& mergeDir,
+    uint32_t maxDepth,
+    uint32_t targetLevel,
+    uint32_t maxPolygonsPerNode = 0)
 {
     namespace fs = std::filesystem;
-    fs::path mergeDir = tmpDir / "merge";
     fs::create_directories(mergeDir);
 
-    fs::path leavesIdxPath  = mergeDir / "leaves.idx";
+    fs::path nodesIdxPath = mergeDir / (targetLevel == maxDepth ? "leaves.idx" : "nodes.idx");
     fs::path polygonsDatPath = mergeDir / "polygons.dat";
 
     auto scanStart = std::chrono::steady_clock::now();
@@ -90,13 +111,15 @@ inline MergeResult execute(
     // serialized polygon bytes in one arena and sort references to that arena.
     std::vector<ShardEntryRef> refs;
     std::vector<char> payloadArena;
+    uint64_t inputPolygons = 0;
     uint64_t totalPolygons = 0;
+    uint64_t truncatedPolygons = 0;
 
     if (clipResult.totalPolygonsClipped <= refs.max_size())
         refs.reserve((size_t)clipResult.totalPolygonsClipped);
 
-    std::cout << "  [Merge] Scanning " << clipResult.shardFiles.size()
-              << " shard files..." << std::endl;
+    std::cout << "  [Merge] Level " << targetLevel << ": scanning "
+              << clipResult.shardFiles.size() << " shard files..." << std::endl;
 
     // Reserve an upper bound to avoid repeatedly moving a multi-GB arena.
     uint64_t payloadCapacity = 0;
@@ -146,7 +169,7 @@ inline MergeResult execute(
             ref.payloadOffset = payloadOffset;
             ref.dataSize      = dataSize;
             refs.push_back(ref);
-            totalPolygons++;
+            inputPolygons++;
         }
     }
 
@@ -179,8 +202,7 @@ inline MergeResult execute(
         return {};
     }
 
-    std::vector<PolygonSerializer::LeafIndex> leafIndices;
-    std::unordered_set<uint64_t> leafKeys;
+    std::vector<PolygonSerializer::NodeIndex> nodeIndices;
 
     // Large output buffer avoids one ostream write call per polygon.
     constexpr size_t OUTPUT_BUFFER_SIZE = 4u * 1024u * 1024u;
@@ -207,9 +229,12 @@ inline MergeResult execute(
             currentCount = 0;
             firstGroup = false;
         } else if (ref.nodeKey != currentKey) {
-            // Finalize previous leaf
-            leafIndices.push_back({currentKey, currentOffset, currentCount, 0});
-            leafKeys.insert(currentKey);
+            // Finalize previous node.  The cap is applied after all shard
+            // entries for this node have been brought together, so it is a
+            // global per-node limit rather than a per-thread limit.
+            if (currentCount > 0) {
+                nodeIndices.push_back({currentKey, currentOffset, currentCount, 0});
+            }
 
             // Start new leaf
             currentKey = ref.nodeKey;
@@ -217,26 +242,34 @@ inline MergeResult execute(
             currentCount = 0;
         }
 
-        // Copy polygon data from the in-memory payload arena.
-        const char* payload = payloadArena.data() + ref.payloadOffset;
-        if (ref.dataSize > OUTPUT_BUFFER_SIZE) {
-            flushOutputBuffer();
-            polyOut.write(payload, ref.dataSize);
-            outputOffset += ref.dataSize;
-        } else {
-            if (outputBuffer.size() + ref.dataSize > OUTPUT_BUFFER_SIZE)
+        bool keep = maxPolygonsPerNode == 0 ||
+                    currentCount < maxPolygonsPerNode;
+        if (keep) {
+            // Copy polygon data from the in-memory payload arena.
+            const char* payload = payloadArena.data() + ref.payloadOffset;
+            if (ref.dataSize > OUTPUT_BUFFER_SIZE) {
                 flushOutputBuffer();
-            size_t oldSize = outputBuffer.size();
-            outputBuffer.resize(oldSize + ref.dataSize);
-            std::memcpy(outputBuffer.data() + oldSize, payload, ref.dataSize);
+                polyOut.write(payload, ref.dataSize);
+                outputOffset += ref.dataSize;
+            } else {
+                if (outputBuffer.size() + ref.dataSize > OUTPUT_BUFFER_SIZE)
+                    flushOutputBuffer();
+                size_t oldSize = outputBuffer.size();
+                outputBuffer.resize(oldSize + ref.dataSize);
+                std::memcpy(outputBuffer.data() + oldSize, payload, ref.dataSize);
+            }
+            currentCount++;
+            totalPolygons++;
+        } else {
+            // The serialized payload is still present in the merge arena,
+            // but it is not copied to the final level file.
+            truncatedPolygons++;
         }
-        currentCount++;
     }
 
     // Flush last group
     if (currentCount > 0) {
-        leafIndices.push_back({currentKey, currentOffset, currentCount, 0});
-        leafKeys.insert(currentKey);
+        nodeIndices.push_back({currentKey, currentOffset, currentCount, 0});
     }
 
     flushOutputBuffer();
@@ -256,34 +289,100 @@ inline MergeResult execute(
     // sort here.
 
     {
-        std::ofstream idxOut(leavesIdxPath, std::ios::binary | std::ios::trunc);
-        PolygonSerializer::LeavesIdxHeader idxHdr;
-        idxHdr.leafCount = leafIndices.size();
+        std::ofstream idxOut(nodesIdxPath, std::ios::binary | std::ios::trunc);
+        PolygonSerializer::NodesIdxHeader idxHdr;
+        idxHdr.leafCount = nodeIndices.size();
         idxHdr.maxDepth  = maxDepth;
-        PolygonSerializer::writeLeavesIdxHeader(idxOut, idxHdr);
-        PolygonSerializer::writeLeafIndices(idxOut, leafIndices);
+        idxHdr.reserved  = targetLevel;
+        PolygonSerializer::writeNodesIdxHeader(idxOut, idxHdr);
+        PolygonSerializer::writeNodeIndices(idxOut, nodeIndices);
         idxOut.close();
     }
 
-    std::cout << "  [Merge] Wrote " << leafIndices.size() << " leaves, "
-              << totalPolygons << " total polygons." << std::endl;
+    uint32_t maxPolyPerNode = 0;
+    for (const auto& node : nodeIndices)
+        maxPolyPerNode = std::max(maxPolyPerNode, node.polyCount);
 
-    // ---- Step 5: Build octree from leaf keys ----
-    auto octree = OctreeBuilder::buildFromLeafKeys(leafKeys, maxDepth);
+    std::cout << "  [Merge] Level " << targetLevel << ": collected "
+              << inputPolygons << " entries, wrote "
+              << nodeIndices.size() << " nodes, " << totalPolygons
+              << " polygons";
+    if (truncatedPolygons > 0)
+        std::cout << ", truncated " << truncatedPolygons;
+    std::cout << "." << std::endl;
 
-    // ---- Step 6: Cleanup shard files (always deleted after merge) ----
+    // Cleanup shard files (always deleted after merge).
     for (auto& shardPath : clipResult.shardFiles)
         fs::remove(shardPath);
-    fs::path clipDir = tmpDir / "clip";
     std::error_code ec;
-    fs::remove(clipDir, ec);  // will fail if not empty, which is fine
+    if (!clipResult.shardDir.empty())
+        fs::remove_all(clipResult.shardDir, ec);
+
+    LevelMergeResult result;
+    result.nodesIdxPath = nodesIdxPath;
+    result.polygonsDatPath = polygonsDatPath;
+    result.targetLevel = targetLevel;
+    result.totalPolygons = totalPolygons;
+    result.totalNodes = nodeIndices.size();
+    result.maxPolyPerNode = maxPolyPerNode;
+    result.truncatedPolygons = truncatedPolygons;
+
+    return result;
+}
+
+// Leaf-compatible wrapper.  The leaf pass is the only pass that builds the
+// octree; all later exact LOD passes reuse its shared OctreeResult.
+inline MergeResult execute(
+    const ClipPhase::ClipResult& clipResult,
+    const std::filesystem::path& tmpDir,
+    uint32_t maxDepth,
+    uint32_t maxPolygonsPerNode = 0)
+{
+    namespace fs = std::filesystem;
+
+    // The generic merge needs the occupied leaf keys to build the octree.
+    // Keep the existing merge implementation's key collection by performing
+    // the leaf merge inline through a small helper result below.
+    fs::path mergeDir = tmpDir / "merge";
+    fs::create_directories(mergeDir);
+
+    // Reuse the generic merge implementation, then reconstruct the leaf key
+    // set from the compact index.  This keeps the public result small and
+    // avoids retaining all serialized payloads after the merge.
+    LevelMergeResult level = executeLevel(
+        clipResult, mergeDir, maxDepth, maxDepth,
+        maxPolygonsPerNode);
+
+    std::unordered_set<uint64_t> leafKeys;
+    {
+        std::ifstream idxIn(level.nodesIdxPath, std::ios::binary);
+        PolygonSerializer::NodesIdxHeader hdr;
+        if (!idxIn || !PolygonSerializer::readNodesIdxHeader(idxIn, hdr)) {
+            std::cerr << "  [Merge] ERROR: cannot read leaf index "
+                      << level.nodesIdxPath << std::endl;
+            return {};
+        }
+
+        std::vector<PolygonSerializer::NodeIndex> indices;
+        PolygonSerializer::readNodeIndices(idxIn, indices, hdr.leafCount);
+        for (const auto& index : indices)
+            leafKeys.insert(index.nodeKey);
+    }
+
+    if (level.totalNodes == 0)
+        return {};
+
+    auto octree = std::make_shared<OctreeBuilder::OctreeResult>(
+        OctreeBuilder::buildFromLeafKeys(leafKeys, maxDepth));
 
     return MergeResult{
-        leavesIdxPath,
-        polygonsDatPath,
+        level.nodesIdxPath,
+        level.polygonsDatPath,
         std::move(octree),
-        totalPolygons,
-        (uint64_t)leafIndices.size()
+        level.totalPolygons,
+        level.totalNodes,
+        level.maxPolyPerNode,
+        level.truncatedPolygons
     };
 }
 
