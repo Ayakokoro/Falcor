@@ -26,6 +26,7 @@ public:
 
 private:
     bool tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize);
+    void updateScreenSpaceLOD(const float4x4& viewProj);
 
     ref<Scene> mpScene;
     ref<Device> mpDevice;
@@ -57,9 +58,18 @@ private:
     bool mRenderBackGround;
     bool mComplete;
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
-    int mMaxLODLevel = -1; // -1=no cap, N=never LOD-stop above this level (leaf=0)
+    int mMaxLODLevel = -1; // -1=no cap, N=do not select a coarser level than N
     float mCoverageBlend = 0.0f; // 0=raw coverage, 1=fill all empty cavity
     float3 mClearColor;
+
+    // One screen-space LOD is selected for the whole grid every frame. LOD 0
+    // is the leaf level and larger values are coarser octree levels.
+    int mScreenLOD = 0;
+    bool mGridProjectionValid = false;
+    float mGridProjectedWidthPixels = 0.0f;
+    float mGridProjectedHeightPixels = 0.0f;
+    float mGridProjectedAreaPixels = 0.0f;
+    float mLeafProjectedSizePixels = 0.0f;
 
     bool mDisplayNDF;
     float2 mSelectedUV;

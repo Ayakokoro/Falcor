@@ -80,6 +80,99 @@ TEBSDF convertVoxelData(const VoxelData& data)
 }
 } // namespace
 
+void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj)
+{
+    constexpr float kTargetVoxelSizePixels = 0.5f;
+    constexpr float kProjectionEpsilon = 1e-6f;
+
+    mGridProjectionValid = false;
+    mGridProjectedWidthPixels = 0.0f;
+    mGridProjectedHeightPixels = 0.0f;
+    mGridProjectedAreaPixels = 0.0f;
+    mLeafProjectedSizePixels = 0.0f;
+    mScreenLOD = 0;
+
+    const uint32_t maxLOD = std::min(mOctreeMaxDepth, mAvailableLODLevels);
+    if (mOutputResolution.x == 0 || mOutputResolution.y == 0 || gridData.voxelCount.x == 0)
+        return;
+
+    const float3 gridExtent(
+        gridData.voxelSize.x * float(gridData.voxelCount.x),
+        gridData.voxelSize.y * float(gridData.voxelCount.y),
+        gridData.voxelSize.z * float(gridData.voxelCount.z)
+    );
+    const float3 gridMax = gridData.gridMin + gridExtent;
+
+    const float3 corners[8] = {
+        float3(gridData.gridMin.x, gridData.gridMin.y, gridData.gridMin.z),
+        float3(gridMax.x,          gridData.gridMin.y, gridData.gridMin.z),
+        float3(gridData.gridMin.x, gridMax.y,          gridData.gridMin.z),
+        float3(gridMax.x,          gridMax.y,          gridData.gridMin.z),
+        float3(gridData.gridMin.x, gridData.gridMin.y, gridMax.z),
+        float3(gridMax.x,          gridData.gridMin.y, gridMax.z),
+        float3(gridData.gridMin.x, gridMax.y,          gridMax.z),
+        float3(gridMax.x,          gridMax.y,          gridMax.z),
+    };
+
+    const float maxFloat = std::numeric_limits<float>::max();
+    float2 minPixels(maxFloat);
+    float2 maxPixels(-maxFloat);
+
+    for (const float3& corner : corners)
+    {
+        const float4 clip = math::mul(viewProj, float4(corner, 1.0f));
+
+        // A grid crossing the near plane cannot be represented by a single
+        // finite screen-space rectangle. Selecting the finest level is the
+        // conservative choice for image quality in this case.
+        if (!(clip.w > kProjectionEpsilon) ||
+            !std::isfinite(clip.x) || !std::isfinite(clip.y) || !std::isfinite(clip.w))
+        {
+            return;
+        }
+
+        const float2 ndc = float2(clip.x, clip.y) / clip.w;
+        const float2 pixels(
+            (ndc.x * 0.5f + 0.5f) * float(mOutputResolution.x),
+            (1.0f - (ndc.y * 0.5f + 0.5f)) * float(mOutputResolution.y)
+        );
+
+        if (!std::isfinite(pixels.x) || !std::isfinite(pixels.y))
+            return;
+
+        minPixels = min(minPixels, pixels);
+        maxPixels = max(maxPixels, pixels);
+    }
+
+    const float2 projectedSize = maxPixels - minPixels;
+    const float projectedArea = projectedSize.x * projectedSize.y;
+    if (!(projectedSize.x > 0.0f) || !(projectedSize.y > 0.0f) ||
+        !std::isfinite(projectedArea))
+    {
+        return;
+    }
+
+    mGridProjectionValid = true;
+    mGridProjectedWidthPixels = projectedSize.x;
+    mGridProjectedHeightPixels = projectedSize.y;
+    mGridProjectedAreaPixels = projectedArea;
+
+    // The projected grid area is divided by N^2 cells. Using the square root
+    // gives an equivalent edge length in pixels, which is also well-defined
+    // when the grid is viewed obliquely. A node at LOD L spans 2^L leaf cells.
+    mLeafProjectedSizePixels = std::sqrt(projectedArea) / float(gridData.voxelCount.x);
+
+    float nodeProjectedSize = mLeafProjectedSizePixels;
+    while (mScreenLOD < int(maxLOD) && nodeProjectedSize <= kTargetVoxelSizePixels)
+    {
+        ++mScreenLOD;
+        nodeProjectedSize *= 2.0f;
+    }
+
+    if (mMaxLODLevel >= 0)
+        mScreenLOD = std::min(mScreenLOD, mMaxLODLevel);
+}
+
 RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice), gridData(VoxelizationBase::GlobalGridData)
 {
@@ -414,6 +507,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     FALCOR_PROFILE(pRenderContext, "RayMarching");
     ref<Camera> pCamera = mpScene->getCamera();
     ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
+    const float4x4 viewProjNoJitter = pCamera->getViewProjMatrixNoJitter();
+    updateScreenSpaceLOD(viewProjNoJitter);
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
@@ -488,7 +583,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;
-        cb["invVP"] = math::inverse(pCamera->getViewProjMatrixNoJitter());
+        cb["invVP"] = math::inverse(viewProjNoJitter);
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
@@ -500,6 +595,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
+        cb["screenLOD"] = mScreenLOD;
         cb["availableLODLevels"] = mAvailableLODLevels;
         for (size_t i = 0; i < mGBufferSplits.size(); ++i)
             cb["gbSplits"][i] = mGBufferSplits[i];
@@ -619,6 +715,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             mVoxelProducer.clear();
             mHasVoxelMetadata = false;
             mBufferCount = 1;
+            mScreenLOD = 0;
+            mGridProjectionValid = false;
             mpFullScreenPass = nullptr;
             mpDisplayNDFPass = nullptr;
 
@@ -636,6 +734,19 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
+    if (mGridProjectionValid)
+    {
+        widget.text("Grid Projection (px): " + std::to_string(mGridProjectedWidthPixels) + " x " +
+                    std::to_string(mGridProjectedHeightPixels));
+        widget.text("Grid Projection Area (px^2): " + std::to_string(mGridProjectedAreaPixels));
+        widget.text("Leaf Voxel Projection (eq. px): " + std::to_string(mLeafProjectedSizePixels));
+        widget.text("Screen-space LOD: " + std::to_string(mScreenLOD) +
+                    " (node size: " + std::to_string(1 << mScreenLOD) + " leaf cells)");
+    }
+    else
+    {
+        widget.text("Grid Projection: invalid/near-plane, using leaf LOD");
+    }
 
     if (mOctreeMaxDepth > 0)
     {
@@ -665,14 +776,14 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             mOptionsChanged = true;
         if (mForcedLOD >= 0)
             widget.text("LOD " + std::to_string(mForcedLOD) + ": node size = " +
-                        std::to_string(1 << (maxLOD - mForcedLOD)) + " leaf voxels");
+                        std::to_string(1 << mForcedLOD) + " leaf voxels");
 
-        // Max LOD level cap for dynamic LOD
+        // Optional cap for the screen-space selected LOD.
         if (widget.slider("Max LOD Level", mMaxLODLevel, -1, maxLOD))
             mOptionsChanged = true;
         if (mMaxLODLevel >= 0)
             widget.text("LOD cap at level " + std::to_string(mMaxLODLevel)
-                        + ": node size = " + std::to_string(1 << (maxLOD - mMaxLODLevel)) + " leaf cells");
+                        + ": node size = " + std::to_string(1 << mMaxLODLevel) + " leaf cells");
     }
     if (widget.checkbox("Use Emissive Light", mUseEmissiveLight))
         mOptionsChanged = true;
@@ -743,6 +854,8 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mpDisplayNDFPass = nullptr;
     mDebug = false;
     mUseEmissiveLight = false;
+    mScreenLOD = 0;
+    mGridProjectionValid = false;
 }
 
 bool RayMarchingPass::onMouseEvent(const MouseEvent& mouseEvent)

@@ -47,7 +47,8 @@ cbuffer CB
     uint2 selectedPixel;
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
-    int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
+    int maxLODLevel;    // cap screen-space LOD: -1=no cap, N=never select coarser than N
+    int screenLOD;      // per-frame grid-wide LOD selected from projected grid area
     uint availableLODLevels; // generated parent levels; 0 means leaf data only
     uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
@@ -68,7 +69,7 @@ struct HitResult
     float3 cell;     // in LOD-0 coordinate space
     uint gbIndex;    // gBuffer offset at leaf node
     uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
-    float lodLevel;  // continuous LOD = log2(footprint), clamped to ≥0; 0=leaf
+    float lodLevel;  // selected discrete LOD level; 0=leaf
 };
 
 struct PsOut
@@ -173,11 +174,11 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 #define EPSILON exp2(-float(S_MAX))
 
 // Parametric octree traversal using Revelles 2000 negative-direction DDA.
-// Merges the speed of parametric space stepping with LOD control (forced/dynamic),
+// Merges the speed of parametric space stepping with grid-wide screen-space LOD,
 // ellipsoid intersection tests, and ignoreNodeSize pre-skip from the original
 // parameterized stack-based traversal.
 // from: starting point in LOD-0 cell space
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance, int fixedLod)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, int fixedLod)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
@@ -227,6 +228,18 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     // ===== Phase 2: normalize + mirror for negative-direction traversal =====
     uint rootSize = 1u << octreeMaxDepth;
 
+    // LOD is selected once per frame from the projected grid size. The
+    // optional arguments remain useful for explicit debug/test overrides, but
+    // no ray-distance based LOD decision is made during traversal.
+    int targetLOD = screenLOD;
+    if (forcedLOD >= 0)
+        targetLOD = forcedLOD;
+    if (fixedLod >= 0)
+        targetLOD = fixedLod;
+    if (maxLODLevel >= 0)
+        targetLOD = min(targetLOD, maxLODLevel);
+    targetLOD = clamp(targetLOD, 0, int(min(octreeMaxDepth, availableLODLevels)));
+
     // Normalize ray origin to [1,2]³ space
     float3 p = rayOrigin / float(rootSize) + 1.0f;
     p = clamp(p, 1.0f, 2.0f);
@@ -274,13 +287,6 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     if (1.5f * coef.y - bias.y > t_min) { idx ^= 2; pos.y = 1.5f; }
     if (1.5f * coef.z - bias.z > t_min) { idx ^= 4; pos.z = 1.5f; }
 
-    // Save entry parametric t for cumulative distance calculation.
-    // t_min is the parametric t at which the ray enters the root [1,2] cube,
-    // and stays constant while t_min advances cell-by-cell.  Using t_entry
-    // guarantees worldDist grows monotonically along the ray instead of
-    // resetting per cell.
-    precise float t_entry = t_min;
-
     // ===== Phase 5: main traversal loop (INTERSECT → PUSH | ADVANCE → POP) =====
     uint maxIter = (1u << octreeMaxDepth) * 3u + 64u;
     uint iter = 0;
@@ -318,24 +324,11 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             TEBSDF nodeData = loadGBuffer(childNode.dataIndex);
             bool nodeHasData = (nodeLOD <= availableLODLevels) && (nodeData.area > 0.0f);
 
-            bool forcedStop  = nodeHasData &&
-                            ((forcedLOD > 0 && (int)nodeLOD == forcedLOD)
-                          || (fixedLod >= 0 && (int)nodeLOD == fixedLod));
+            bool selectedLOD = nodeHasData && ((int)nodeLOD == targetLOD);
 
-            // Dynamic LOD: compare ray-footprint radius with node size.
-            // Only active for primary rays (fixedLod < 0); secondary bounces,
-            // visibility checks, and coverage tests use a fixed LOD level
-            // inherited from the hit point to avoid LOD switching.
-            // Convert parametric t to cell-space distance for the footprint calculation.
-            // Use t_entry (root entry t) instead of t_min so the distance accumulates
-            // across cells — footprint grows monotonically along the ray.
-            float worldDist = (tc_max - t_entry) * float(rootSize);
-            float footprint = cone.bias + max(worldDist, 0.0f) * cone.tanHalfAngle;
-            bool lodLevelOK  = (maxLODLevel < 0) || ((int)nodeLOD <= maxLODLevel);
-            bool dynamicStop = nodeHasData && (fixedLod < 0) && lodLevelOK &&
-                               (footprint > (float)nodeSize);
-
-            bool shouldStop = nodeHasData && (isLeaf || forcedStop || dynamicStop);
+            // Stop at the selected grid-wide LOD. Structural nodes without
+            // data are never accepted as hits.
+            bool shouldStop = nodeHasData && (isLeaf || selectedLOD);
 
             // --- Hit test when a stopping condition is met ---
             if (shouldStop && t_min <= tv_max)
@@ -361,7 +354,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
                     HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize);
                     if (hit.hit)
                     {
-                        hit.lodLevel = log2(max(footprint, 1.0f));
+                        hit.lodLevel = float(nodeLOD);
                         return hit;
                     }
                 }
@@ -369,9 +362,9 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 
             // --- PUSH: descend into child ---
             // Unavailable internal nodes also come through this path because
-            // forcedStop is gated by nodeHasData. Dynamic-stop nodes that miss
-            // the ellipsoid likewise continue descending.
-            bool wantPush = (!isLeaf && !forcedStop) && (t_min <= tv_max);
+            // selectedLOD is gated by nodeHasData. If the selected node misses
+            // the ellipsoid, continue descending to finer data.
+            bool wantPush = (!isLeaf && !selectedLOD) && (t_min <= tv_max);
 
             if (wantPush)
             {
@@ -441,7 +434,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
-    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, -1);
     return hit.hit ? 0 : 1;
 }
 
@@ -451,7 +444,7 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, -1);
     return hit.hit ? 0 : 1;
 }
 
@@ -469,7 +462,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, -1);
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -573,12 +566,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         }
         pdfs[i] = max(pdfs[i], minPdf);
 
-        // Widen cone based on BSDF roughness before next bounce
-        float rough = maxRoughness(offset);
-        float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
-        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
-
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize));
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, -1);
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -711,7 +699,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     // Error: need world space distance
     float initialDistance = (inOut.x + 1e-6) * length(delta);
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
-    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1);
+    HitResult hit = rayMarching(from, direction, -1, 0, -1);
 
     if (all(pixel == selectedPixel))
     {
