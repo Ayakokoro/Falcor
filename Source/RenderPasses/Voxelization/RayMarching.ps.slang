@@ -474,6 +474,31 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     return valueToColor(coverage);
 }
 
+float3 localToWorldPoint(float3 pointLocal)
+{
+    return mul(instanceTransform, float4(pointLocal, 1.0f)).xyz;
+}
+
+float3 localToWorldVector(float3 vectorLocal)
+{
+    return mul(instanceTransform, float4(vectorLocal, 0.0f)).xyz;
+}
+
+float3 worldToLocalPoint(float3 pointWorld)
+{
+    return mul(inverseInstanceTransform, float4(pointWorld, 1.0f)).xyz;
+}
+
+float3 worldToLocalVector(float3 vectorWorld)
+{
+    return mul(inverseInstanceTransform, float4(vectorWorld, 0.0f)).xyz;
+}
+
+float3 localToWorldNormal(float3 normalLocal)
+{
+    return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
+}
+
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
@@ -483,7 +508,7 @@ float3 debugShading(HitResult hit, float3 v)
     switch (drawMode)
     {
     case ABSDFDrawMode::Normal:
-        return bsdf.surface.getMainNormal(v) * 0.5 + 0.5;
+        return localToWorldNormal(bsdf.surface.getMainNormal(v)) * 0.5 + 0.5;
     case ABSDFDrawMode::Ellipsoid:
         float3 localPos = hit.cell - hit.cellInt;
         float3 d = localPos - e.center;
@@ -522,31 +547,6 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
     return lightColor * BSDF.eval(l, v, h);
 }
 
-float3 localToWorldPoint(float3 pointLocal)
-{
-    return mul(instanceTransform, float4(pointLocal, 1.0f)).xyz;
-}
-
-float3 localToWorldVector(float3 vectorLocal)
-{
-    return mul(instanceTransform, float4(vectorLocal, 0.0f)).xyz;
-}
-
-float3 worldToLocalPoint(float3 pointWorld)
-{
-    return mul(inverseInstanceTransform, float4(pointWorld, 1.0f)).xyz;
-}
-
-float3 worldToLocalVector(float3 vectorWorld)
-{
-    return mul(inverseInstanceTransform, float4(vectorWorld, 0.0f)).xyz;
-}
-
-float3 localToWorldNormal(float3 normalLocal)
-{
-    return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
-}
-
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
@@ -554,17 +554,21 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     float3 posLocal = gridMin + hit.cell * voxelSize;
     float3 posW = localToWorldPoint(posLocal);
     LightSample ls = {};
-    bool valid = sampleLight(posW, v, BSDF, sg, ls);
+    float3 viewLocal = normalize(v);
+    float3 viewWorld = normalize(localToWorldVector(viewLocal));
+    bool valid = sampleLight(posW, viewWorld, BSDF, sg, ls);
 
     if (!valid || ls.pdf <= 0 || all(ls.h == 0))
         return 0;
 
+    float3 lightLocal = normalize(worldToLocalVector(ls.l));
+    float3 halfLocal = normalize(worldToLocalVector(ls.h));
     ls.pdf = max(ls.pdf, minPdf);
-    float3 mainNormal = BSDF.surface.getMainNormal(ls.l);
-    float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x, cone);
+    float3 mainNormal = BSDF.surface.getMainNormal(lightLocal);
+    float visibility = calcLightVisibility(hit, lightLocal, mainNormal, ls.distance / voxelSize.x, cone);
 
     if (visibility > 0)
-        return visibility * shading(offset, ls.l, v, ls.h, ls.lightColor) / ls.pdf;
+        return visibility * shading(offset, lightLocal, viewLocal, halfLocal, ls.lightColor) / ls.pdf;
     return 0;
 }
 
@@ -618,7 +622,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
 #if USE_ENV_MAP
             if (leaveGrid && all(hs[i] == 0))
             {
-                float3 incidentLight = gEnvMapSampler.eval(ls[i]);
+                float3 incidentLight = gEnvMapSampler.eval(normalize(localToWorldVector(ls[i])));
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
 #endif
@@ -680,9 +684,11 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     TEBSDF BSDF = loadGBuffer(hit.gbIndex);
     float3 posLocal = gridMin + hit.cell * voxelSize;
     float3 posW = localToWorldPoint(posLocal);
+    float3 viewLocal = normalize(v);
+    float3 viewWorld = normalize(localToWorldVector(viewLocal));
 
     LightSample ls = {};
-    bool valid = sampleLight(posW, v, BSDF, sg, ls);
+    bool valid = sampleLight(posW, viewWorld, BSDF, sg, ls);
 
     // Ambient fallback (no valid light sample)
     float3 ambient = baseColor * 0.04;
@@ -690,10 +696,11 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     if (!valid || ls.pdf <= 0)
         return ambient;
 
-    float3 N = BSDF.surface.getMainNormal(ls.l);
-    float NdotL = saturate(dot(N, ls.l));
+    float3 lightLocal = normalize(worldToLocalVector(ls.l));
+    float3 N = BSDF.surface.getMainNormal(lightLocal);
+    float NdotL = saturate(dot(N, lightLocal));
 
-    float visibility = calcLightVisibility(hit, ls.l, N, ls.distance / voxelSize.x, cone);
+    float visibility = calcLightVisibility(hit, lightLocal, N, ls.distance / voxelSize.x, cone);
 
     // Lambert: diffuse = baseColor * (N·L) * lightColor * visibility / (π * pdf)
     float3 diffuse = baseColor * NdotL * ls.lightColor * visibility * (1.0 / Pi) / max(ls.pdf, minPdf);
@@ -710,8 +717,10 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     float3 from = screenCoordToCell(texCoord, 0);
     float3 to = screenCoordToCell(texCoord, 1);
     float3 delta = to - from;
-    float3 direction = normalize(delta);
-    psOut.color = renderBackground(normalize(localToWorldVector(direction)));
+    float3 directionCell = normalize(delta);
+    float3 directionLocal = normalize(directionCell * voxelSize);
+    float3 directionWorld = normalize(localToWorldVector(directionLocal));
+    psOut.color = renderBackground(directionWorld);
 
     if (octreeMaxDepth == 0)
         return psOut;
@@ -727,16 +736,17 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
     from = from + (inOut.x + 1e-6) * delta;
 
-    // Error: need world space distance
+    // The traversal and ray-cone distances are expressed in local cell space.
     float initialDistance = (inOut.x + 1e-6) * length(delta);
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
-    HitResult hit = rayMarching(from, direction, -1, 0, -1);
+    HitResult hit = rayMarching(from, directionCell, -1, 0, -1);
 
     if (all(pixel == selectedPixel))
     {
         if (hit.hit)
         {
-            selectedVoxel[0] = float4(normalize(localToWorldVector(-direction)), (float)hit.gbIndex);
+            // DisplayNDF evaluates the selected lobe in asset-local space.
+            selectedVoxel[0] = float4(-directionLocal, (float)hit.gbIndex);
             selectedVoxel[1] = float4(float3(hit.cellInt), 0);
         }
         else
@@ -763,10 +773,10 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             }
         }
 #endif
-            color = shadingGlobal(hit, -direction, sg, primaryCone);
+            color = shadingGlobal(hit, -directionLocal, sg, primaryCone);
             break;
         case ABSDFDrawMode::Coverage:
-            color = coverageTest(hit, direction, primaryCone);
+            color = coverageTest(hit, directionLocal, primaryCone);
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
@@ -813,11 +823,11 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             }
 
             baseColor = colors[min(lodLevel, 5u)]; // Clamp to max color index
-            color = lambertShading(hit, -direction, sg, primaryCone, baseColor);
+            color = lambertShading(hit, -directionLocal, sg, primaryCone, baseColor);
         }
             break;
         default:
-            color = debugShading(hit, -direction);
+            color = debugShading(hit, -directionLocal);
             break;
         }
         psOut.color = float4(color, 1);

@@ -26,6 +26,7 @@ public:
 
 private:
     bool tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize);
+    void updateInstanceTransform();
     void updateScreenSpaceLOD(const float4x4& viewProj, const float4x4& localToWorld);
 
     ref<Scene> mpScene;
@@ -61,6 +62,8 @@ private:
     // The current pass contains exactly one implicit instance. Keeping its
     // transforms explicit makes the local-grid/world-space boundary clear and
     // lets the screen-space LOD code use the same path as future instances.
+    float3 mInstanceTranslation = float3(0.0f);
+    float3 mInstanceRotationDegrees = float3(0.0f);
     float4x4 mInstanceTransform = float4x4::identity();
     float4x4 mInverseInstanceTransform = float4x4::identity();
     float4x4 mNormalTransform = float4x4::identity();

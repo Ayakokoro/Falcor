@@ -80,6 +80,36 @@ TEBSDF convertVoxelData(const VoxelData& data)
 }
 } // namespace
 
+void RayMarchingPass::updateInstanceTransform()
+{
+    // The voxel grid is stored in the asset's local space. Since the current
+    // asset has no separate authored pivot, rotate around the grid center so
+    // changing rotation does not make the model orbit the world origin.
+    const float3 gridExtent(
+        gridData.voxelSize.x * float(gridData.voxelCount.x),
+        gridData.voxelSize.y * float(gridData.voxelCount.y),
+        gridData.voxelSize.z * float(gridData.voxelCount.z)
+    );
+    const float3 pivot = gridData.gridMin + 0.5f * gridExtent;
+
+    const float3 rotationRadians = math::radians(mInstanceRotationDegrees);
+    const float4x4 rotation = math::matrixFromRotationXYZ(
+        rotationRadians.x, rotationRadians.y, rotationRadians.z
+    );
+    const float4x4 toPivot = math::matrixFromTranslation(-pivot);
+    const float4x4 fromPivot = math::matrixFromTranslation(pivot);
+    const float4x4 translation = math::matrixFromTranslation(mInstanceTranslation);
+
+    // Column-vector convention: local point is rotated around the pivot first,
+    // then translated into world space.
+    mInstanceTransform = math::mul(
+        translation,
+        math::mul(fromPivot, math::mul(rotation, toPivot))
+    );
+    mInverseInstanceTransform = math::inverse(mInstanceTransform);
+    mNormalTransform = math::transpose(mInverseInstanceTransform);
+}
+
 void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj, const float4x4& localToWorld)
 {
     constexpr float kTargetVoxelSizePixels = 0.5f;
@@ -509,6 +539,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     ref<Camera> pCamera = mpScene->getCamera();
     ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
     const float4x4 viewProjNoJitter = pCamera->getViewProjMatrixNoJitter();
+    updateInstanceTransform();
     updateScreenSpaceLOD(viewProjNoJitter, mInstanceTransform);
     if (!mSelectedVoxel)
     {
@@ -738,7 +769,12 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
-    widget.text("Instances: 1 (identity transform)");
+    widget.text("Instances: 1 (single instance)");
+    if (widget.var("Instance Translation", mInstanceTranslation, -1000.0f, 1000.0f, 0.01f))
+        mOptionsChanged = true;
+    if (widget.var("Instance Rotation XYZ (deg)", mInstanceRotationDegrees, -360.0f, 360.0f, 0.5f))
+        mOptionsChanged = true;
+    widget.text("Instance Rotation Pivot: Grid Center");
     if (mGridProjectionValid)
     {
         widget.text("Grid Projection (px): " + std::to_string(mGridProjectedWidthPixels) + " x " +
@@ -859,6 +895,8 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mpDisplayNDFPass = nullptr;
     mDebug = false;
     mUseEmissiveLight = false;
+    mInstanceTranslation = float3(0.0f);
+    mInstanceRotationDegrees = float3(0.0f);
     mInstanceTransform = float4x4::identity();
     mInverseInstanceTransform = float4x4::identity();
     mNormalTransform = float4x4::identity();
