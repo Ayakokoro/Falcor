@@ -40,6 +40,7 @@ cbuffer CB
     float4x4 instanceTransform;        // local grid -> world
     float4x4 inverseInstanceTransform; // world -> local grid
     float4x4 normalTransform;           // local normal -> world normal
+    float3 instanceScale;               // local-axis scale before rotation
     float shadowBias;
     uint drawMode;
     uint frameIndex;
@@ -435,9 +436,14 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     return { false, int3(0), float3(0), 0, 0, 0.0f };
 }
 
+float3 localToCellDirection(float3 directionLocal)
+{
+    return normalizeSafe(directionLocal / voxelSize);
+}
+
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
-    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, -1);
+    hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, -1);
     return hit.hit ? 0 : 1;
 }
 
@@ -447,7 +453,7 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, -1);
+    hit = rayMarching(from, localToCellDirection(direction), distance - ignoreDistance, hit.nodeSize, -1);
     return hit.hit ? 0 : 1;
 }
 
@@ -465,7 +471,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, -1);
+        hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, -1);
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -497,6 +503,20 @@ float3 worldToLocalVector(float3 vectorWorld)
 float3 localToWorldNormal(float3 normalLocal)
 {
     return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
+}
+
+float worldDistanceToCellDistance(float3 directionWorld, float distanceWorld)
+{
+    float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(directionWorld)) / voxelSize;
+    return distanceWorld * length(directionCellPerWorld);
+}
+
+float worldVoxelSize()
+{
+    // Rotation preserves the length of each scaled local voxel axis. Use the
+    // largest world-space edge as a conservative emissive matching tolerance.
+    float3 worldVoxelSizes = abs(instanceScale * voxelSize);
+    return max(max(worldVoxelSizes.x, worldVoxelSizes.y), max(worldVoxelSizes.z, 1e-6f));
 }
 
 float3 debugShading(HitResult hit, float3 v)
@@ -556,16 +576,33 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     LightSample ls = {};
     float3 viewLocal = normalize(v);
     float3 viewWorld = normalize(localToWorldVector(viewLocal));
-    bool valid = sampleLight(posW, viewWorld, BSDF, sg, ls);
+    bool valid = sampleLight(
+        posW,
+        viewLocal,
+        viewWorld,
+        BSDF,
+        sg,
+        ls,
+        instanceTransform,
+        inverseInstanceTransform
+    );
 
     if (!valid || ls.pdf <= 0 || all(ls.h == 0))
         return 0;
 
     float3 lightLocal = normalize(worldToLocalVector(ls.l));
-    float3 halfLocal = normalize(worldToLocalVector(ls.h));
+    // Under non-uniform scale, transforming a world half-vector is not
+    // equivalent to the half-vector of the transformed directions.
+    float3 halfLocal = normalize(lightLocal + viewLocal);
     ls.pdf = max(ls.pdf, minPdf);
     float3 mainNormal = BSDF.surface.getMainNormal(lightLocal);
-    float visibility = calcLightVisibility(hit, lightLocal, mainNormal, ls.distance / voxelSize.x, cone);
+    float visibility = calcLightVisibility(
+        hit,
+        lightLocal,
+        mainNormal,
+        worldDistanceToCellDistance(ls.l, ls.distance),
+        cone
+    );
 
     if (visibility > 0)
         return visibility * shading(offset, lightLocal, viewLocal, halfLocal, ls.lightColor) / ls.pdf;
@@ -599,7 +636,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         }
         pdfs[i] = max(pdfs[i], minPdf);
 
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, -1);
+        hits[i + 1] = rayMarching(hits[i].cell, localToCellDirection(ls[i]), -1, hits[i].nodeSize, -1);
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -688,7 +725,16 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     float3 viewWorld = normalize(localToWorldVector(viewLocal));
 
     LightSample ls = {};
-    bool valid = sampleLight(posW, viewWorld, BSDF, sg, ls);
+    bool valid = sampleLight(
+        posW,
+        viewLocal,
+        viewWorld,
+        BSDF,
+        sg,
+        ls,
+        instanceTransform,
+        inverseInstanceTransform
+    );
 
     // Ambient fallback (no valid light sample)
     float3 ambient = baseColor * 0.04;
@@ -700,7 +746,13 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     float3 N = BSDF.surface.getMainNormal(lightLocal);
     float NdotL = saturate(dot(N, lightLocal));
 
-    float visibility = calcLightVisibility(hit, lightLocal, N, ls.distance / voxelSize.x, cone);
+    float visibility = calcLightVisibility(
+        hit,
+        lightLocal,
+        N,
+        worldDistanceToCellDistance(ls.l, ls.distance),
+        cone
+    );
 
     // Lambert: diffuse = baseColor * (N·L) * lightColor * visibility / (π * pdf)
     float3 diffuse = baseColor * NdotL * ls.lightColor * visibility * (1.0 / Pi) / max(ls.pdf, minPdf);
@@ -766,7 +818,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         {
             float3 posLocal = gridMin + hit.cell * voxelSize;
             float3 posW = localToWorldPoint(posLocal);
-            if (checkHitEmissive(posW, voxelSize.x, color))
+            if (checkHitEmissive(posW, worldVoxelSize(), color))
             {
                 psOut.color = float4(color, 1);
                 return psOut;

@@ -92,19 +92,26 @@ void RayMarchingPass::updateInstanceTransform()
     );
     const float3 pivot = gridData.gridMin + 0.5f * gridExtent;
 
+    // Keep every scale component strictly positive so the inverse transform
+    // and the local/world distance conversion remain valid.
+    mInstanceScale.x = std::max(mInstanceScale.x, 1e-4f);
+    mInstanceScale.y = std::max(mInstanceScale.y, 1e-4f);
+    mInstanceScale.z = std::max(mInstanceScale.z, 1e-4f);
+
     const float3 rotationRadians = math::radians(mInstanceRotationDegrees);
     const float4x4 rotation = math::matrixFromRotationXYZ(
         rotationRadians.x, rotationRadians.y, rotationRadians.z
     );
+    const float4x4 scaling = math::matrixFromScaling(mInstanceScale);
     const float4x4 toPivot = math::matrixFromTranslation(-pivot);
     const float4x4 fromPivot = math::matrixFromTranslation(pivot);
     const float4x4 translation = math::matrixFromTranslation(mInstanceTranslation);
 
     // Column-vector convention: local point is rotated around the pivot first,
-    // then translated into world space.
+    // non-uniformly scaled around the same pivot, then translated into world space.
     mInstanceTransform = math::mul(
         translation,
-        math::mul(fromPivot, math::mul(rotation, toPivot))
+        math::mul(fromPivot, math::mul(rotation, math::mul(scaling, toPivot)))
     );
     mInverseInstanceTransform = math::inverse(mInstanceTransform);
     mNormalTransform = math::transpose(mInverseInstanceTransform);
@@ -619,6 +626,9 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["instanceTransform"] = mInstanceTransform;
         cb["inverseInstanceTransform"] = mInverseInstanceTransform;
         cb["normalTransform"] = mNormalTransform;
+        cb["instanceScale"] = mInstanceScale;
+        // The shader traces in local cell units. The bias is asset-local and
+        // therefore scales with the instance together with the voxel grid.
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
@@ -774,7 +784,9 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.var("Instance Rotation XYZ (deg)", mInstanceRotationDegrees, -360.0f, 360.0f, 0.5f))
         mOptionsChanged = true;
-    widget.text("Instance Rotation Pivot: Grid Center");
+    if (widget.var("Instance Scale XYZ", mInstanceScale, 0.01f, 100.0f, 0.01f))
+        mOptionsChanged = true;
+    widget.text("Instance Rotation/Scale Pivot: Grid Center");
     if (mGridProjectionValid)
     {
         widget.text("Grid Projection (px): " + std::to_string(mGridProjectedWidthPixels) + " x " +
@@ -897,6 +909,7 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mUseEmissiveLight = false;
     mInstanceTranslation = float3(0.0f);
     mInstanceRotationDegrees = float3(0.0f);
+    mInstanceScale = float3(1.0f);
     mInstanceTransform = float4x4::identity();
     mInverseInstanceTransform = float4x4::identity();
     mNormalTransform = float4x4::identity();

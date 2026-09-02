@@ -64,6 +64,7 @@ private:
     // lets the screen-space LOD code use the same path as future instances.
     float3 mInstanceTranslation = float3(0.0f);
     float3 mInstanceRotationDegrees = float3(0.0f);
+    float3 mInstanceScale = float3(1.0f);
     float4x4 mInstanceTransform = float4x4::identity();
     float4x4 mInverseInstanceTransform = float4x4::identity();
     float4x4 mNormalTransform = float4x4::identity();

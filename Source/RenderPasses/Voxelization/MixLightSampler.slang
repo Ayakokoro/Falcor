@@ -53,7 +53,7 @@ bool checkHitEmissive(float3 posW, float tolerance, out float3 lightColor)
     return false;
 }
 
-bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 vWorld, TEBSDF BSDF, inout S sg, inout LightSample ls)
 {
     uint lightCount = min(gScene.lightCount, MAX_LIGHT_COUNT - 1);
     float totalIlluminance = 0;
@@ -124,13 +124,40 @@ bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 v, TEBS
         return false;
     ls.lightColor = lightColors[selected];
     ls.l = dirs[selected];
-    ls.h = normalizeSafe(ls.l + v);
+    ls.h = normalizeSafe(ls.l + vWorld);
     ls.distance = distances[selected];
     ls.pdf = illuminances[selected] / totalIlluminance;
     return true;
 }
 
-bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+float worldPdfToLocalPdf(
+    float pdfWorld,
+    float3 directionWorld,
+    float4x4 localToWorldTransform,
+    float4x4 worldToLocalTransform
+)
+{
+    float3 directionLocal = normalizeSafe(mul(worldToLocalTransform, float4(directionWorld, 0.0f)).xyz);
+    float3 transformedDirection = mul(localToWorldTransform, float4(directionLocal, 0.0f)).xyz;
+    float transformedLength = length(transformedDirection);
+    float determinantAbs = abs(determinant(float3x3(localToWorldTransform)));
+
+    // dω_world / dω_local for a linear direction transform A is
+    // |det(A)| / |A * directionLocal|^3.
+    float solidAngleJacobian = determinantAbs /
+        max(transformedLength * transformedLength * transformedLength, 1e-12f);
+    return pdfWorld * solidAngleJacobian;
+}
+
+bool inline sampleEmmisive<S : ISampleGenerator>(
+    float3 posW,
+    float3 vWorld,
+    TEBSDF BSDF,
+    inout S sg,
+    inout LightSample ls,
+    float4x4 localToWorldTransform,
+    float4x4 worldToLocalTransform
+)
 {
     TriangleLightSample tls;
     uint triangleCount = gScene.lightCollection.getActiveTriangleCount();
@@ -149,41 +176,79 @@ bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF B
         return false;
 
     ls.l = tls.dir;
-    ls.h = normalizeSafe(ls.l + v);
+    ls.h = normalizeSafe(ls.l + vWorld);
     ls.distance = max(tls.distance, MinLightDistance);
     ls.lightColor = tls.Le;
-    ls.pdf = tls.pdf * triangleSelectionPdf;
+    ls.pdf = worldPdfToLocalPdf(
+        tls.pdf * triangleSelectionPdf,
+        ls.l,
+        localToWorldTransform,
+        worldToLocalTransform
+    );
     return true;
 }
 
-bool inline sampleEnvMap<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+bool inline sampleEnvMap<S : ISampleGenerator>(
+    float3 posW,
+    float3 vLocal,
+    float3 vWorld,
+    TEBSDF BSDF,
+    inout S sg,
+    inout LightSample ls,
+    float4x4 localToWorldTransform,
+    float4x4 worldToLocalTransform
+)
 {
     SurfaceBRDF BRDF = BSDF.surface; // 采样光源时不考虑delta lobe
     float bsdfWeight = BRDF.calcBRDFWeight();
     ls.pdf = 0;
 
+    float3 lLocal = 0;
+    float3 hLocal = 0;
+
     if (Next(sg) <= bsdfWeight)
     {
-        BRDF.sample(v, ls.l, ls.h, sg);
+        BRDF.sample(vLocal, lLocal, hLocal, sg);
+        ls.l = normalizeSafe(mul(localToWorldTransform, float4(lLocal, 0.0f)).xyz);
+        ls.h = normalizeSafe(mul(localToWorldTransform, float4(hLocal, 0.0f)).xyz);
     }
     else
     {
         EnvMapSample envSample;
         gEnvMapSampler.sample(Next2(sg), envSample);
         ls.l = envSample.dir;
-        ls.h = normalizeSafe(ls.l + v);
+        ls.h = normalizeSafe(ls.l + vWorld);
+        lLocal = normalizeSafe(mul(worldToLocalTransform, float4(ls.l, 0.0f)).xyz);
+        hLocal = normalizeSafe(lLocal + vLocal);
     }
     if (bsdfWeight > 0)
-        ls.pdf += bsdfWeight * BRDF.evalPdf(ls.l, v, ls.h);
+        ls.pdf += bsdfWeight * BRDF.evalPdf(lLocal, vLocal, hLocal);
     if (bsdfWeight < 1)
-        ls.pdf += (1 - bsdfWeight) * gEnvMapSampler.evalPdf(ls.l);
+    {
+        float envPdfLocal = worldPdfToLocalPdf(
+            gEnvMapSampler.evalPdf(ls.l),
+            ls.l,
+            localToWorldTransform,
+            worldToLocalTransform
+        );
+        ls.pdf += (1 - bsdfWeight) * envPdfLocal;
+    }
 
     ls.lightColor = gEnvMapSampler.eval(ls.l);
     ls.distance = -1;
     return true;
 }
 
-inline bool sampleLight<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+inline bool sampleLight<S : ISampleGenerator>(
+    float3 posW,
+    float3 vLocal,
+    float3 vWorld,
+    TEBSDF BSDF,
+    inout S sg,
+    inout LightSample ls,
+    float4x4 localToWorldTransform,
+    float4x4 worldToLocalTransform
+)
 {
     float weights[LIGHT_TYPES]; // 一般光源，环境光，自发光
     weights[0] = gScene.getLightCount() > 0 ? 1 : 0;
@@ -222,16 +287,33 @@ inline bool sampleLight<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF
     switch (selected)
     {
     case 0:
-        valid = sampleGeneralLight(posW, v, BSDF, sg, ls);
+        valid = sampleGeneralLight(posW, vWorld, BSDF, sg, ls);
         break;
     case 1:
 #if USE_ENV_MAP
-        valid = sampleEnvMap(posW, v, BSDF, sg, ls);
+        valid = sampleEnvMap(
+            posW,
+            vLocal,
+            vWorld,
+            BSDF,
+            sg,
+            ls,
+            localToWorldTransform,
+            worldToLocalTransform
+        );
 #endif
         break;
     case 2:
 #if USE_EMISSIVE_LIGHTS
-        valid = sampleEmmisive(posW, v, BSDF, sg, ls);
+        valid = sampleEmmisive(
+            posW,
+            vWorld,
+            BSDF,
+            sg,
+            ls,
+            localToWorldTransform,
+            worldToLocalTransform
+        );
 #endif
         break;
     }
