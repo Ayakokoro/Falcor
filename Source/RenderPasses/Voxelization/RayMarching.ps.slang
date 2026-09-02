@@ -22,6 +22,7 @@ import Utils.Sampling.UniformSampleGenerator;
 StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
+StructuredBuffer<VoxelInstanceData> instances;
 
 RWStructuredBuffer<float4> selectedVoxel;
 
@@ -37,10 +38,11 @@ cbuffer CB
 {
     uint2 pixelCount;
     float4x4 invVP;
-    float4x4 instanceTransform;        // local grid -> world
-    float4x4 inverseInstanceTransform; // world -> local grid
-    float4x4 normalTransform;           // local normal -> world normal
-    float3 instanceScale;               // local-axis scale before rotation
+    uint instanceCount;
+    float4x4 instanceTransform;        // selected-instance fallback context
+    float4x4 inverseInstanceTransform; // selected-instance fallback context
+    float4x4 normalTransform;           // selected-instance fallback context
+    float3 instanceScale;               // selected-instance fallback context
     float shadowBias;
     uint drawMode;
     uint frameIndex;
@@ -52,7 +54,7 @@ cbuffer CB
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap screen-space LOD: -1=no cap, N=never select coarser than N
-    int screenLOD;      // per-frame grid-wide LOD selected from projected grid area
+    int screenLOD;      // selected-instance fallback; primary uses instance.screenLOD
     uint availableLODLevels; // generated parent levels; 0 means leaf data only
     uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
@@ -74,6 +76,20 @@ struct HitResult
     uint gbIndex;    // gBuffer offset at leaf node
     uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
     float lodLevel;  // selected discrete LOD level; 0=leaf
+};
+
+// Primary-ray hit expressed in world space while retaining the local hit used
+// by traversal and shading.  The latter is intentionally not replaced: the
+// voxel hierarchy, g-buffer, and secondary rays are all asset-local.
+struct WorldHitResult
+{
+    bool hit;
+    uint instanceId;
+    float3 positionW;
+    float tWorld;
+    float3 directionLocal;
+    float rayConeBias;
+    HitResult localHit;
 };
 
 struct PsOut
@@ -235,11 +251,9 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     // LOD is selected once per frame from the projected grid size. The
     // optional arguments remain useful for explicit debug/test overrides, but
     // no ray-distance based LOD decision is made during traversal.
-    int targetLOD = screenLOD;
+    int targetLOD = fixedLod >= 0 ? fixedLod : screenLOD;
     if (forcedLOD >= 0)
         targetLOD = forcedLOD;
-    if (fixedLod >= 0)
-        targetLOD = fixedLod;
     if (maxLODLevel >= 0)
         targetLOD = min(targetLOD, maxLODLevel);
     targetLOD = clamp(targetLOD, 0, int(min(octreeMaxDepth, availableLODLevels)));
@@ -441,23 +455,30 @@ float3 localToCellDirection(float3 directionLocal)
     return normalizeSafe(directionLocal / voxelSize);
 }
 
-float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
+float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone, int traceLOD)
 {
-    hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, -1);
+    hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, traceLOD);
     return hit.hit ? 0 : 1;
 }
 
-float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, float distance, RayCone cone)
+float calcLightVisibility(
+    HitResult hit,
+    float3 direction,
+    float3 mainNormal,
+    float distance,
+    RayCone cone,
+    int traceLOD
+)
 {
     float ignoreDistance = 2;
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, localToCellDirection(direction), distance - ignoreDistance, hit.nodeSize, -1);
+    hit = rayMarching(from, localToCellDirection(direction), distance - ignoreDistance, hit.nodeSize, traceLOD);
     return hit.hit ? 0 : 1;
 }
 
-float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
+float3 coverageTest(HitResult hit, float3 direction, RayCone cone, int traceLOD)
 {
     float coverage = 0;
     uint offset = hit.gbIndex;
@@ -471,7 +492,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, -1);
+        hit = rayMarching(hit.cell, localToCellDirection(direction), -1, hit.nodeSize, traceLOD);
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -485,9 +506,19 @@ float3 localToWorldPoint(float3 pointLocal)
     return mul(instanceTransform, float4(pointLocal, 1.0f)).xyz;
 }
 
+float3 localToWorldPoint(float3 pointLocal, VoxelInstanceData instance)
+{
+    return mul(instance.localToWorld, float4(pointLocal, 1.0f)).xyz;
+}
+
 float3 localToWorldVector(float3 vectorLocal)
 {
     return mul(instanceTransform, float4(vectorLocal, 0.0f)).xyz;
+}
+
+float3 localToWorldVector(float3 vectorLocal, VoxelInstanceData instance)
+{
+    return mul(instance.localToWorld, float4(vectorLocal, 0.0f)).xyz;
 }
 
 float3 worldToLocalPoint(float3 pointWorld)
@@ -495,9 +526,19 @@ float3 worldToLocalPoint(float3 pointWorld)
     return mul(inverseInstanceTransform, float4(pointWorld, 1.0f)).xyz;
 }
 
+float3 worldToLocalPoint(float3 pointWorld, VoxelInstanceData instance)
+{
+    return mul(instance.worldToLocal, float4(pointWorld, 1.0f)).xyz;
+}
+
 float3 worldToLocalVector(float3 vectorWorld)
 {
     return mul(inverseInstanceTransform, float4(vectorWorld, 0.0f)).xyz;
+}
+
+float3 worldToLocalVector(float3 vectorWorld, VoxelInstanceData instance)
+{
+    return mul(instance.worldToLocal, float4(vectorWorld, 0.0f)).xyz;
 }
 
 float3 localToWorldNormal(float3 normalLocal)
@@ -505,9 +546,52 @@ float3 localToWorldNormal(float3 normalLocal)
     return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
 }
 
+float3 localToWorldNormal(float3 normalLocal, VoxelInstanceData instance)
+{
+    return normalize(mul(instance.normalTransform, float4(normalLocal, 0.0f)).xyz);
+}
+
+WorldHitResult makeWorldHitResult(
+    HitResult localHit,
+    float3 rayOriginW,
+    float3 rayDirectionW,
+    VoxelInstanceData instance,
+    float rayConeBias
+)
+{
+    WorldHitResult result = {};
+    result.instanceId = instance.instanceId;
+    result.tWorld = 1e30f;
+    result.rayConeBias = rayConeBias;
+    result.directionLocal = normalizeSafe(worldToLocalVector(rayDirectionW, instance));
+    result.localHit = localHit;
+
+    if (!localHit.hit)
+        return result;
+
+    float3 positionLocal = gridMin + localHit.cell * voxelSize;
+    result.positionW = localToWorldPoint(positionLocal, instance);
+    // The origin is the per-pixel unprojected NDC-depth 0 point. Keeping this
+    // convention makes tWorld comparable when several instances are tested
+    // against the same camera ray later.
+    result.tWorld = dot(result.positionW - rayOriginW, normalizeSafe(rayDirectionW));
+    result.hit = true;
+    return result;
+}
+
 float worldDistanceToCellDistance(float3 directionWorld, float distanceWorld)
 {
     float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(directionWorld)) / voxelSize;
+    return distanceWorld * length(directionCellPerWorld);
+}
+
+float worldDistanceToCellDistance(
+    float3 directionWorld,
+    float distanceWorld,
+    VoxelInstanceData instance
+)
+{
+    float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(directionWorld), instance) / voxelSize;
     return distanceWorld * length(directionCellPerWorld);
 }
 
@@ -519,7 +603,19 @@ float worldVoxelSize()
     return max(max(worldVoxelSizes.x, worldVoxelSizes.y), max(worldVoxelSizes.z, 1e-6f));
 }
 
-float3 debugShading(HitResult hit, float3 v)
+float worldVoxelSize(VoxelInstanceData instance)
+{
+    // Rotation preserves the length of each scaled local voxel axis. Use the
+    // largest world-space edge as a conservative emissive matching tolerance.
+    float3 worldVoxelSizes = float3(
+        length(mul((float3x3)instance.localToWorld, float3(voxelSize.x, 0, 0))),
+        length(mul((float3x3)instance.localToWorld, float3(0, voxelSize.y, 0))),
+        length(mul((float3x3)instance.localToWorld, float3(0, 0, voxelSize.z)))
+    );
+    return max(max(worldVoxelSizes.x, worldVoxelSizes.y), max(worldVoxelSizes.z, 1e-6f));
+}
+
+float3 debugShading(HitResult hit, float3 v, VoxelInstanceData instance)
 {
     uint offset = hit.gbIndex;
     TEBSDF bsdf = loadGBuffer(offset);
@@ -528,7 +624,7 @@ float3 debugShading(HitResult hit, float3 v)
     switch (drawMode)
     {
     case ABSDFDrawMode::Normal:
-        return localToWorldNormal(bsdf.surface.getMainNormal(v)) * 0.5 + 0.5;
+        return localToWorldNormal(bsdf.surface.getMainNormal(v), instance) * 0.5 + 0.5;
     case ABSDFDrawMode::Ellipsoid:
         float3 localPos = hit.cell - hit.cellInt;
         float3 d = localPos - e.center;
@@ -567,15 +663,21 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
     return lightColor * BSDF.eval(l, v, h);
 }
 
-float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
+float3 shadingDirect(
+    HitResult hit,
+    float3 v,
+    inout UniformSampleGenerator sg,
+    RayCone cone,
+    VoxelInstanceData instance
+)
 {
     uint offset = hit.gbIndex;
     TEBSDF BSDF = loadGBuffer(offset);
     float3 posLocal = gridMin + hit.cell * voxelSize;
-    float3 posW = localToWorldPoint(posLocal);
+    float3 posW = localToWorldPoint(posLocal, instance);
     LightSample ls = {};
     float3 viewLocal = normalize(v);
-    float3 viewWorld = normalize(localToWorldVector(viewLocal));
+    float3 viewWorld = normalize(localToWorldVector(viewLocal, instance));
     bool valid = sampleLight(
         posW,
         viewLocal,
@@ -583,14 +685,14 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         BSDF,
         sg,
         ls,
-        instanceTransform,
-        inverseInstanceTransform
+        instance.localToWorld,
+        instance.worldToLocal
     );
 
     if (!valid || ls.pdf <= 0 || all(ls.h == 0))
         return 0;
 
-    float3 lightLocal = normalize(worldToLocalVector(ls.l));
+    float3 lightLocal = normalize(worldToLocalVector(ls.l, instance));
     // Under non-uniform scale, transforming a world half-vector is not
     // equivalent to the half-vector of the transformed directions.
     float3 halfLocal = normalize(lightLocal + viewLocal);
@@ -600,8 +702,9 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         hit,
         lightLocal,
         mainNormal,
-        worldDistanceToCellDistance(ls.l, ls.distance),
-        cone
+        worldDistanceToCellDistance(ls.l, ls.distance, instance),
+        cone,
+        instance.screenLOD
     );
 
     if (visibility > 0)
@@ -609,7 +712,13 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     return 0;
 }
 
-float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
+float3 shadingGlobal(
+    HitResult hit,
+    float3 v,
+    inout UniformSampleGenerator sg,
+    RayCone cone,
+    VoxelInstanceData instance
+)
 {
     HitResult[MAX_BOUNCE + 1] hits;
     float3[MAX_BOUNCE + 1] ls;
@@ -636,7 +745,13 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         }
         pdfs[i] = max(pdfs[i], minPdf);
 
-        hits[i + 1] = rayMarching(hits[i].cell, localToCellDirection(ls[i]), -1, hits[i].nodeSize, -1);
+        hits[i + 1] = rayMarching(
+            hits[i].cell,
+            localToCellDirection(ls[i]),
+            -1,
+            hits[i].nodeSize,
+            instance.screenLOD
+        );
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -653,13 +768,13 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         uint currentOffset = currentHit.gbIndex;
         float3 currentV = i == 0 ? v : -ls[i - 1];
 
-        reflectLights[i] += shadingDirect(currentHit, currentV, sg, cone);
+        reflectLights[i] += shadingDirect(currentHit, currentV, sg, cone, instance);
         if (i == shadingPointCount - 1)
         {
 #if USE_ENV_MAP
             if (leaveGrid && all(hs[i] == 0))
             {
-                float3 incidentLight = gEnvMapSampler.eval(normalize(localToWorldVector(ls[i])));
+                float3 incidentLight = gEnvMapSampler.eval(normalize(localToWorldVector(ls[i], instance)));
                 reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
             }
 #endif
@@ -683,14 +798,81 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     return reflectLights[0];
 }
 
-float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
+float3 screenCoordToWorld(float2 screenCoord, float NDCDepth)
 {
     float4 NDC = float4(2 * screenCoord.x - 1, 1 - 2 * screenCoord.y, NDCDepth, 1);
     float4 temp = mul(invVP, NDC);
-    float3 posWorld = (temp / temp.w).xyz;
+    return (temp / temp.w).xyz;
+}
+
+float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
+{
+    float3 posWorld = screenCoordToWorld(screenCoord, NDCDepth);
     float3 posLocal = worldToLocalPoint(posWorld);
     float3 cell = (posLocal - gridMin) / voxelSize;
     return cell;
+}
+
+bool intersectWorldBounds(
+    float3 rayOriginW,
+    float3 rayDirectionW,
+    VoxelInstanceData instance
+)
+{
+    const float kDirectionEpsilon = 1e-8f;
+    float3 direction = rayDirectionW;
+    if (abs(direction.x) < kDirectionEpsilon) direction.x = direction.x < 0 ? -kDirectionEpsilon : kDirectionEpsilon;
+    if (abs(direction.y) < kDirectionEpsilon) direction.y = direction.y < 0 ? -kDirectionEpsilon : kDirectionEpsilon;
+    if (abs(direction.z) < kDirectionEpsilon) direction.z = direction.z < 0 ? -kDirectionEpsilon : kDirectionEpsilon;
+
+    float3 reciprocal = 1.0f / direction;
+    float3 t0 = (instance.worldBoundsMin.xyz - rayOriginW) * reciprocal;
+    float3 t1 = (instance.worldBoundsMax.xyz - rayOriginW) * reciprocal;
+    float3 tMin = min(t0, t1);
+    float3 tMax = max(t0, t1);
+    float nearT = max(max(tMin.x, tMin.y), tMin.z);
+    float farT = min(min(tMax.x, tMax.y), tMax.z);
+    return farT >= max(nearT, 0.0f);
+}
+
+WorldHitResult tracePrimaryInstance(
+    float3 rayOriginW,
+    float3 rayEndW,
+    float3 rayDirectionW,
+    float coneTan,
+    VoxelInstanceData instance
+)
+{
+    WorldHitResult result = {};
+    result.instanceId = instance.instanceId;
+    result.tWorld = 1e30f;
+
+    if (instance.enabled == 0 || !intersectWorldBounds(rayOriginW, rayDirectionW, instance))
+        return result;
+
+    float3 fromLocal = worldToLocalPoint(rayOriginW, instance);
+    float3 toLocal = worldToLocalPoint(rayEndW, instance);
+    float3 from = (fromLocal - gridMin) / voxelSize;
+    float3 to = (toLocal - gridMin) / voxelSize;
+    float3 delta = to - from;
+    float3 directionCell = normalizeSafe(delta);
+    if (all(directionCell == float3(0)))
+        return result;
+
+    float2 inOut = clip(float3(0), float3(voxelCount), from, to);
+    if (inOut.x < 0)
+        return result;
+
+    from += (inOut.x + 1e-6f) * delta;
+    float initialDistance = (inOut.x + 1e-6f) * length(delta);
+    HitResult localHit = rayMarching(from, directionCell, -1, 0, instance.screenLOD);
+    return makeWorldHitResult(
+        localHit,
+        rayOriginW,
+        rayDirectionW,
+        instance,
+        initialDistance * coneTan
+    );
 }
 
 float2 randomJitter()
@@ -716,13 +898,20 @@ float4 renderBackground(float3 direction)
 // Simple Lambert + shadow-ray shading for LOD heatmap visualization.
 // Samples the scene light and traces a visibility ray; baseColor is the
 // LOD heatmap hue modulated by N·L and shadow.
-float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
+float3 lambertShading(
+    HitResult hit,
+    float3 v,
+    inout UniformSampleGenerator sg,
+    RayCone cone,
+    float3 baseColor,
+    VoxelInstanceData instance
+)
 {
     TEBSDF BSDF = loadGBuffer(hit.gbIndex);
     float3 posLocal = gridMin + hit.cell * voxelSize;
-    float3 posW = localToWorldPoint(posLocal);
+    float3 posW = localToWorldPoint(posLocal, instance);
     float3 viewLocal = normalize(v);
-    float3 viewWorld = normalize(localToWorldVector(viewLocal));
+    float3 viewWorld = normalize(localToWorldVector(viewLocal, instance));
 
     LightSample ls = {};
     bool valid = sampleLight(
@@ -732,8 +921,8 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
         BSDF,
         sg,
         ls,
-        instanceTransform,
-        inverseInstanceTransform
+        instance.localToWorld,
+        instance.worldToLocal
     );
 
     // Ambient fallback (no valid light sample)
@@ -742,7 +931,7 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     if (!valid || ls.pdf <= 0)
         return ambient;
 
-    float3 lightLocal = normalize(worldToLocalVector(ls.l));
+    float3 lightLocal = normalize(worldToLocalVector(ls.l, instance));
     float3 N = BSDF.surface.getMainNormal(lightLocal);
     float NdotL = saturate(dot(N, lightLocal));
 
@@ -750,8 +939,9 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
         hit,
         lightLocal,
         N,
-        worldDistanceToCellDistance(ls.l, ls.distance),
-        cone
+        worldDistanceToCellDistance(ls.l, ls.distance, instance),
+        cone,
+        instance.screenLOD
     );
 
     // Lambert: diffuse = baseColor * (N·L) * lightColor * visibility / (π * pdf)
@@ -766,19 +956,12 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     uint2 pixel = uint2(texCoord * pixelCount);
     float2 jitter = randomJitter();
     texCoord = saturate(texCoord + jitter);
-    float3 from = screenCoordToCell(texCoord, 0);
-    float3 to = screenCoordToCell(texCoord, 1);
-    float3 delta = to - from;
-    float3 directionCell = normalize(delta);
-    float3 directionLocal = normalize(directionCell * voxelSize);
-    float3 directionWorld = normalize(localToWorldVector(directionLocal));
+    float3 rayOriginWorld = screenCoordToWorld(texCoord, 0);
+    float3 rayEndWorld = screenCoordToWorld(texCoord, 1);
+    float3 directionWorld = normalize(rayEndWorld - rayOriginWorld);
     psOut.color = renderBackground(directionWorld);
 
     if (octreeMaxDepth == 0)
-        return psOut;
-
-    float2 inOut = clip(float3(0), float3(voxelCount), from, to);
-    if (inOut.x < 0)
         return psOut;
 
     // Primary ray cone: pixel footprint
@@ -786,20 +969,43 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     float coneTan = tanHalfFovY / pixelCount.y;
 
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
-    from = from + (inOut.x + 1e-6) * delta;
+    WorldHitResult worldHit = {};
+    worldHit.tWorld = 1e30f;
+    VoxelInstanceData selectedInstance = {};
 
-    // The traversal and ray-cone distances are expressed in local cell space.
-    float initialDistance = (inOut.x + 1e-6) * length(delta);
-    RayCone primaryCone = { coneTan, initialDistance * coneTan };
-    HitResult hit = rayMarching(from, directionCell, -1, 0, -1);
+    // All instances share the same single-bin voxel resources. Each instance
+    // gets its own local ray and screen-space LOD, then the nearest world hit
+    // wins. This is the primary-ray scene traversal for the first multi-
+    // instance implementation.
+    for (uint i = 0; i < instanceCount; ++i)
+    {
+        VoxelInstanceData instance = instances[i];
+        WorldHitResult candidate = tracePrimaryInstance(
+            rayOriginWorld,
+            rayEndWorld,
+            directionWorld,
+            coneTan,
+            instance
+        );
+
+        const float kHitTieEpsilon = 1e-5f;
+        bool strictlyCloser = candidate.tWorld < worldHit.tWorld - kHitTieEpsilon;
+        bool sameDepth = abs(candidate.tWorld - worldHit.tWorld) <= kHitTieEpsilon;
+        bool stableTieBreak = sameDepth && candidate.instanceId < worldHit.instanceId;
+        if (candidate.hit && (strictlyCloser || stableTieBreak))
+        {
+            worldHit = candidate;
+            selectedInstance = instance;
+        }
+    }
 
     if (all(pixel == selectedPixel))
     {
-        if (hit.hit)
+        if (worldHit.hit)
         {
             // DisplayNDF evaluates the selected lobe in asset-local space.
-            selectedVoxel[0] = float4(-directionLocal, (float)hit.gbIndex);
-            selectedVoxel[1] = float4(float3(hit.cellInt), 0);
+            selectedVoxel[0] = float4(-worldHit.directionLocal, (float)worldHit.localHit.gbIndex);
+            selectedVoxel[1] = float4(float3(worldHit.localHit.cellInt), (float)worldHit.instanceId);
         }
         else
         {
@@ -808,27 +1014,30 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         }
     }
 
-    if (hit.hit)
+    if (worldHit.hit)
     {
+        // Keep traversal and shading in asset-local space; primary-hit
+        // consumers can use the world-space result above.
+        HitResult hit = worldHit.localHit;
+        float3 directionLocal = worldHit.directionLocal;
+        RayCone primaryCone = { coneTan, worldHit.rayConeBias };
         float3 color = 0;
         switch (drawMode)
         {
         case ABSDFDrawMode::Default:
 #if USE_EMISSIVE_LIGHTS
         {
-            float3 posLocal = gridMin + hit.cell * voxelSize;
-            float3 posW = localToWorldPoint(posLocal);
-            if (checkHitEmissive(posW, worldVoxelSize(), color))
+            if (checkHitEmissive(worldHit.positionW, worldVoxelSize(selectedInstance), color))
             {
                 psOut.color = float4(color, 1);
                 return psOut;
             }
         }
 #endif
-            color = shadingGlobal(hit, -directionLocal, sg, primaryCone);
+            color = shadingGlobal(hit, -directionLocal, sg, primaryCone, selectedInstance);
             break;
         case ABSDFDrawMode::Coverage:
-            color = coverageTest(hit, directionLocal, primaryCone);
+            color = coverageTest(hit, directionLocal, primaryCone, selectedInstance.screenLOD);
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
@@ -875,11 +1084,11 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             }
 
             baseColor = colors[min(lodLevel, 5u)]; // Clamp to max color index
-            color = lambertShading(hit, -directionLocal, sg, primaryCone, baseColor);
+            color = lambertShading(hit, -directionLocal, sg, primaryCone, baseColor, selectedInstance);
         }
             break;
         default:
-            color = debugShading(hit, -directionLocal);
+            color = debugShading(hit, -directionLocal, selectedInstance);
             break;
         }
         psOut.color = float4(color, 1);

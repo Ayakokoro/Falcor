@@ -1,5 +1,6 @@
 #include "RayMarchingPass.h"
 #include "VoxelizationMetadata.h"
+#include "VoxelSceneMetadata.h"
 #include "Shading.slang"
 #include "Math/SphericalHarmonics.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
@@ -17,6 +18,16 @@ const std::string kDisplayShaderFile = "RenderPasses/Voxelization/DisplayNDF.ps.
 const std::string kOutputColor = "color";
 const std::string kBufferCountDefine = "RAY_MARCHING_BUFFER_COUNT";
 constexpr size_t kRayMarchingBufferByteLimit = size_t(1) << 30; // 1 GiB per resource.
+
+bool isVoxelSceneMetaFile(const std::filesystem::path& path)
+{
+    const std::string filename = path.filename().string();
+    constexpr const char* kJsonSuffix = ".voxscene.json";
+    const size_t suffixLength = std::char_traits<char>::length(kJsonSuffix);
+    return path.extension() == ".voxscene" ||
+        (filename.size() >= suffixLength &&
+         filename.compare(filename.size() - suffixLength, suffixLength, kJsonSuffix) == 0);
+}
 
 // Host-side conversion replicating TEBSDF::init + SurfaceBRDF::init + LobeBRDF::init
 // (Shading.slang) so the raw VoxelData never has to be staged on the GPU.
@@ -80,11 +91,8 @@ TEBSDF convertVoxelData(const VoxelData& data)
 }
 } // namespace
 
-void RayMarchingPass::updateInstanceTransform()
+void RayMarchingPass::updateInstanceTransforms()
 {
-    // The voxel grid is stored in the asset's local space. Since the current
-    // asset has no separate authored pivot, rotate around the grid center so
-    // changing rotation does not make the model orbit the world origin.
     const float3 gridExtent(
         gridData.voxelSize.x * float(gridData.voxelCount.x),
         gridData.voxelSize.y * float(gridData.voxelCount.y),
@@ -92,42 +100,81 @@ void RayMarchingPass::updateInstanceTransform()
     );
     const float3 pivot = gridData.gridMin + 0.5f * gridExtent;
 
-    // Keep every scale component strictly positive so the inverse transform
-    // and the local/world distance conversion remain valid.
-    mInstanceScale.x = std::max(mInstanceScale.x, 1e-4f);
-    mInstanceScale.y = std::max(mInstanceScale.y, 1e-4f);
-    mInstanceScale.z = std::max(mInstanceScale.z, 1e-4f);
+    // Include half a voxel around the grid for a conservative broad-phase
+    // bound. The local traversal still clips against the exact grid bounds.
+    const float3 boundsMinLocal = gridData.gridMin - 0.5f * gridData.voxelSize;
+    const float3 boundsMaxLocal = gridData.gridMin + gridExtent + 0.5f * gridData.voxelSize;
+    const float3 corners[8] = {
+        float3(boundsMinLocal.x, boundsMinLocal.y, boundsMinLocal.z),
+        float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMinLocal.z),
+        float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
+        float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
+        float3(boundsMinLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
+        float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
+        float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
+        float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
+    };
 
-    const float3 rotationRadians = math::radians(mInstanceRotationDegrees);
-    const float4x4 rotation = math::matrixFromRotationXYZ(
-        rotationRadians.x, rotationRadians.y, rotationRadians.z
-    );
-    const float4x4 scaling = math::matrixFromScaling(mInstanceScale);
-    const float4x4 toPivot = math::matrixFromTranslation(-pivot);
-    const float4x4 fromPivot = math::matrixFromTranslation(pivot);
-    const float4x4 translation = math::matrixFromTranslation(mInstanceTranslation);
+    for (size_t i = 0; i < mInstances.size(); ++i)
+    {
+        VoxelInstance& instance = mInstances[i];
 
-    // Column-vector convention: local point is rotated around the pivot first,
-    // non-uniformly scaled around the same pivot, then translated into world space.
-    mInstanceTransform = math::mul(
-        translation,
-        math::mul(fromPivot, math::mul(rotation, math::mul(scaling, toPivot)))
-    );
-    mInverseInstanceTransform = math::inverse(mInstanceTransform);
-    mNormalTransform = math::transpose(mInverseInstanceTransform);
+        // Keep every scale component strictly positive so the inverse
+        // transform and the local/world distance conversion remain valid.
+        instance.scale.x = std::max(instance.scale.x, 1e-4f);
+        instance.scale.y = std::max(instance.scale.y, 1e-4f);
+        instance.scale.z = std::max(instance.scale.z, 1e-4f);
+
+        const float3 rotationRadians = math::radians(instance.rotationDegrees);
+        const float4x4 rotation = math::matrixFromRotationXYZ(
+            rotationRadians.x, rotationRadians.y, rotationRadians.z
+        );
+        const float4x4 scaling = math::matrixFromScaling(instance.scale);
+        const float4x4 toPivot = math::matrixFromTranslation(-pivot);
+        const float4x4 fromPivot = math::matrixFromTranslation(pivot);
+        const float4x4 translation = math::matrixFromTranslation(instance.translation);
+
+        // Column-vector convention: local point is rotated around the pivot
+        // first, scaled around the same pivot, then translated into world space.
+        instance.localToWorld = math::mul(
+            translation,
+            math::mul(fromPivot, math::mul(rotation, math::mul(scaling, toPivot)))
+        );
+        instance.worldToLocal = math::inverse(instance.localToWorld);
+        instance.normalTransform = math::transpose(instance.worldToLocal);
+
+        float3 boundsMinW(std::numeric_limits<float>::max());
+        float3 boundsMaxW(-std::numeric_limits<float>::max());
+        for (const float3& corner : corners)
+        {
+            const float3 cornerW = math::mul(instance.localToWorld, float4(corner, 1.0f)).xyz();
+            boundsMinW = min(boundsMinW, cornerW);
+            boundsMaxW = max(boundsMaxW, cornerW);
+        }
+        instance.worldBoundsMin = boundsMinW;
+        instance.worldBoundsMax = boundsMaxW;
+    }
 }
 
-void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj, const float4x4& localToWorld)
+void RayMarchingPass::updateScreenSpaceLOD(
+    const float4x4& viewProj,
+    VoxelInstance& instance,
+    bool updateDebugStats
+)
 {
     constexpr float kTargetVoxelSizePixels = 0.5f;
     constexpr float kProjectionEpsilon = 1e-6f;
 
-    mGridProjectionValid = false;
-    mGridProjectedWidthPixels = 0.0f;
-    mGridProjectedHeightPixels = 0.0f;
-    mGridProjectedAreaPixels = 0.0f;
-    mLeafProjectedSizePixels = 0.0f;
-    mScreenLOD = 0;
+    instance.screenLOD = 0;
+    if (updateDebugStats)
+    {
+        mGridProjectionValid = false;
+        mGridProjectedWidthPixels = 0.0f;
+        mGridProjectedHeightPixels = 0.0f;
+        mGridProjectedAreaPixels = 0.0f;
+        mLeafProjectedSizePixels = 0.0f;
+        mScreenLOD = 0;
+    }
 
     const uint32_t maxLOD = std::min(mOctreeMaxDepth, mAvailableLODLevels);
     if (mOutputResolution.x == 0 || mOutputResolution.y == 0 || gridData.voxelCount.x == 0)
@@ -157,7 +204,7 @@ void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj, const float
 
     for (const float3& corner : corners)
     {
-        const float3 worldCorner = math::mul(localToWorld, float4(corner, 1.0f)).xyz();
+        const float3 worldCorner = math::mul(instance.localToWorld, float4(corner, 1.0f)).xyz();
         const float4 clip = math::mul(viewProj, float4(worldCorner, 1.0f));
 
         // A grid crossing the near plane cannot be represented by a single
@@ -190,31 +237,172 @@ void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj, const float
         return;
     }
 
-    mGridProjectionValid = true;
-    mGridProjectedWidthPixels = projectedSize.x;
-    mGridProjectedHeightPixels = projectedSize.y;
-    mGridProjectedAreaPixels = projectedArea;
+    const float leafProjectedSizePixels = std::sqrt(projectedArea) / float(gridData.voxelCount.x);
+    int screenLOD = 0;
 
     // The projected grid area is divided by N^2 cells. Using the square root
     // gives an equivalent edge length in pixels, which is also well-defined
     // when the grid is viewed obliquely. A node at LOD L spans 2^L leaf cells.
-    mLeafProjectedSizePixels = std::sqrt(projectedArea) / float(gridData.voxelCount.x);
-
-    float nodeProjectedSize = mLeafProjectedSizePixels;
-    while (mScreenLOD < int(maxLOD) && nodeProjectedSize <= kTargetVoxelSizePixels)
+    float nodeProjectedSize = leafProjectedSizePixels;
+    while (screenLOD < int(maxLOD) && nodeProjectedSize <= kTargetVoxelSizePixels)
     {
-        ++mScreenLOD;
+        ++screenLOD;
         nodeProjectedSize *= 2.0f;
     }
 
     if (mMaxLODLevel >= 0)
-        mScreenLOD = std::min(mScreenLOD, mMaxLODLevel);
+        screenLOD = std::min(screenLOD, mMaxLODLevel);
+
+    instance.screenLOD = screenLOD;
+    if (updateDebugStats)
+    {
+        mGridProjectionValid = true;
+        mGridProjectedWidthPixels = projectedSize.x;
+        mGridProjectedHeightPixels = projectedSize.y;
+        mGridProjectedAreaPixels = projectedArea;
+        mLeafProjectedSizePixels = leafProjectedSizePixels;
+        mScreenLOD = screenLOD;
+    }
+}
+
+void RayMarchingPass::updateInstanceBuffer()
+{
+    if (mInstances.empty())
+    {
+        mInstanceBuffer = nullptr;
+        return;
+    }
+
+    std::vector<VoxelInstanceGPU> gpuInstances;
+    gpuInstances.reserve(mInstances.size());
+    for (const VoxelInstance& instance : mInstances)
+    {
+        VoxelInstanceGPU gpu{};
+        gpu.localToWorld = instance.localToWorld;
+        gpu.worldToLocal = instance.worldToLocal;
+        gpu.normalTransform = instance.normalTransform;
+        gpu.worldBoundsMin = float4(instance.worldBoundsMin, 0.0f);
+        gpu.worldBoundsMax = float4(instance.worldBoundsMax, 0.0f);
+        gpu.instanceId = instance.instanceId;
+        gpu.screenLOD = instance.screenLOD;
+        gpu.enabled = instance.enabled ? 1u : 0u;
+        gpu.padding = 0;
+        gpuInstances.push_back(gpu);
+    }
+
+    const uint32_t instanceCount = static_cast<uint32_t>(gpuInstances.size());
+    if (!mInstanceBuffer || mInstanceBuffer->getElementCount() != instanceCount)
+    {
+        mInstanceBuffer = mpDevice->createStructuredBuffer(
+            sizeof(VoxelInstanceGPU),
+            instanceCount,
+            ResourceBindFlags::ShaderResource,
+            MemoryType::DeviceLocal,
+            gpuInstances.data(),
+            false
+        );
+    }
+    else
+    {
+        mInstanceBuffer->setBlob(
+            gpuInstances.data(),
+            0,
+            gpuInstances.size() * sizeof(VoxelInstanceGPU)
+        );
+    }
+}
+
+void RayMarchingPass::resetVoxelResources()
+{
+    // The shader array size is compiled from mBufferCount. These resources and
+    // both fullscreen passes must be discarded together when a new bin is
+    // selected, otherwise a scene with a different split count can retain the
+    // previous shader layout for one frame.
+    mGBuffers.clear();
+    mPBuffers.clear();
+    mGBufferSplits.clear();
+    mOctreeBuffer = nullptr;
+    mOctreeMaxDepth = 0;
+    mOctreeNodeCounts.clear();
+    mAvailableLODLevels = 0;
+    mVoxelFormatVersion = 0;
+    mVoxelLodMode.clear();
+    mVoxelProducer.clear();
+    mHasVoxelMetadata = false;
+    mBufferCount = 1;
+    mInstanceBuffer = nullptr;
+    mSelectedVoxel = nullptr;
+    mpSelectedVoxelStaging = nullptr;
+    mSelectedHit = false;
+    mSelectedGbOffset = 0xFFFFFFFF;
+    mSelectedCellInt = int3(-1);
+    mSelectedInstanceId = 0xFFFFFFFF;
+    mScreenLOD = 0;
+    mGridProjectionValid = false;
+    mpFullScreenPass = nullptr;
+    mpDisplayNDFPass = nullptr;
+}
+
+void RayMarchingPass::resetInstancesToIdentity()
+{
+    mInstances.clear();
+    mInstances.emplace_back();
+    mInstanceEditIndex = 0;
+    mInstanceBuffer = nullptr;
+    mSelectedHit = false;
+    mSelectedGbOffset = 0xFFFFFFFF;
+    mSelectedCellInt = int3(-1);
+    mSelectedInstanceId = 0xFFFFFFFF;
+}
+
+bool RayMarchingPass::loadSceneMeta(const std::filesystem::path& path)
+{
+    VoxelSceneMetadata::Scene scene;
+    std::string error;
+    if (!VoxelSceneMetadata::read(path, scene, error))
+    {
+        mSceneMetaError = std::move(error);
+        std::cerr << "Failed to load voxel scene meta: " << mSceneMetaError << std::endl;
+        return false;
+    }
+
+    std::vector<VoxelInstance> instances;
+    instances.reserve(scene.instances.size());
+    for (const VoxelSceneMetadata::Instance& source : scene.instances)
+    {
+        VoxelInstance instance;
+        instance.instanceId = source.instanceId;
+        instance.enabled = source.enabled;
+        instance.translation = float3(
+            source.translation[0], source.translation[1], source.translation[2]
+        );
+        instance.rotationDegrees = float3(
+            source.rotationDegrees[0], source.rotationDegrees[1], source.rotationDegrees[2]
+        );
+        instance.scale = float3(source.scale[0], source.scale[1], source.scale[2]);
+        instances.push_back(instance);
+    }
+
+    mInstances = std::move(instances);
+    mInstanceEditIndex = 0;
+    mVoxelFilePath = scene.voxelFile;
+    mSceneMetaPath = scene.sourcePath;
+    mSceneMetaAssetId = scene.assetId;
+    mSceneMetaLoaded = true;
+    mSceneMetaError.clear();
+
+    resetVoxelResources();
+    requestRecompile();
+    mComplete = false;
+    mOptionsChanged = true;
+    return true;
 }
 
 RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice), gridData(VoxelizationBase::GlobalGridData)
 {
     mpDevice = pDevice;
+    mInstances.emplace_back();
     mComplete = true;
     mShadowBias100 = 0.01f;
     mMinPdf100 = 0.1f;
@@ -275,15 +463,24 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
     if (!mComplete)
     {
+        // Direct bin loading and scene-meta loading share the same binary
+        // reader. A fallback keeps the old UI state usable if a pass is
+        // restored with mComplete=false before a file has been selected.
+        if (mVoxelFilePath.empty() && selectedFile < filePaths.size())
+            mVoxelFilePath = filePaths[selectedFile];
+        if (mVoxelFilePath.empty())
+            return;
+
+        const std::filesystem::path binaryPath = mVoxelFilePath;
         GridData& gd = VoxelizationBase::GlobalGridData;
 
         std::ifstream f;
-        f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
+        f.open(binaryPath, std::ios::binary | std::ios::ate);
         if (!f.is_open())
             return;
 
-        std::cout << "Reading voxel data from: " << filePaths[selectedFile] << std::endl;
-        size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
+        std::cout << "Reading voxel data from: " << binaryPath << std::endl;
+        size_t fileSize = std::filesystem::file_size(binaryPath);
         size_t offset = 0;
 
         // Read GridData header
@@ -304,7 +501,6 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // The optional text sidecar carries the producer/version and, for
         // CPU-generated files, how many parent LOD levels contain data.
         VoxelizationMetadata::Metadata metadata;
-        const auto& binaryPath = filePaths[selectedFile];
         std::error_code metadataEc;
         const bool hasSidecar = std::filesystem::exists(
             VoxelizationMetadata::sidecarPath(binaryPath), metadataEc);
@@ -546,8 +742,16 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     ref<Camera> pCamera = mpScene->getCamera();
     ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
     const float4x4 viewProjNoJitter = pCamera->getViewProjMatrixNoJitter();
-    updateInstanceTransform();
-    updateScreenSpaceLOD(viewProjNoJitter, mInstanceTransform);
+    if (mInstances.empty())
+        mInstances.emplace_back();
+    mInstanceEditIndex = std::min<uint32_t>(mInstanceEditIndex, static_cast<uint32_t>(mInstances.size() - 1));
+    updateInstanceTransforms();
+    for (size_t i = 0; i < mInstances.size(); ++i)
+    {
+        updateScreenSpaceLOD(viewProjNoJitter, mInstances[i], i == mInstanceEditIndex);
+    }
+    mScreenLOD = mInstances[mInstanceEditIndex].screenLOD;
+    updateInstanceBuffer();
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
@@ -612,6 +816,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             var["pBuffer"][i] = mPBuffers[i];
         }
         var["octreeBuffer"] = mOctreeBuffer;
+        var["instances"] = mInstanceBuffer;
         var["selectedVoxel"] = mSelectedVoxel;
 
         auto cb_GridData = var["GridData"];
@@ -623,10 +828,14 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;
         cb["invVP"] = math::inverse(viewProjNoJitter);
-        cb["instanceTransform"] = mInstanceTransform;
-        cb["inverseInstanceTransform"] = mInverseInstanceTransform;
-        cb["normalTransform"] = mNormalTransform;
-        cb["instanceScale"] = mInstanceScale;
+        const VoxelInstance& debugInstance = mInstances[mInstanceEditIndex];
+        cb["instanceCount"] = static_cast<uint32_t>(mInstances.size());
+        // These fields remain as a compatibility/fallback context for local
+        // helper paths. Primary tracing uses the per-instance structured buffer.
+        cb["instanceTransform"] = debugInstance.localToWorld;
+        cb["inverseInstanceTransform"] = debugInstance.worldToLocal;
+        cb["normalTransform"] = debugInstance.normalTransform;
+        cb["instanceScale"] = debugInstance.scale;
         // The shader traces in local cell units. The bias is asset-local and
         // therefore scales with the instance together with the voxel grid.
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
@@ -692,11 +901,13 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mSelectedHit = true;
             mSelectedGbOffset = (uint)v0.w;
             mSelectedCellInt = int3((int)v1.x, (int)v1.y, (int)v1.z);
+            mSelectedInstanceId = (uint)v1.w;
         }
         else
         {
             mSelectedHit = false;
             mSelectedGbOffset = 0xFFFFFFFF;
+            mSelectedInstanceId = 0xFFFFFFFF;
             mSelectedCellInt = int3(-1);
         }
     }
@@ -710,10 +921,14 @@ void RayMarchingPass::compile(RenderContext* pRenderContext, const CompileData& 
 
 void RayMarchingPass::renderUI(Gui::Widgets& widget)
 {
-    // ---- File selection (from ReadVoxelPass) ----
-    if (VoxelizationBase::FileUpdated)
+    // ---- Voxel bin and scene-meta selection ----
+    // Keep probing while no scene meta is present so a hand-authored file
+    // created while the application is running becomes visible without
+    // needing a voxel re-generation event.
+    if (VoxelizationBase::FileUpdated || !mFileListInitialized || sceneMetaPaths.empty())
     {
         filePaths.clear();
+        sceneMetaPaths.clear();
         for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
         {
             // Metadata is a sidecar (<file>.bin.meta), not a selectable voxel
@@ -723,53 +938,85 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             {
                 filePaths.push_back(entry.path());
             }
+            else if (std::filesystem::is_regular_file(entry) && isVoxelSceneMetaFile(entry.path()))
+            {
+                sceneMetaPaths.push_back(entry.path());
+            }
         }
+        std::sort(filePaths.begin(), filePaths.end());
+        std::sort(sceneMetaPaths.begin(), sceneMetaPaths.end());
+        mFileListInitialized = true;
         VoxelizationBase::FileUpdated = false;
     }
+
     Gui::DropdownList list;
     for (uint i = 0; i < filePaths.size(); i++)
     {
         list.push_back({i, filePaths[i].filename().string()});
     }
-    widget.dropdown("File", list, selectedFile);
-
-    if (mpScene && widget.button("Read"))
+    if (!filePaths.empty())
     {
-        std::ifstream f;
-        f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
-        if (f.is_open())
+        selectedFile = std::min<uint>(selectedFile, static_cast<uint>(filePaths.size() - 1));
+        widget.dropdown("Voxel Bin", list, selectedFile);
+
+        if (mpScene && widget.button("Read Voxel Bin"))
         {
-            size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
-            size_t offset = 0;
-            tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
-            f.close();
+            const std::filesystem::path binaryPath = filePaths[selectedFile];
+            std::ifstream f(binaryPath, std::ios::binary | std::ios::ate);
+            if (f.is_open())
+            {
+                const size_t fileSize = std::filesystem::file_size(binaryPath);
+                size_t offset = 0;
+                tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
+                f.close();
 
-            // The buffer count is part of the shader resource layout. Drop the
-            // old resources and passes before the next execute() computes the
-            // new count, otherwise a reload with a different scene size would
-            // use the previous fixed array layout.
-            mGBuffers.clear();
-            mPBuffers.clear();
-            mGBufferSplits.clear();
-            mOctreeBuffer = nullptr;
-            mOctreeMaxDepth = 0;
-            mOctreeNodeCounts.clear();
-            mAvailableLODLevels = 0;
-            mVoxelFormatVersion = 0;
-            mVoxelLodMode.clear();
-            mVoxelProducer.clear();
-            mHasVoxelMetadata = false;
-            mBufferCount = 1;
-            mScreenLOD = 0;
-            mGridProjectionValid = false;
-            mpFullScreenPass = nullptr;
-            mpDisplayNDFPass = nullptr;
+                mVoxelFilePath = binaryPath;
+                mSceneMetaPath.clear();
+                mSceneMetaAssetId.clear();
+                mSceneMetaError.clear();
+                mSceneMetaLoaded = false;
+                resetInstancesToIdentity();
+                resetVoxelResources();
 
-            requestRecompile();
-            mComplete = false;
-            mOptionsChanged = true;
+                requestRecompile();
+                mComplete = false;
+                mOptionsChanged = true;
+            }
         }
     }
+    else
+    {
+        widget.text("No voxel .bin files found.");
+    }
+
+    Gui::DropdownList sceneList;
+    for (uint i = 0; i < sceneMetaPaths.size(); i++)
+    {
+        sceneList.push_back({i, sceneMetaPaths[i].filename().string()});
+    }
+    if (!sceneMetaPaths.empty())
+    {
+        selectedSceneMeta = std::min<uint>(
+            selectedSceneMeta,
+            static_cast<uint>(sceneMetaPaths.size() - 1)
+        );
+        widget.dropdown("Voxel Scene Meta", sceneList, selectedSceneMeta);
+        if (mpScene && widget.button("Read Voxel Scene Meta"))
+            loadSceneMeta(sceneMetaPaths[selectedSceneMeta]);
+    }
+    else
+    {
+        widget.text("No .voxscene scene meta files found.");
+    }
+
+    if (mSceneMetaLoaded)
+    {
+        widget.text("Scene Meta: " + mSceneMetaPath.filename().string());
+        widget.text("Scene Asset: " + mSceneMetaAssetId);
+        widget.text("Scene Voxel Bin: " + mVoxelFilePath.filename().string());
+    }
+    if (!mSceneMetaError.empty())
+        widget.text("Scene Meta Error: " + mSceneMetaError);
 
     widget.text("Voxel Size: " + ToString(gridData.voxelSize));
     widget.text("Voxel Count: " + ToString((int3)gridData.voxelCount));
@@ -779,13 +1026,61 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
-    widget.text("Instances: 1 (single instance)");
-    if (widget.var("Instance Translation", mInstanceTranslation, -1000.0f, 1000.0f, 0.01f))
+    if (mInstances.empty())
+        mInstances.emplace_back();
+    widget.text("Instances: " + std::to_string(mInstances.size()) + " (shared single bin)");
+    if (widget.button("Add Instance") && mInstances.size() < 256)
+    {
+        VoxelInstance instance;
+        uint32_t nextInstanceId = 0;
+        while (std::any_of(
+            mInstances.begin(),
+            mInstances.end(),
+            [nextInstanceId](const VoxelInstance& existing) { return existing.instanceId == nextInstanceId; }
+        ))
+        {
+            ++nextInstanceId;
+        }
+        instance.instanceId = nextInstanceId;
+        mInstances.push_back(instance);
+        mInstanceEditIndex = static_cast<uint32_t>(mInstances.size() - 1);
         mOptionsChanged = true;
-    if (widget.var("Instance Rotation XYZ (deg)", mInstanceRotationDegrees, -360.0f, 360.0f, 0.5f))
+    }
+    if (mInstances.size() > 1 && widget.button("Remove Selected Instance"))
+    {
+        mInstances.erase(mInstances.begin() + mInstanceEditIndex);
+        mInstanceEditIndex = std::min<uint32_t>(
+            mInstanceEditIndex,
+            static_cast<uint32_t>(mInstances.size() - 1)
+        );
         mOptionsChanged = true;
-    if (widget.var("Instance Scale XYZ", mInstanceScale, 0.01f, 100.0f, 0.01f))
+    }
+
+    mInstanceEditIndex = std::min<uint32_t>(
+        mInstanceEditIndex,
+        static_cast<uint32_t>(mInstances.size() - 1)
+    );
+    if (mInstances.size() > 1 &&
+        widget.var(
+            "Edit Instance",
+            mInstanceEditIndex,
+            0u,
+            static_cast<uint32_t>(mInstances.size() - 1)
+        ))
+    {
         mOptionsChanged = true;
+    }
+
+    VoxelInstance& instance = mInstances[mInstanceEditIndex];
+    if (widget.checkbox("Instance Enabled", instance.enabled))
+        mOptionsChanged = true;
+    if (widget.var("Instance Translation", instance.translation, -1000.0f, 1000.0f, 0.01f))
+        mOptionsChanged = true;
+    if (widget.var("Instance Rotation XYZ (deg)", instance.rotationDegrees, -360.0f, 360.0f, 0.5f))
+        mOptionsChanged = true;
+    if (widget.var("Instance Scale XYZ", instance.scale, 0.01f, 100.0f, 0.01f))
+        mOptionsChanged = true;
+    widget.text("Editing Instance ID: " + std::to_string(instance.instanceId));
     widget.text("Instance Rotation/Scale Pivot: Grid Center");
     if (mGridProjectionValid)
     {
@@ -893,6 +1188,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     {
         widget.text("Selected Voxel cellInt: " + ToString(mSelectedCellInt));
         widget.text("Selected Voxel gbOffset: " + std::to_string(mSelectedGbOffset));
+        widget.text("Selected Instance ID: " + std::to_string(mSelectedInstanceId));
     }
     else
     {
@@ -903,18 +1199,16 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
 void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
 {
     mpScene = pScene;
-    mpFullScreenPass = nullptr;
-    mpDisplayNDFPass = nullptr;
     mDebug = false;
     mUseEmissiveLight = false;
-    mInstanceTranslation = float3(0.0f);
-    mInstanceRotationDegrees = float3(0.0f);
-    mInstanceScale = float3(1.0f);
-    mInstanceTransform = float4x4::identity();
-    mInverseInstanceTransform = float4x4::identity();
-    mNormalTransform = float4x4::identity();
-    mScreenLOD = 0;
-    mGridProjectionValid = false;
+    mVoxelFilePath.clear();
+    mSceneMetaPath.clear();
+    mSceneMetaAssetId.clear();
+    mSceneMetaError.clear();
+    mSceneMetaLoaded = false;
+    resetInstancesToIdentity();
+    resetVoxelResources();
+    mComplete = false;
 }
 
 bool RayMarchingPass::onMouseEvent(const MouseEvent& mouseEvent)

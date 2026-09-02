@@ -44,4 +44,20 @@ struct OctreeNode
     uint dataIndex;   // Index into gBuffer/pBuffer for this node's own data (independent per-node)
 };
 
+// Per-placement data for the single-bin multi-instance ray marcher. This is
+// shared with C++ so the structured-buffer layout cannot drift between host
+// upload code and Slang.
+struct VoxelInstanceData
+{
+    float4x4 localToWorld;
+    float4x4 worldToLocal;
+    float4x4 normalTransform;
+    float4 worldBoundsMin;
+    float4 worldBoundsMax;
+    uint instanceId;
+    int screenLOD;
+    uint enabled;
+    uint padding;
+};
+
 END_NAMESPACE_FALCOR
