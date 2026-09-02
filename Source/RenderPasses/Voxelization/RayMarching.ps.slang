@@ -37,6 +37,9 @@ cbuffer CB
 {
     uint2 pixelCount;
     float4x4 invVP;
+    float4x4 instanceTransform;        // local grid -> world
+    float4x4 inverseInstanceTransform; // world -> local grid
+    float4x4 normalTransform;           // local normal -> world normal
     float shadowBias;
     uint drawMode;
     uint frameIndex;
@@ -519,11 +522,37 @@ float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
     return lightColor * BSDF.eval(l, v, h);
 }
 
+float3 localToWorldPoint(float3 pointLocal)
+{
+    return mul(instanceTransform, float4(pointLocal, 1.0f)).xyz;
+}
+
+float3 localToWorldVector(float3 vectorLocal)
+{
+    return mul(instanceTransform, float4(vectorLocal, 0.0f)).xyz;
+}
+
+float3 worldToLocalPoint(float3 pointWorld)
+{
+    return mul(inverseInstanceTransform, float4(pointWorld, 1.0f)).xyz;
+}
+
+float3 worldToLocalVector(float3 vectorWorld)
+{
+    return mul(inverseInstanceTransform, float4(vectorWorld, 0.0f)).xyz;
+}
+
+float3 localToWorldNormal(float3 normalLocal)
+{
+    return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
+}
+
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
     TEBSDF BSDF = loadGBuffer(offset);
-    float3 posW = gridMin + hit.cell * voxelSize;
+    float3 posLocal = gridMin + hit.cell * voxelSize;
+    float3 posW = localToWorldPoint(posLocal);
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
 
@@ -617,8 +646,9 @@ float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
 {
     float4 NDC = float4(2 * screenCoord.x - 1, 1 - 2 * screenCoord.y, NDCDepth, 1);
     float4 temp = mul(invVP, NDC);
-    float4 posWorld = temp / temp.w;
-    float3 cell = (posWorld.xyz - gridMin) / voxelSize;
+    float3 posWorld = (temp / temp.w).xyz;
+    float3 posLocal = worldToLocalPoint(posWorld);
+    float3 cell = (posLocal - gridMin) / voxelSize;
     return cell;
 }
 
@@ -648,7 +678,8 @@ float4 renderBackground(float3 direction)
 float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
 {
     TEBSDF BSDF = loadGBuffer(hit.gbIndex);
-    float3 posW = gridMin + hit.cell * voxelSize;
+    float3 posLocal = gridMin + hit.cell * voxelSize;
+    float3 posW = localToWorldPoint(posLocal);
 
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -680,7 +711,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     float3 to = screenCoordToCell(texCoord, 1);
     float3 delta = to - from;
     float3 direction = normalize(delta);
-    psOut.color = renderBackground(direction);
+    psOut.color = renderBackground(normalize(localToWorldVector(direction)));
 
     if (octreeMaxDepth == 0)
         return psOut;
@@ -705,7 +736,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     {
         if (hit.hit)
         {
-            selectedVoxel[0] = float4(-direction, (float)hit.gbIndex);
+            selectedVoxel[0] = float4(normalize(localToWorldVector(-direction)), (float)hit.gbIndex);
             selectedVoxel[1] = float4(float3(hit.cellInt), 0);
         }
         else
@@ -723,7 +754,8 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         case ABSDFDrawMode::Default:
 #if USE_EMISSIVE_LIGHTS
         {
-            float3 posW = gridMin + hit.cell * voxelSize;
+            float3 posLocal = gridMin + hit.cell * voxelSize;
+            float3 posW = localToWorldPoint(posLocal);
             if (checkHitEmissive(posW, voxelSize.x, color))
             {
                 psOut.color = float4(color, 1);

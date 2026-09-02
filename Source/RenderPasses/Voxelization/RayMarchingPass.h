@@ -26,7 +26,7 @@ public:
 
 private:
     bool tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize);
-    void updateScreenSpaceLOD(const float4x4& viewProj);
+    void updateScreenSpaceLOD(const float4x4& viewProj, const float4x4& localToWorld);
 
     ref<Scene> mpScene;
     ref<Device> mpDevice;
@@ -57,6 +57,14 @@ private:
     bool mDebug;
     bool mRenderBackGround;
     bool mComplete;
+
+    // The current pass contains exactly one implicit instance. Keeping its
+    // transforms explicit makes the local-grid/world-space boundary clear and
+    // lets the screen-space LOD code use the same path as future instances.
+    float4x4 mInstanceTransform = float4x4::identity();
+    float4x4 mInverseInstanceTransform = float4x4::identity();
+    float4x4 mNormalTransform = float4x4::identity();
+
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     int mMaxLODLevel = -1; // -1=no cap, N=do not select a coarser level than N
     float mCoverageBlend = 0.0f; // 0=raw coverage, 1=fill all empty cavity

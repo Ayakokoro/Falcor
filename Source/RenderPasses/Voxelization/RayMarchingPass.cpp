@@ -80,7 +80,7 @@ TEBSDF convertVoxelData(const VoxelData& data)
 }
 } // namespace
 
-void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj)
+void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj, const float4x4& localToWorld)
 {
     constexpr float kTargetVoxelSizePixels = 0.5f;
     constexpr float kProjectionEpsilon = 1e-6f;
@@ -120,7 +120,8 @@ void RayMarchingPass::updateScreenSpaceLOD(const float4x4& viewProj)
 
     for (const float3& corner : corners)
     {
-        const float4 clip = math::mul(viewProj, float4(corner, 1.0f));
+        const float3 worldCorner = math::mul(localToWorld, float4(corner, 1.0f)).xyz();
+        const float4 clip = math::mul(viewProj, float4(worldCorner, 1.0f));
 
         // A grid crossing the near plane cannot be represented by a single
         // finite screen-space rectangle. Selecting the finest level is the
@@ -508,7 +509,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     ref<Camera> pCamera = mpScene->getCamera();
     ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
     const float4x4 viewProjNoJitter = pCamera->getViewProjMatrixNoJitter();
-    updateScreenSpaceLOD(viewProjNoJitter);
+    updateScreenSpaceLOD(viewProjNoJitter, mInstanceTransform);
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
@@ -584,6 +585,9 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;
         cb["invVP"] = math::inverse(viewProjNoJitter);
+        cb["instanceTransform"] = mInstanceTransform;
+        cb["inverseInstanceTransform"] = mInverseInstanceTransform;
+        cb["normalTransform"] = mNormalTransform;
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
@@ -734,6 +738,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
+    widget.text("Instances: 1 (identity transform)");
     if (mGridProjectionValid)
     {
         widget.text("Grid Projection (px): " + std::to_string(mGridProjectedWidthPixels) + " x " +
@@ -854,6 +859,9 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mpDisplayNDFPass = nullptr;
     mDebug = false;
     mUseEmissiveLight = false;
+    mInstanceTransform = float4x4::identity();
+    mInverseInstanceTransform = float4x4::identity();
+    mNormalTransform = float4x4::identity();
     mScreenLOD = 0;
     mGridProjectionValid = false;
 }
