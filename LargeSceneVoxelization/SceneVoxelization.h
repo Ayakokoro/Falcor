@@ -154,6 +154,38 @@ public:
             uint level = gen.mBFSOrder[nodeIdx].level;
 
             if (level == mMaxDepth) {
+                // Keep the in-memory path on the same node-analysis code as
+                // the disk-backed pipeline and VoxelizationInspector.
+                VoxelizationCore::NodeData debugNode;
+                debugNode.request.level = level;
+                debugNode.request.cell = gen.mBFSOrder[nodeIdx].cellInt;
+                debugNode.request.nodeKey = PolygonGenerator::makeNodeKey(
+                    level, debugNode.request.cell);
+                debugNode.polygons = gen.polygonArrays[nodeIdx];
+                debugNode.storedPolygonCount =
+                    static_cast<uint32_t>(debugNode.polygons.size());
+
+                VoxelizationCore::TextureSet debugTextures{
+                    mBaseColorTextures,
+                    mSpecularTextures,
+                    mMetallicTextures,
+                    mNormalMapTextures};
+                VoxelizationCore::AnalysisContext debugContext{
+                    scene, mGrid, mMaxDepth, debugTextures};
+                VoxelizationCore::AnalysisOptions debugOptions;
+                debugOptions.sampleFrequency = mConfig.sampleFrequency;
+
+                const auto debugResult = VoxelizationCore::analyzeNode(
+                    debugNode, debugContext, debugOptions);
+                if (debugResult.success)
+                    gen.gBuffer[nodeIdx] = debugResult.voxelData;
+                else {
+                    std::cerr << "  [Analyze] ERROR: " << debugResult.error << std::endl;
+                    gen.gBuffer[nodeIdx].init();
+                }
+                continue;
+#if 0 // Legacy inline leaf analysis; now implemented by VoxelizationCore.
+
                 // ── LEAF: analyze from own polygon data ──
                 VoxelData& vd = gen.gBuffer[nodeIdx];
                 PolygonRange& range = gen.polygonRangeBuffer[nodeIdx];
@@ -293,6 +325,7 @@ public:
                     vd.totalProjAreaFunc = totalF;
                 }
 
+#endif
             } else if (mConfig.lodMode == LODBuildMode::Approximate &&
                        level >= mMaxDepth - generatedLodLevels) {
                 // ── NON-LEAF: aggregate from children's VoxelData ──

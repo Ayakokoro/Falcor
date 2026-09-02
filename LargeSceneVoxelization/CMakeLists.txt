@@ -61,56 +61,92 @@ if(NOT assimp_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# Executable
+# Shared CPU voxelization/inspection core
 # ---------------------------------------------------------------------------
-add_executable(LargeSceneVoxelization
-    main.cpp
+# This is intentionally a static library.  Both executables link the same
+# single-node reader and analysis implementation without introducing a DLL
+# ABI/export boundary on Windows.
+add_library(VoxelizationCore STATIC
+    VoxelizationCore.cpp
+    VoxelizationCore.h
 )
 
-target_include_directories(LargeSceneVoxelization PRIVATE
+target_include_directories(VoxelizationCore PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${stb_SOURCE_DIR}           # stb_image.h
     ${glm_SOURCE_DIR}           # GLM header-only
 )
 
-target_link_libraries(LargeSceneVoxelization PRIVATE
+target_link_libraries(VoxelizationCore PUBLIC
     fmt::fmt
     assimp
+)
+
+# ---------------------------------------------------------------------------
+# Executables
+# ---------------------------------------------------------------------------
+add_executable(LargeSceneVoxelization
+    main.cpp
+)
+
+add_executable(VoxelizationInspector
+    VoxelizationInspector.cpp
+)
+
+target_link_libraries(LargeSceneVoxelization PRIVATE VoxelizationCore)
+target_link_libraries(VoxelizationInspector PRIVATE VoxelizationCore)
+
+target_include_directories(LargeSceneVoxelization PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${stb_SOURCE_DIR}
+    ${glm_SOURCE_DIR}
+)
+
+target_include_directories(VoxelizationInspector PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
 # ---------------------------------------------------------------------------
 # Compiler options
 # ---------------------------------------------------------------------------
 if(MSVC)
-    target_compile_options(LargeSceneVoxelization PRIVATE
+    foreach(target VoxelizationCore LargeSceneVoxelization VoxelizationInspector)
+        target_compile_options(${target} PRIVATE
         /W3 /MP /arch:AVX2 /fp:fast
         $<$<CONFIG:Release>:/O2 /GL>
         $<$<CONFIG:Debug>:/Od /Zi>
-    )
-    target_link_options(LargeSceneVoxelization PRIVATE
+        )
+    endforeach()
+    foreach(target LargeSceneVoxelization VoxelizationInspector)
+        target_link_options(${target} PRIVATE
         $<$<CONFIG:Release>:/LTCG>
-    )
+        )
+    endforeach()
 else()
-    target_compile_options(LargeSceneVoxelization PRIVATE
+    foreach(target VoxelizationCore LargeSceneVoxelization VoxelizationInspector)
+        target_compile_options(${target} PRIVATE
         -Wall -Wextra -march=native -ffast-math
         $<$<CONFIG:Release>:-O3 -flto>
         $<$<CONFIG:Debug>:-O0 -g>
-    )
+        )
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-install(TARGETS LargeSceneVoxelization RUNTIME DESTINATION bin)
+install(TARGETS LargeSceneVoxelization VoxelizationInspector RUNTIME DESTINATION bin)
 
 # ---------------------------------------------------------------------------
 # Post-build: copy assimp DLL to output directory
 # ---------------------------------------------------------------------------
 if(assimp_BINARY_DIR AND WIN32)
-    add_custom_command(TARGET LargeSceneVoxelization POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${assimp_BINARY_DIR}/bin/$<CONFIG>/assimp-vc143-mt.dll"
-            "$<TARGET_FILE_DIR:LargeSceneVoxelization>"
-        COMMENT "Copying assimp DLL to output directory"
-    )
+    foreach(target LargeSceneVoxelization VoxelizationInspector)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${assimp_BINARY_DIR}/bin/$<CONFIG>/assimp-vc143-mt.dll"
+                "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Copying assimp DLL to output directory"
+        )
+    endforeach()
 endif()
