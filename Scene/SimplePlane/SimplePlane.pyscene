@@ -1,14 +1,14 @@
-envMap = EnvMap('../EnvMap/White.exr')
-envMap.intensity = 1.0
-sceneBuilder.envMap = envMap
+# envMap = EnvMap('../EnvMap/White.exr')
+# envMap.intensity = 1.0
+# sceneBuilder.envMap = envMap
 
 sceneBuilder.importScene('simpleplane.fbx')
 
 # Add directional light
-# dirLight = DirectionalLight('Directional light')
-# dirLight.intensity = float3(20.0, 10.54, 10.08)
-# dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
-# sceneBuilder.addLight(dirLight)
+dirLight = DirectionalLight('Directional light')
+dirLight.intensity = float3(20.0, 10.54, 10.08)
+dirLight.direction = float3(0.6245101094245911, -0.7170000076293945, -0.3096744418144226)
+sceneBuilder.addLight(dirLight)
 
 camera = Camera()
 camera.position = float3(0, 0.28, 1.2)

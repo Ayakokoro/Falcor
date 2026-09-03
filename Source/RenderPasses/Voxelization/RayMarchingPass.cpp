@@ -831,7 +831,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         const VoxelInstance& debugInstance = mInstances[mInstanceEditIndex];
         cb["instanceCount"] = static_cast<uint32_t>(mInstances.size());
         // These fields remain as a compatibility/fallback context for local
-        // helper paths. Primary tracing uses the per-instance structured buffer.
+        // helper paths. Scene tracing uses the per-instance structured buffer.
         cb["instanceTransform"] = debugInstance.localToWorld;
         cb["inverseInstanceTransform"] = debugInstance.worldToLocal;
         cb["normalTransform"] = debugInstance.normalTransform;
