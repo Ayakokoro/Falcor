@@ -1199,6 +1199,17 @@ void RayMarchingPass::compile(RenderContext* pRenderContext, const CompileData& 
 
 void RayMarchingPass::renderUI(Gui::Widgets& widget)
 {
+    namespace fs = std::filesystem;
+    const fs::path resourceRoot = fs::path(VoxelizationBase::ResourceFolder);
+    const auto resourcePathLabel = [&resourceRoot](const fs::path& path)
+    {
+        std::error_code relativeEc;
+        const fs::path relative = fs::relative(path, resourceRoot, relativeEc);
+        if (!relativeEc && !relative.empty())
+            return relative.generic_string();
+        return path.filename().generic_string();
+    };
+
     // ---- Voxel bin and scene-meta selection ----
     // Keep probing while no scene meta is present so a hand-authored file
     // created while the application is running becomes visible without
@@ -1207,20 +1218,34 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     {
         filePaths.clear();
         sceneMetaPaths.clear();
-        for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
+
+        try
         {
-            // Metadata is a sidecar (<file>.bin.meta), not a selectable voxel
-            // data file. Keep the dropdown restricted to binary voxel files.
-            if (std::filesystem::is_regular_file(entry) &&
-                entry.path().extension() == ".bin")
+            // Search below the whole resource tree. Instanced voxelization
+            // writes a manifest and its asset bins into an output directory,
+            // which is commonly kept as a subdirectory under resource/.
+            for (const auto& entry : fs::recursive_directory_iterator(
+                     resourceRoot, fs::directory_options::skip_permission_denied))
             {
-                filePaths.push_back(entry.path());
-            }
-            else if (std::filesystem::is_regular_file(entry) && isVoxelSceneMetaFile(entry.path()))
-            {
-                sceneMetaPaths.push_back(entry.path());
+                std::error_code fileEc;
+                if (!entry.is_regular_file(fileEc) || fileEc)
+                    continue;
+
+                // Metadata is a sidecar (<file>.bin.meta), not a selectable
+                // voxel data file. Keep the dropdown restricted to binary
+                // voxel files.
+                if (entry.path().extension() == ".bin")
+                    filePaths.push_back(entry.path());
+                else if (isVoxelSceneMetaFile(entry.path()))
+                    sceneMetaPaths.push_back(entry.path());
             }
         }
+        catch (const fs::filesystem_error& e)
+        {
+            std::cerr << "Failed to scan voxel resource directory recursively ('"
+                      << resourceRoot.string() << "'): " << e.what() << std::endl;
+        }
+
         std::sort(filePaths.begin(), filePaths.end());
         std::sort(sceneMetaPaths.begin(), sceneMetaPaths.end());
         mFileListInitialized = true;
@@ -1230,7 +1255,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     Gui::DropdownList list;
     for (uint i = 0; i < filePaths.size(); i++)
     {
-        list.push_back({i, filePaths[i].filename().string()});
+        list.push_back({i, resourcePathLabel(filePaths[i])});
     }
     if (!filePaths.empty())
     {
@@ -1278,7 +1303,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     Gui::DropdownList sceneList;
     for (uint i = 0; i < sceneMetaPaths.size(); i++)
     {
-        sceneList.push_back({i, sceneMetaPaths[i].filename().string()});
+        sceneList.push_back({i, resourcePathLabel(sceneMetaPaths[i])});
     }
     if (!sceneMetaPaths.empty())
     {
@@ -1297,7 +1322,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
 
     if (mSceneMetaLoaded)
     {
-        widget.text("Scene Meta: " + mSceneMetaPath.filename().string());
+        widget.text("Scene Meta: " + resourcePathLabel(mSceneMetaPath));
         widget.text("Scene Assets: " + std::to_string(mVoxelAssets.size()));
     }
     if (!mSceneMetaError.empty())

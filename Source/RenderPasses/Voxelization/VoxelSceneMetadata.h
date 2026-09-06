@@ -50,7 +50,7 @@ namespace VoxelSceneMetadata
 inline constexpr const char* kFormat = "FalcorVoxelScene";
 inline constexpr uint32_t kCurrentVersion = 2;
 inline constexpr uint32_t kMaxAssets = 256;
-inline constexpr uint32_t kMaxInstances = 256;
+inline constexpr uint32_t kMaxInstances = 4096;
 
 using Transform16 = std::array<float, 16>;
 
