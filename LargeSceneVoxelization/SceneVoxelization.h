@@ -14,6 +14,7 @@
 #include "AnalyzePhase.h"
 #include "OctreeBuilder.h"
 #include "../Source/RenderPasses/Voxelization/VoxelizationMetadata.h"
+#include "../Source/RenderPasses/Voxelization/VoxelSceneMetadata.h"
 #include <vector>
 #include <memory>
 #include <fstream>
@@ -443,6 +444,12 @@ public:
     // ---- Disk-backed pipeline ----
     bool processDisk(const std::string& fbxPath, const std::string& outputPath);
 
+    // Voxelize each unique mesh once in its local coordinate system and write
+    // a v2 scene manifest containing one complete transform per source node.
+    // This path is intentionally disk-backed so peak memory is bounded by one
+    // asset at a time.
+    bool processInstanced(const std::string& glbPath, const std::string& outputDir);
+
 private:
     VoxelizationConfig mConfig;
     GridData mGrid;
@@ -459,6 +466,28 @@ private:
     std::string mTmpDir = "./tmp";
     uint32_t mNumThreads = 0;   // 0 = auto-detect
     bool mKeepTemp = true;      // default: keep temp files
+
+    bool processDiskScene(
+        const InstancedScene& scene,
+        const std::string& outputPath,
+        const std::filesystem::path& workDir,
+        const std::string& label
+    );
+
+    static VoxelSceneMetadata::Transform16 toMetadataTransform(const glm::mat4& matrix)
+    {
+        VoxelSceneMetadata::Transform16 result{};
+
+        // GLM is indexed as matrix[column][row]. The scene metadata format is
+        // serialized in logical row-major order.
+        for (uint32_t row = 0; row < 4; ++row)
+        {
+            for (uint32_t col = 0; col < 4; ++col)
+                result[row * 4 + col] = matrix[col][row];
+        }
+
+        return result;
+    }
 
     // ---- Transform helpers ----
 
@@ -1010,5 +1039,290 @@ inline bool SceneVoxelization::processDisk(
     }
 
     std::cout << "Done." << std::endl;
+    return true;
+}
+
+// Shared disk-backed pipeline used by the per-asset instanced path. The
+// caller supplies a scene that contains one local-space asset and an identity
+// instance, so the existing clip/analyze code can be reused unchanged.
+inline bool SceneVoxelization::processDiskScene(
+    const InstancedScene& scene,
+    const std::string& outputPath,
+    const std::filesystem::path& workDir,
+    const std::string& label
+)
+{
+    namespace fs = std::filesystem;
+
+    if (scene.meshes.empty() || scene.instances.empty())
+    {
+        std::cerr << "  [" << label << "] Scene has no mesh instances to voxelize."
+                  << std::endl;
+        return false;
+    }
+
+    fs::create_directories(workDir);
+    setupGrid(scene);
+
+    uint32_t resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
+    if (resolution > (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH))
+    {
+        std::cerr << "Grid resolution " << resolution
+                  << " exceeds nodeKey capacity (max "
+                  << (1u << PolygonGenerator::NODE_KEY_MAX_DEPTH) << ")" << std::endl;
+        return false;
+    }
+    mMaxDepth = 0;
+    while ((1u << mMaxDepth) < resolution)
+        mMaxDepth++;
+
+    loadTextures(scene.materials);
+
+    uint32_t generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
+    mGeneratedLodLevels = generatedLodLevels;
+    if (mConfig.lodLevels > mMaxDepth)
+    {
+        std::cout << "  LOD level count clamped from " << mConfig.lodLevels
+                  << " to " << mMaxDepth << std::endl;
+    }
+
+    const char* lodModeName =
+        mConfig.lodMode == LODBuildMode::Approximate ? "approximate" : "brute-force";
+    std::cout << "  LODs: " << generatedLodLevels
+              << " additional levels, mode=" << lodModeName << std::endl;
+    std::cout << "Grid: " << mGrid.voxelCount.x << "^3  voxelSize=" << mGrid.voxelSize.x
+              << "  maxDepth=" << mMaxDepth << std::endl;
+
+    std::cout << "\n=== [" << label << "] Phase 1: Multi-threaded Clip ===" << std::endl;
+    auto clipResult = ClipPhase::executeLevel(
+        scene, mGrid, mMaxDepth, mMaxDepth,
+        workDir, mNumThreads, "clip");
+    if (clipResult.shardFiles.empty())
+    {
+        std::cerr << "Clip phase produced no output." << std::endl;
+        return false;
+    }
+
+    std::cout << "\n=== [" << label << "] Phase 2: Merge ===" << std::endl;
+    auto mergeResult = MergePhase::execute(
+        clipResult, workDir, mMaxDepth, mConfig.maxPolygonsPerNode);
+    if (mergeResult.totalLeaves == 0 || !mergeResult.octree)
+    {
+        std::cerr << "Merge phase produced no leaves." << std::endl;
+        return false;
+    }
+
+    std::cout << "\n=== [" << label << "] Phase 3: Analyze ===" << std::endl;
+    AnalyzePhase::AnalyzeContext actx{
+        scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
+        mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
+    };
+    AnalyzePhase::execute(mergeResult, actx, mNumThreads);
+
+    auto& octree = *mergeResult.octree;
+    if (mConfig.lodMode == LODBuildMode::Approximate)
+    {
+        std::cout << "\n=== [" << label << "] Phase 4: Approximate Parent Aggregation ==="
+                  << std::endl;
+        aggregateParents(octree, mMaxDepth, generatedLodLevels);
+    }
+    else if (generatedLodLevels > 0)
+    {
+        std::cout << "\n=== [" << label << "] Phase 4: Brute-Force Parent LODs ==="
+                  << std::endl;
+
+        for (uint32_t lod = 1; lod <= generatedLodLevels; ++lod)
+        {
+            const uint32_t targetLevel = mMaxDepth - lod;
+            const std::string suffix = "lod_" + std::to_string(lod);
+            const std::string clipPhaseName = "clip_" + suffix;
+            const fs::path levelMergeDir = workDir / ("merge_" + suffix);
+
+            std::cout << "\n--- [" << label << "] Exact LOD " << lod
+                      << " (tree level " << targetLevel << ") ---" << std::endl;
+
+            auto lodClipResult = ClipPhase::executeLevel(
+                scene, mGrid, mMaxDepth, targetLevel,
+                workDir, mNumThreads, clipPhaseName);
+            if (lodClipResult.shardFiles.empty())
+            {
+                std::cerr << "  [LOD " << lod << "] clip produced no shards."
+                          << std::endl;
+                return false;
+            }
+
+            auto lodMergeResult = MergePhase::executeLevel(
+                lodClipResult, levelMergeDir, mMaxDepth, targetLevel,
+                mConfig.maxPolygonsPerNode);
+            if (lodMergeResult.totalNodes > 0)
+            {
+                AnalyzePhase::executeNodes(
+                    lodMergeResult.nodesIdxPath,
+                    lodMergeResult.polygonsDatPath,
+                    octree,
+                    actx,
+                    mNumThreads,
+                    "LOD " + std::to_string(lod));
+            }
+            else
+            {
+                std::cerr << "  [LOD " << lod << "] merge produced no nodes."
+                          << std::endl;
+            }
+
+            if (!mKeepTemp)
+            {
+                std::error_code ec;
+                fs::remove_all(levelMergeDir, ec);
+            }
+        }
+    }
+
+    std::cout << "\n=== [" << label << "] Phase 5: Write Output ===" << std::endl;
+    writeOutputDisk(outputPath, octree, mergeResult.totalPolygons,
+                    mergeResult.maxPolyPerNode);
+
+    if (!mKeepTemp)
+    {
+        std::error_code ec;
+        fs::remove_all(workDir / "merge", ec);
+    }
+    else
+    {
+        std::cout << "Merge data kept in: " << (workDir / "merge") << std::endl;
+    }
+
+    std::cout << "[" << label << "] Done." << std::endl;
+    return true;
+}
+
+inline bool SceneVoxelization::processInstanced(
+    const std::string& glbPath, const std::string& outputDir)
+{
+    namespace fs = std::filesystem;
+
+    std::cout << "Loading GLB for per-asset instanced voxelization: "
+              << glbPath << std::endl;
+
+    SceneLoader loader(mConfig.useSpecGlossMaterials);
+    InstancedScene sourceScene;
+    if (!loader.loadMeshInstances(glbPath, sourceScene))
+    {
+        std::cerr << "Failed to load: " << loader.getError() << std::endl;
+        return false;
+    }
+
+    if (sourceScene.meshes.empty() || sourceScene.instances.empty())
+    {
+        std::cerr << "Input scene has no mesh instances." << std::endl;
+        return false;
+    }
+    if (sourceScene.meshes.size() > VoxelSceneMetadata::kMaxAssets)
+    {
+        std::cerr << "Input scene has " << sourceScene.meshes.size()
+                  << " unique meshes, but the scene metadata limit is "
+                  << VoxelSceneMetadata::kMaxAssets << "." << std::endl;
+        return false;
+    }
+
+    for (size_t i = 0; i < sourceScene.instances.size(); ++i)
+    {
+        if (sourceScene.instances[i].meshID >= sourceScene.meshes.size())
+        {
+            std::cerr << "Instance " << i << " references an invalid mesh ID."
+                      << std::endl;
+            return false;
+        }
+    }
+
+    const fs::path outputRoot = fs::absolute(fs::path(outputDir)).lexically_normal();
+    std::error_code directoryEc;
+    fs::create_directories(outputRoot, directoryEc);
+    if (directoryEc)
+    {
+        std::cerr << "Cannot create output directory: " << outputRoot << std::endl;
+        return false;
+    }
+
+    const std::string inputStem = fs::path(glbPath).stem().string();
+    const std::string sceneName = inputStem.empty() ? "scene" : inputStem;
+    const fs::path sceneMetaPath = outputRoot / (sceneName + ".voxscene.json");
+
+    VoxelSceneMetadata::Scene sceneMeta;
+    sceneMeta.sourcePath = sceneMetaPath;
+    sceneMeta.assets.reserve(sourceScene.meshes.size());
+
+    std::cout << "  Unique meshes: " << sourceScene.meshes.size()
+              << "  Instances: " << sourceScene.instances.size()
+              << "  Materials: " << sourceScene.materials.size() << std::endl;
+    std::cout << "  Output directory: " << outputRoot << std::endl;
+
+    // Voxelize each unique mesh once in local space. Every temporary scene
+    // contains one identity instance, so setupGrid() uses local bounds and
+    // no source node transform is baked into the voxel asset.
+    for (uint32_t meshIndex = 0;
+         meshIndex < static_cast<uint32_t>(sourceScene.meshes.size());
+         ++meshIndex)
+    {
+        const std::string assetId = "mesh_" + std::to_string(meshIndex);
+        const fs::path outputPath = outputRoot / (assetId + ".bin");
+        const fs::path workDir = fs::path(mTmpDir) / "instanced" / assetId;
+
+        InstancedScene assetScene;
+        assetScene.materials = sourceScene.materials;
+
+        MeshGeometry mesh = sourceScene.meshes[meshIndex];
+        mesh.meshID = 0;
+        assetScene.meshes.push_back(std::move(mesh));
+
+        MeshInstance identityInstance{};
+        identityInstance.meshID = 0;
+        identityInstance.transform = glm::mat4(1.0f);
+        assetScene.instances.push_back(identityInstance);
+
+        std::cout << "\n=== Voxelizing asset " << assetId << " ("
+                  << (meshIndex + 1) << "/" << sourceScene.meshes.size()
+                  << ") ===" << std::endl;
+
+        if (!processDiskScene(assetScene, outputPath.string(), workDir, assetId))
+            return false;
+
+        VoxelSceneMetadata::Asset asset;
+        asset.assetId = assetId;
+        asset.voxelFile = outputPath;
+        sceneMeta.assets.push_back(std::move(asset));
+
+        if (!mKeepTemp)
+        {
+            std::error_code ec;
+            fs::remove_all(workDir, ec);
+        }
+    }
+
+    sceneMeta.instances.reserve(sourceScene.instances.size());
+    for (uint32_t instanceIndex = 0;
+         instanceIndex < static_cast<uint32_t>(sourceScene.instances.size());
+         ++instanceIndex)
+    {
+        const MeshInstance& sourceInstance = sourceScene.instances[instanceIndex];
+
+        VoxelSceneMetadata::Instance instance;
+        instance.instanceId = instanceIndex;
+        instance.assetIndex = sourceInstance.meshID;
+        instance.enabled = true;
+        instance.transform = toMetadataTransform(sourceInstance.transform);
+        sceneMeta.instances.push_back(std::move(instance));
+    }
+
+    std::string metadataError;
+    if (!VoxelSceneMetadata::write(sceneMetaPath, sceneMeta, metadataError))
+    {
+        std::cerr << "Failed to write scene metadata: " << metadataError << std::endl;
+        return false;
+    }
+
+    std::cout << "\nWrote scene metadata: " << sceneMetaPath << std::endl;
+    std::cout << "  Assets: " << sceneMeta.assets.size()
+              << "  Instances: " << sceneMeta.instances.size() << std::endl;
     return true;
 }

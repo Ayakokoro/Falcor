@@ -10,16 +10,36 @@
 
 using namespace Falcor;
 
-// CPU-side description of one placement of the currently loaded voxel asset.
-// The voxel buffers remain shared; only this per-instance data changes.
+// CPU-side description of one voxel binary in the composed scene. All assets
+// are concatenated into shared GPU buffers; these offsets identify each
+// asset's ranges and octree root.
+struct VoxelAsset
+{
+    std::string assetId;
+    std::filesystem::path voxelFile;
+    GridData gridData{};
+    uint32_t octreeRoot = 0;
+    uint32_t voxelDataOffset = 0;
+    uint32_t octreeMaxDepth = 0;
+    std::vector<uint32_t> octreeNodeCounts;
+    uint32_t availableLODLevels = 0;
+    uint32_t voxelFormatVersion = 0;
+    std::string voxelLodMode;
+    std::string voxelProducer;
+    bool hasVoxelMetadata = false;
+    size_t voxelDataFileOffset = 0;
+};
+
+// CPU-side description of one placement of a voxel asset.
 struct VoxelInstance
 {
     uint32_t instanceId = 0;
+    uint32_t assetIndex = 0;
     bool enabled = true;
 
-    float3 translation = float3(0.0f);
-    float3 rotationDegrees = float3(0.0f);
-    float3 scale = float3(1.0f);
+    // Complete transform from the voxel asset's local coordinate system to
+    // world space. This is the direct representation loaded from scene meta.
+    float4x4 assetToWorld = float4x4::identity();
 
     float4x4 localToWorld = float4x4::identity();
     float4x4 worldToLocal = float4x4::identity();
@@ -30,9 +50,10 @@ struct VoxelInstance
     int32_t screenLOD = 0;
 };
 
-// GPU representation is defined in VoxelizationShared.slang, which is also
+// GPU representations are defined in VoxelizationShared.slang, which is also
 // included by the ray-marching shader.
 using VoxelInstanceGPU = VoxelInstanceData;
+using VoxelAssetGPU = VoxelAssetData;
 
 class RayMarchingPass : public RenderPass
 {
@@ -53,6 +74,7 @@ public:
 private:
     bool tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize);
     bool loadSceneMeta(const std::filesystem::path& path);
+    bool loadVoxelResources(RenderContext* pRenderContext);
     void resetVoxelResources();
     void resetInstancesToIdentity();
     void updateInstanceTransforms();
@@ -79,7 +101,6 @@ private:
     uint selectedSceneMeta = 0;
     std::filesystem::path mVoxelFilePath;
     std::filesystem::path mSceneMetaPath;
-    std::string mSceneMetaAssetId;
     std::string mSceneMetaError;
     bool mSceneMetaLoaded = false;
     bool mFileListInitialized = false;
@@ -99,8 +120,10 @@ private:
     bool mComplete;
 
     std::vector<VoxelInstance> mInstances;
+    std::vector<VoxelAsset> mVoxelAssets;
     uint32_t mInstanceEditIndex = 0;
     ref<Buffer> mInstanceBuffer;
+    ref<Buffer> mAssetBuffer;
 
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     int mMaxLODLevel = -1; // -1=no cap, N=do not select a coarser level than N
@@ -129,13 +152,6 @@ private:
     std::vector<uint32_t> mGBufferSplits; // Exclusive global end index per buffer.
     uint32_t mBufferCount = 1;
     ref<Buffer> mOctreeBuffer;
-    uint32_t mOctreeMaxDepth = 0;
-    std::vector<uint32_t> mOctreeNodeCounts;
-    uint32_t mAvailableLODLevels = 0;
-    uint32_t mVoxelFormatVersion = 0;
-    std::string mVoxelLodMode;
-    std::string mVoxelProducer;
-    bool mHasVoxelMetadata = false;
 
     bool mOptionsChanged;
     uint mFrameIndex;

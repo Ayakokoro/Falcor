@@ -6,9 +6,11 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/FalcorMath.h"
 #include <algorithm>
+#include <cmath>
 #include <execution>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 
 namespace
@@ -18,6 +20,8 @@ const std::string kDisplayShaderFile = "RenderPasses/Voxelization/DisplayNDF.ps.
 const std::string kOutputColor = "color";
 const std::string kBufferCountDefine = "RAY_MARCHING_BUFFER_COUNT";
 constexpr size_t kRayMarchingBufferByteLimit = size_t(1) << 30; // 1 GiB per resource.
+constexpr size_t kVoxelConversionChunkElements = size_t(64) * 1024;
+constexpr uint32_t kMaxRayMarchingOctreeDepth = 23;
 
 bool isVoxelSceneMetaFile(const std::filesystem::path& path)
 {
@@ -93,53 +97,50 @@ TEBSDF convertVoxelData(const VoxelData& data)
 
 void RayMarchingPass::updateInstanceTransforms()
 {
-    const float3 gridExtent(
-        gridData.voxelSize.x * float(gridData.voxelCount.x),
-        gridData.voxelSize.y * float(gridData.voxelCount.y),
-        gridData.voxelSize.z * float(gridData.voxelCount.z)
-    );
-    const float3 pivot = gridData.gridMin + 0.5f * gridExtent;
-
-    // Include half a voxel around the grid for a conservative broad-phase
-    // bound. The local traversal still clips against the exact grid bounds.
-    const float3 boundsMinLocal = gridData.gridMin - 0.5f * gridData.voxelSize;
-    const float3 boundsMaxLocal = gridData.gridMin + gridExtent + 0.5f * gridData.voxelSize;
-    const float3 corners[8] = {
-        float3(boundsMinLocal.x, boundsMinLocal.y, boundsMinLocal.z),
-        float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMinLocal.z),
-        float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
-        float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
-        float3(boundsMinLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
-        float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
-        float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
-        float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
-    };
-
     for (size_t i = 0; i < mInstances.size(); ++i)
     {
         VoxelInstance& instance = mInstances[i];
+        if (instance.assetIndex >= mVoxelAssets.size())
+        {
+            instance.worldBoundsMin = float3(0.0f);
+            instance.worldBoundsMax = float3(0.0f);
+            continue;
+        }
 
-        // Keep every scale component strictly positive so the inverse
-        // transform and the local/world distance conversion remain valid.
-        instance.scale.x = std::max(instance.scale.x, 1e-4f);
-        instance.scale.y = std::max(instance.scale.y, 1e-4f);
-        instance.scale.z = std::max(instance.scale.z, 1e-4f);
-
-        const float3 rotationRadians = math::radians(instance.rotationDegrees);
-        const float4x4 rotation = math::matrixFromRotationXYZ(
-            rotationRadians.x, rotationRadians.y, rotationRadians.z
+        const GridData& assetGrid = mVoxelAssets[instance.assetIndex].gridData;
+        const float3 gridExtent(
+            assetGrid.voxelSize.x * float(assetGrid.voxelCount.x),
+            assetGrid.voxelSize.y * float(assetGrid.voxelCount.y),
+            assetGrid.voxelSize.z * float(assetGrid.voxelCount.z)
         );
-        const float4x4 scaling = math::matrixFromScaling(instance.scale);
-        const float4x4 toPivot = math::matrixFromTranslation(-pivot);
-        const float4x4 fromPivot = math::matrixFromTranslation(pivot);
-        const float4x4 translation = math::matrixFromTranslation(instance.translation);
 
-        // Column-vector convention: local point is rotated around the pivot
-        // first, scaled around the same pivot, then translated into world space.
-        instance.localToWorld = math::mul(
-            translation,
-            math::mul(fromPivot, math::mul(rotation, math::mul(scaling, toPivot)))
-        );
+        // Include half a voxel around the grid for a conservative broad-phase
+        // bound. The local traversal still clips against the exact grid bounds.
+        const float3 boundsMinLocal = assetGrid.gridMin - 0.5f * assetGrid.voxelSize;
+        const float3 boundsMaxLocal = assetGrid.gridMin + gridExtent + 0.5f * assetGrid.voxelSize;
+        const float3 corners[8] = {
+            float3(boundsMinLocal.x, boundsMinLocal.y, boundsMinLocal.z),
+            float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMinLocal.z),
+            float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
+            float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMinLocal.z),
+            float3(boundsMinLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
+            float3(boundsMaxLocal.x, boundsMinLocal.y, boundsMaxLocal.z),
+            float3(boundsMinLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
+            float3(boundsMaxLocal.x, boundsMaxLocal.y, boundsMaxLocal.z),
+        };
+
+        // Scene metadata stores the complete asset-local-to-world affine
+        // transform. Do not apply the old grid-center pivot transform here.
+        instance.localToWorld = instance.assetToWorld;
+
+        const float determinant = math::determinant(instance.localToWorld);
+        if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12f)
+        {
+            instance.worldBoundsMin = float3(0.0f);
+            instance.worldBoundsMax = float3(0.0f);
+            continue;
+        }
+
         instance.worldToLocal = math::inverse(instance.localToWorld);
         instance.normalTransform = math::transpose(instance.worldToLocal);
 
@@ -176,25 +177,30 @@ void RayMarchingPass::updateScreenSpaceLOD(
         mScreenLOD = 0;
     }
 
-    const uint32_t maxLOD = std::min(mOctreeMaxDepth, mAvailableLODLevels);
-    if (mOutputResolution.x == 0 || mOutputResolution.y == 0 || gridData.voxelCount.x == 0)
+    if (instance.assetIndex >= mVoxelAssets.size())
+        return;
+
+    const VoxelAsset& asset = mVoxelAssets[instance.assetIndex];
+    const GridData& assetGrid = asset.gridData;
+    const uint32_t maxLOD = std::min(asset.octreeMaxDepth, asset.availableLODLevels);
+    if (mOutputResolution.x == 0 || mOutputResolution.y == 0 || assetGrid.voxelCount.x == 0)
         return;
 
     const float3 gridExtent(
-        gridData.voxelSize.x * float(gridData.voxelCount.x),
-        gridData.voxelSize.y * float(gridData.voxelCount.y),
-        gridData.voxelSize.z * float(gridData.voxelCount.z)
+        assetGrid.voxelSize.x * float(assetGrid.voxelCount.x),
+        assetGrid.voxelSize.y * float(assetGrid.voxelCount.y),
+        assetGrid.voxelSize.z * float(assetGrid.voxelCount.z)
     );
-    const float3 gridMax = gridData.gridMin + gridExtent;
+    const float3 gridMax = assetGrid.gridMin + gridExtent;
 
     const float3 corners[8] = {
-        float3(gridData.gridMin.x, gridData.gridMin.y, gridData.gridMin.z),
-        float3(gridMax.x,          gridData.gridMin.y, gridData.gridMin.z),
-        float3(gridData.gridMin.x, gridMax.y,          gridData.gridMin.z),
-        float3(gridMax.x,          gridMax.y,          gridData.gridMin.z),
-        float3(gridData.gridMin.x, gridData.gridMin.y, gridMax.z),
-        float3(gridMax.x,          gridData.gridMin.y, gridMax.z),
-        float3(gridData.gridMin.x, gridMax.y,          gridMax.z),
+        float3(assetGrid.gridMin.x, assetGrid.gridMin.y, assetGrid.gridMin.z),
+        float3(gridMax.x,           assetGrid.gridMin.y, assetGrid.gridMin.z),
+        float3(assetGrid.gridMin.x, gridMax.y,           assetGrid.gridMin.z),
+        float3(gridMax.x,           gridMax.y,           assetGrid.gridMin.z),
+        float3(assetGrid.gridMin.x, assetGrid.gridMin.y, gridMax.z),
+        float3(gridMax.x,           assetGrid.gridMin.y, gridMax.z),
+        float3(assetGrid.gridMin.x, gridMax.y,           gridMax.z),
         float3(gridMax.x,          gridMax.y,          gridMax.z),
     };
 
@@ -237,7 +243,7 @@ void RayMarchingPass::updateScreenSpaceLOD(
         return;
     }
 
-    const float leafProjectedSizePixels = std::sqrt(projectedArea) / float(gridData.voxelCount.x);
+    const float leafProjectedSizePixels = std::sqrt(projectedArea) / float(assetGrid.voxelCount.x);
     int screenLOD = 0;
 
     // The projected grid area is divided by N^2 cells. Using the square root
@@ -286,7 +292,7 @@ void RayMarchingPass::updateInstanceBuffer()
         gpu.instanceId = instance.instanceId;
         gpu.screenLOD = instance.screenLOD;
         gpu.enabled = instance.enabled ? 1u : 0u;
-        gpu.padding = 0;
+        gpu.assetIndex = instance.assetIndex;
         gpuInstances.push_back(gpu);
     }
 
@@ -315,20 +321,15 @@ void RayMarchingPass::updateInstanceBuffer()
 void RayMarchingPass::resetVoxelResources()
 {
     // The shader array size is compiled from mBufferCount. These resources and
-    // both fullscreen passes must be discarded together when a new bin is
-    // selected, otherwise a scene with a different split count can retain the
+    // both fullscreen passes must be discarded together when a new asset set
+    // is selected, otherwise a scene with a different split count can retain the
     // previous shader layout for one frame.
     mGBuffers.clear();
     mPBuffers.clear();
     mGBufferSplits.clear();
     mOctreeBuffer = nullptr;
-    mOctreeMaxDepth = 0;
-    mOctreeNodeCounts.clear();
-    mAvailableLODLevels = 0;
-    mVoxelFormatVersion = 0;
-    mVoxelLodMode.clear();
-    mVoxelProducer.clear();
-    mHasVoxelMetadata = false;
+    mAssetBuffer = nullptr;
+    mVoxelAssets.clear();
     mBufferCount = 1;
     mInstanceBuffer = nullptr;
     mSelectedVoxel = nullptr;
@@ -372,29 +373,419 @@ bool RayMarchingPass::loadSceneMeta(const std::filesystem::path& path)
     {
         VoxelInstance instance;
         instance.instanceId = source.instanceId;
+        instance.assetIndex = source.assetIndex;
         instance.enabled = source.enabled;
-        instance.translation = float3(
-            source.translation[0], source.translation[1], source.translation[2]
+        instance.assetToWorld = math::matrixFromCoefficients<float, 4, 4>(
+            source.transform.data()
         );
-        instance.rotationDegrees = float3(
-            source.rotationDegrees[0], source.rotationDegrees[1], source.rotationDegrees[2]
-        );
-        instance.scale = float3(source.scale[0], source.scale[1], source.scale[2]);
         instances.push_back(instance);
     }
 
+    std::vector<VoxelAsset> assets;
+    assets.reserve(scene.assets.size());
+    for (const VoxelSceneMetadata::Asset& source : scene.assets)
+    {
+        VoxelAsset asset;
+        asset.assetId = source.assetId;
+        asset.voxelFile = source.voxelFile;
+        assets.push_back(std::move(asset));
+    }
+
+    resetVoxelResources();
+    mVoxelAssets = std::move(assets);
     mInstances = std::move(instances);
     mInstanceEditIndex = 0;
-    mVoxelFilePath = scene.voxelFile;
+    mVoxelFilePath = mVoxelAssets.front().voxelFile;
     mSceneMetaPath = scene.sourcePath;
-    mSceneMetaAssetId = scene.assetId;
     mSceneMetaLoaded = true;
     mSceneMetaError.clear();
 
-    resetVoxelResources();
     requestRecompile();
     mComplete = false;
     mOptionsChanged = true;
+    return true;
+}
+
+bool RayMarchingPass::loadVoxelResources(RenderContext* pRenderContext)
+{
+    auto failLoad = [this](const std::string& message)
+    {
+        mSceneMetaError = message;
+        std::cerr << "Failed to load voxel resources: " << message << std::endl;
+        return false;
+    };
+
+    std::vector<VoxelAsset> loadedAssets = mVoxelAssets;
+    if (loadedAssets.empty())
+    {
+        if (mVoxelFilePath.empty() && selectedFile < filePaths.size())
+            mVoxelFilePath = filePaths[selectedFile];
+        if (mVoxelFilePath.empty())
+            return false;
+
+        VoxelAsset asset;
+        asset.assetId = mVoxelFilePath.stem().string();
+        asset.voxelFile = mVoxelFilePath;
+        loadedAssets.push_back(std::move(asset));
+    }
+
+    std::vector<std::vector<OctreeNode>> assetOctrees(loadedAssets.size());
+    uint64_t totalNodeCount64 = 0;
+    uint64_t totalVoxelCount64 = 0;
+
+    // Pass 1 reads the lightweight headers and octrees, validates all local
+    // indices, and relocates them into one global node/data index space.
+    for (size_t assetIndex = 0; assetIndex < loadedAssets.size(); ++assetIndex)
+    {
+        VoxelAsset& asset = loadedAssets[assetIndex];
+        std::ifstream input(asset.voxelFile, std::ios::binary | std::ios::ate);
+        if (!input.is_open())
+            return failLoad("Cannot open voxel asset '" + asset.assetId + "': " + asset.voxelFile.string());
+
+        std::error_code sizeEc;
+        const std::uintmax_t fileSizeWide = std::filesystem::file_size(asset.voxelFile, sizeEc);
+        if (sizeEc || fileSizeWide > std::numeric_limits<size_t>::max())
+            return failLoad("Cannot determine a supported file size for voxel asset '" + asset.assetId + "'.");
+        const size_t fileSize = static_cast<size_t>(fileSizeWide);
+        size_t offset = 0;
+
+        if (!tryRead(input, offset, sizeof(GridData), &asset.gridData, fileSize))
+            return failLoad("Voxel asset '" + asset.assetId + "' has a truncated GridData header.");
+        if (!tryRead(input, offset, sizeof(uint32_t), &asset.octreeMaxDepth, fileSize))
+            return failLoad("Voxel asset '" + asset.assetId + "' has a truncated octree header.");
+
+        if (asset.octreeMaxDepth > kMaxRayMarchingOctreeDepth)
+        {
+            return failLoad(
+                "Voxel asset '" + asset.assetId + "' has octree depth " +
+                std::to_string(asset.octreeMaxDepth) + ", but the traversal supports at most " +
+                std::to_string(kMaxRayMarchingOctreeDepth) + "."
+            );
+        }
+        if (asset.gridData.voxelCount.x == 0 || asset.gridData.voxelCount.y == 0 ||
+            asset.gridData.voxelCount.z == 0 ||
+            !(asset.gridData.voxelSize.x > 0.0f) || !(asset.gridData.voxelSize.y > 0.0f) ||
+            !(asset.gridData.voxelSize.z > 0.0f) ||
+            !std::isfinite(asset.gridData.voxelSize.x) ||
+            !std::isfinite(asset.gridData.voxelSize.y) ||
+            !std::isfinite(asset.gridData.voxelSize.z))
+        {
+            return failLoad("Voxel asset '" + asset.assetId + "' has invalid grid dimensions or voxel size.");
+        }
+        const uint32_t rootSize = 1u << asset.octreeMaxDepth;
+        const uint64_t gridVoxelCountXY =
+            uint64_t(asset.gridData.voxelCount.x) * asset.gridData.voxelCount.y;
+        if (asset.gridData.voxelCount.x > rootSize || asset.gridData.voxelCount.y > rootSize ||
+            asset.gridData.voxelCount.z > rootSize ||
+            gridVoxelCountXY > std::numeric_limits<size_t>::max() / asset.gridData.voxelCount.z ||
+            !std::isfinite(asset.gridData.gridMin.x) ||
+            !std::isfinite(asset.gridData.gridMin.y) ||
+            !std::isfinite(asset.gridData.gridMin.z))
+        {
+            return failLoad("Voxel asset '" + asset.assetId + "' is incompatible with its octree root extent.");
+        }
+        if (asset.gridData.solidVoxelCount == 0 ||
+            asset.gridData.solidVoxelCount > std::numeric_limits<uint32_t>::max())
+        {
+            return failLoad("Voxel asset '" + asset.assetId + "' has an unsupported voxel payload size.");
+        }
+
+        asset.octreeNodeCounts.resize(size_t(asset.octreeMaxDepth) + 1);
+        const size_t nodeCountBytes = asset.octreeNodeCounts.size() * sizeof(uint32_t);
+        if (!tryRead(input, offset, nodeCountBytes, asset.octreeNodeCounts.data(), fileSize))
+            return failLoad("Voxel asset '" + asset.assetId + "' has truncated octree level counts.");
+        if (asset.octreeNodeCounts.empty() || asset.octreeNodeCounts[0] != 1)
+            return failLoad("Voxel asset '" + asset.assetId + "' must contain exactly one octree root.");
+
+        uint64_t localNodeCount64 = 0;
+        for (uint32_t count : asset.octreeNodeCounts)
+            localNodeCount64 += count;
+        if (localNodeCount64 == 0 || localNodeCount64 > std::numeric_limits<uint32_t>::max())
+            return failLoad("Voxel asset '" + asset.assetId + "' has an unsupported octree node count.");
+        if (totalNodeCount64 + localNodeCount64 > std::numeric_limits<uint32_t>::max())
+            return failLoad("The concatenated scene octree exceeds the uint32 index range.");
+        if (totalVoxelCount64 + asset.gridData.solidVoxelCount > std::numeric_limits<uint32_t>::max())
+            return failLoad("The concatenated voxel payload exceeds the uint32 index range.");
+
+        const uint32_t localNodeCount = static_cast<uint32_t>(localNodeCount64);
+        std::vector<OctreeNode>& nodes = assetOctrees[assetIndex];
+        nodes.resize(localNodeCount);
+        if (!tryRead(input, offset, size_t(localNodeCount) * sizeof(OctreeNode), nodes.data(), fileSize))
+            return failLoad("Voxel asset '" + asset.assetId + "' has a truncated octree payload.");
+
+        asset.octreeRoot = static_cast<uint32_t>(totalNodeCount64);
+        asset.voxelDataOffset = static_cast<uint32_t>(totalVoxelCount64);
+        asset.voxelDataFileOffset = offset;
+
+        const uint32_t localVoxelCount = static_cast<uint32_t>(asset.gridData.solidVoxelCount);
+        std::vector<uint32_t> levelStarts(asset.octreeNodeCounts.size() + 1, 0);
+        for (size_t level = 0; level < asset.octreeNodeCounts.size(); ++level)
+            levelStarts[level + 1] = levelStarts[level] + asset.octreeNodeCounts[level];
+
+        for (uint32_t level = 0; level <= asset.octreeMaxDepth; ++level)
+        {
+            for (uint32_t nodeIndex = levelStarts[level]; nodeIndex < levelStarts[level + 1]; ++nodeIndex)
+            {
+                OctreeNode& node = nodes[nodeIndex];
+                if ((node.childMask & ~0xffu) != 0)
+                    return failLoad("Voxel asset '" + asset.assetId + "' contains an invalid octree child mask.");
+                if (node.dataIndex >= localVoxelCount)
+                {
+                    return failLoad(
+                        "Voxel asset '" + asset.assetId + "' contains an out-of-range dataIndex at node " +
+                        std::to_string(nodeIndex) + "."
+                    );
+                }
+
+                node.dataIndex += asset.voxelDataOffset;
+                if (node.childMask != 0)
+                {
+                    uint32_t childCount = 0;
+                    for (uint32_t bits = node.childMask & 0xffu; bits != 0; bits >>= 1)
+                        childCount += bits & 1u;
+                    const bool hasNextLevel = level < asset.octreeMaxDepth;
+                    const uint32_t nextLevelStart = hasNextLevel ? levelStarts[level + 1] : localNodeCount;
+                    const uint32_t nextLevelEnd = hasNextLevel ? levelStarts[level + 2] : localNodeCount;
+                    if (!hasNextLevel || node.childBase < nextLevelStart ||
+                        uint64_t(node.childBase) + childCount > nextLevelEnd)
+                    {
+                        return failLoad(
+                            "Voxel asset '" + asset.assetId + "' contains an out-of-range childBase at node " +
+                            std::to_string(nodeIndex) + "."
+                        );
+                    }
+                    node.childBase += asset.octreeRoot;
+                }
+            }
+        }
+
+        const uint64_t payloadBytes = uint64_t(localVoxelCount) * sizeof(VoxelData);
+        if (payloadBytes > fileSize || asset.voxelDataFileOffset > fileSize - size_t(payloadBytes))
+            return failLoad("Voxel asset '" + asset.assetId + "' has a truncated VoxelData payload.");
+
+        VoxelizationMetadata::Metadata metadata;
+        std::error_code metadataEc;
+        const bool hasSidecar = std::filesystem::exists(
+            VoxelizationMetadata::sidecarPath(asset.voxelFile), metadataEc
+        );
+        if (VoxelizationMetadata::read(asset.voxelFile, metadata) &&
+            metadata.maxDepth == asset.octreeMaxDepth &&
+            (metadata.totalNodes == 0 || metadata.totalNodes == localNodeCount))
+        {
+            asset.hasVoxelMetadata = true;
+            asset.voxelFormatVersion = metadata.version;
+            asset.voxelLodMode = metadata.lodMode;
+            asset.voxelProducer = metadata.producer;
+            asset.availableLODLevels = std::min(metadata.generatedLodLevels, asset.octreeMaxDepth);
+        }
+        else if (hasSidecar)
+        {
+            asset.hasVoxelMetadata = false;
+            asset.voxelFormatVersion = 0;
+            asset.voxelLodMode.clear();
+            asset.voxelProducer.clear();
+            asset.availableLODLevels = 0;
+            std::cerr << "Voxel metadata for '" << asset.assetId
+                      << "' is invalid or does not match its binary; using leaf-only LOD." << std::endl;
+        }
+        else
+        {
+            asset.hasVoxelMetadata = false;
+            asset.voxelFormatVersion = 0;
+            asset.voxelLodMode = "legacy";
+            asset.voxelProducer = "legacy";
+            asset.availableLODLevels = asset.octreeMaxDepth;
+        }
+
+        totalNodeCount64 += localNodeCount64;
+        totalVoxelCount64 += localVoxelCount;
+
+        std::cout << "Voxel asset[" << assetIndex << "] '" << asset.assetId
+                  << "': file=" << asset.voxelFile
+                  << ", root=" << asset.octreeRoot
+                  << ", dataBase=" << asset.voxelDataOffset
+                  << ", nodes=" << localNodeCount
+                  << ", voxels=" << localVoxelCount
+                  << ", maxDepth=" << asset.octreeMaxDepth
+                  << ", availableLODLevels=" << asset.availableLODLevels << std::endl;
+    }
+
+    const uint32_t totalNodeCount = static_cast<uint32_t>(totalNodeCount64);
+    const uint32_t totalVoxelCount = static_cast<uint32_t>(totalVoxelCount64);
+    std::vector<OctreeNode> sceneOctree;
+    sceneOctree.reserve(totalNodeCount);
+    for (std::vector<OctreeNode>& nodes : assetOctrees)
+    {
+        sceneOctree.insert(
+            sceneOctree.end(),
+            std::make_move_iterator(nodes.begin()),
+            std::make_move_iterator(nodes.end())
+        );
+    }
+
+    ref<Buffer> octreeBuffer = mpDevice->createStructuredBuffer(
+        sizeof(OctreeNode), totalNodeCount, ResourceBindFlags::ShaderResource
+    );
+    octreeBuffer->setBlob(sceneOctree.data(), 0, sceneOctree.size() * sizeof(OctreeNode));
+    assetOctrees.clear();
+    sceneOctree.clear();
+    sceneOctree.shrink_to_fit();
+
+    const size_t maxElementsPerBuffer = kRayMarchingBufferByteLimit / sizeof(TEBSDF);
+    FALCOR_CHECK(maxElementsPerBuffer > 0, "TEBSDF is larger than the ray-marching buffer limit.");
+    const size_t splitCount64 =
+        (size_t(totalVoxelCount) + maxElementsPerBuffer - 1) / maxElementsPerBuffer;
+    FALCOR_CHECK(splitCount64 > 0 && splitCount64 <= std::numeric_limits<uint32_t>::max(),
+                 "Unsupported ray-marching buffer split count.");
+    const uint32_t splitCount = static_cast<uint32_t>(splitCount64);
+
+    std::vector<uint32_t> counts(splitCount, 0);
+    std::vector<uint32_t> splits(splitCount, 0);
+    size_t globalBase = 0;
+    for (uint32_t bufferIndex = 0; bufferIndex < splitCount; ++bufferIndex)
+    {
+        const size_t count = std::min(maxElementsPerBuffer, size_t(totalVoxelCount) - globalBase);
+        counts[bufferIndex] = static_cast<uint32_t>(count);
+        globalBase += count;
+        splits[bufferIndex] = static_cast<uint32_t>(globalBase);
+    }
+
+    std::vector<ref<Buffer>> gBuffers(splitCount);
+    std::vector<ref<Buffer>> pBuffers(splitCount);
+    for (uint32_t bufferIndex = 0; bufferIndex < splitCount; ++bufferIndex)
+    {
+        gBuffers[bufferIndex] = mpDevice->createStructuredBuffer(
+            sizeof(TEBSDF), counts[bufferIndex],
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal
+        );
+        pBuffers[bufferIndex] = mpDevice->createStructuredBuffer(
+            sizeof(Ellipsoid), counts[bufferIndex],
+            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
+            MemoryType::DeviceLocal
+        );
+    }
+
+    // Pass 2 streams each VoxelData payload in bounded chunks. A chunk never
+    // crosses a GPU split, so it can be uploaded directly at its global index.
+    for (const VoxelAsset& asset : loadedAssets)
+    {
+        std::ifstream input(asset.voxelFile, std::ios::binary);
+        if (!input.is_open())
+            return failLoad("Cannot reopen voxel asset '" + asset.assetId + "' for payload streaming.");
+
+        const uint32_t assetVoxelCount = static_cast<uint32_t>(asset.gridData.solidVoxelCount);
+        uint32_t localBase = 0;
+        while (localBase < assetVoxelCount)
+        {
+            const uint32_t globalIndex = asset.voxelDataOffset + localBase;
+            const auto splitIt = std::upper_bound(splits.begin(), splits.end(), globalIndex);
+            if (splitIt == splits.end())
+                return failLoad("Internal voxel split lookup failed for asset '" + asset.assetId + "'.");
+
+            const uint32_t bufferIndex = static_cast<uint32_t>(std::distance(splits.begin(), splitIt));
+            const uint32_t bufferBase = bufferIndex == 0 ? 0 : splits[bufferIndex - 1];
+            const uint32_t count = static_cast<uint32_t>(std::min<size_t>({
+                size_t(assetVoxelCount - localBase),
+                size_t(splits[bufferIndex] - globalIndex),
+                kVoxelConversionChunkElements
+            }));
+
+            std::vector<VoxelData> source(count);
+            const uint64_t sourceOffset64 = uint64_t(asset.voxelDataFileOffset) +
+                uint64_t(localBase) * sizeof(VoxelData);
+            if (sourceOffset64 > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()))
+                return failLoad("Voxel payload offset is too large for asset '" + asset.assetId + "'.");
+            input.seekg(static_cast<std::streamoff>(sourceOffset64), std::ios::beg);
+            input.read(
+                reinterpret_cast<char*>(source.data()),
+                static_cast<std::streamsize>(size_t(count) * sizeof(VoxelData))
+            );
+            if (!input)
+                return failLoad("Failed while streaming VoxelData for asset '" + asset.assetId + "'.");
+
+            std::vector<TEBSDF> gbChunk(count);
+            std::vector<Ellipsoid> pChunk(count);
+            std::transform(
+                std::execution::par_unseq,
+                source.begin(),
+                source.end(),
+                gbChunk.begin(),
+                [](const VoxelData& data) { return convertVoxelData(data); }
+            );
+            std::transform(
+                std::execution::par_unseq,
+                source.begin(),
+                source.end(),
+                pChunk.begin(),
+                [](const VoxelData& data) { return data.ellipsoid; }
+            );
+
+            const size_t destinationElement = size_t(globalIndex - bufferBase);
+            gBuffers[bufferIndex]->setBlob(
+                gbChunk.data(), destinationElement * sizeof(TEBSDF), size_t(count) * sizeof(TEBSDF)
+            );
+            pBuffers[bufferIndex]->setBlob(
+                pChunk.data(), destinationElement * sizeof(Ellipsoid), size_t(count) * sizeof(Ellipsoid)
+            );
+            localBase += count;
+        }
+    }
+
+    std::vector<VoxelAssetGPU> gpuAssets;
+    gpuAssets.reserve(loadedAssets.size());
+    for (const VoxelAsset& asset : loadedAssets)
+    {
+        VoxelAssetGPU gpu{};
+        gpu.gridMin = float4(asset.gridData.gridMin, 0.0f);
+        gpu.voxelSize = float4(asset.gridData.voxelSize, 0.0f);
+        gpu.voxelCountAndDepth = uint4(
+            asset.gridData.voxelCount.x,
+            asset.gridData.voxelCount.y,
+            asset.gridData.voxelCount.z,
+            asset.octreeMaxDepth
+        );
+        gpu.resourceInfo = uint4(
+            asset.octreeRoot,
+            asset.availableLODLevels,
+            asset.voxelDataOffset,
+            static_cast<uint32_t>(asset.gridData.solidVoxelCount)
+        );
+        gpuAssets.push_back(gpu);
+    }
+    ref<Buffer> assetBuffer = mpDevice->createStructuredBuffer(
+        sizeof(VoxelAssetGPU),
+        static_cast<uint32_t>(gpuAssets.size()),
+        ResourceBindFlags::ShaderResource,
+        MemoryType::DeviceLocal,
+        gpuAssets.data(),
+        false
+    );
+
+    pRenderContext->submit(true);
+
+    mVoxelAssets = std::move(loadedAssets);
+    mGBuffers = std::move(gBuffers);
+    mPBuffers = std::move(pBuffers);
+    mGBufferSplits = std::move(splits);
+    mBufferCount = splitCount;
+    mOctreeBuffer = std::move(octreeBuffer);
+    mAssetBuffer = std::move(assetBuffer);
+
+    if (!mInstances.empty())
+        mInstanceEditIndex = std::min<uint32_t>(mInstanceEditIndex, uint32_t(mInstances.size() - 1));
+    if (!mInstances.empty() && mInstances[mInstanceEditIndex].assetIndex < mVoxelAssets.size())
+        gridData = mVoxelAssets[mInstances[mInstanceEditIndex].assetIndex].gridData;
+    else
+        gridData = mVoxelAssets.front().gridData;
+
+    mSceneMetaError.clear();
+    mComplete = true;
+    std::cout << "Loaded voxel scene: assets=" << mVoxelAssets.size()
+              << ", instances=" << mInstances.size()
+              << ", nodes=" << totalNodeCount
+              << ", data=" << totalVoxelCount
+              << ", buffers=" << mBufferCount << std::endl;
     return true;
 }
 
@@ -460,282 +851,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mOptionsChanged = false;
     }
 
-    // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
-    if (!mComplete)
-    {
-        // Direct bin loading and scene-meta loading share the same binary
-        // reader. A fallback keeps the old UI state usable if a pass is
-        // restored with mComplete=false before a file has been selected.
-        if (mVoxelFilePath.empty() && selectedFile < filePaths.size())
-            mVoxelFilePath = filePaths[selectedFile];
-        if (mVoxelFilePath.empty())
-            return;
-
-        const std::filesystem::path binaryPath = mVoxelFilePath;
-        GridData& gd = VoxelizationBase::GlobalGridData;
-
-        std::ifstream f;
-        f.open(binaryPath, std::ios::binary | std::ios::ate);
-        if (!f.is_open())
-            return;
-
-        std::cout << "Reading voxel data from: " << binaryPath << std::endl;
-        size_t fileSize = std::filesystem::file_size(binaryPath);
-        size_t offset = 0;
-
-        // Read GridData header
-        tryRead(f, offset, sizeof(GridData), &gd, fileSize);
-
-        // Read octree header
-        uint32_t maxDepth = 0;
-        tryRead(f, offset, sizeof(uint32_t), &maxDepth, fileSize);
-
-        std::vector<uint32_t> nodeCounts(maxDepth + 1);
-        tryRead(f, offset, (maxDepth + 1) * sizeof(uint32_t), nodeCounts.data(), fileSize);
-
-        uint32_t totalNodes = 0;
-        for (uint32_t i = 0; i <= maxDepth; i++)
-            totalNodes += nodeCounts[i];
-
-        // The binary layout is shared with the original voxelization pass.
-        // The optional text sidecar carries the producer/version and, for
-        // CPU-generated files, how many parent LOD levels contain data.
-        VoxelizationMetadata::Metadata metadata;
-        std::error_code metadataEc;
-        const bool hasSidecar = std::filesystem::exists(
-            VoxelizationMetadata::sidecarPath(binaryPath), metadataEc);
-        if (VoxelizationMetadata::read(binaryPath, metadata) &&
-            metadata.maxDepth == maxDepth &&
-            (metadata.totalNodes == 0 || metadata.totalNodes == totalNodes))
-        {
-            mHasVoxelMetadata = true;
-            mVoxelFormatVersion = metadata.version;
-            mVoxelLodMode = metadata.lodMode;
-            mVoxelProducer = metadata.producer;
-            mAvailableLODLevels = std::min(metadata.generatedLodLevels, maxDepth);
-            std::cout << "Voxel metadata: version=" << mVoxelFormatVersion
-                      << ", producer=" << mVoxelProducer
-                      << ", lodMode=" << mVoxelLodMode
-                      << ", availableLODLevels=" << mAvailableLODLevels << std::endl;
-        }
-        else if (hasSidecar)
-        {
-            // A present but invalid sidecar is not treated as a legacy file:
-            // conservatively expose leaves only instead of stopping at a
-            // possibly unavailable parent node.
-            mHasVoxelMetadata = false;
-            mVoxelFormatVersion = 0;
-            mVoxelLodMode.clear();
-            mVoxelProducer.clear();
-            mAvailableLODLevels = 0;
-            std::cerr << "Voxel metadata is missing, invalid, or does not "
-                      << "match the binary: "
-                      << VoxelizationMetadata::sidecarPath(binaryPath)
-                      << ". Falling back to leaf-only LOD." << std::endl;
-        }
-        else
-        {
-            // Files written before sidecar support generated data for every
-            // tree level, so preserve their historical behavior.
-            mHasVoxelMetadata = false;
-            mVoxelFormatVersion = 0;
-            mVoxelLodMode = "legacy";
-            mVoxelProducer = "legacy";
-            mAvailableLODLevels = maxDepth;
-            std::cout << "No voxel metadata sidecar; treating file as legacy "
-                      << "with all LOD levels available." << std::endl;
-        }
-
-        std::cout << "Octree: maxDepth=" << maxDepth << ", totalNodes=" << totalNodes;
-
-        // Read all octree nodes
-        std::vector<OctreeNode> octreeNodes(totalNodes);
-        tryRead(f, offset, totalNodes * sizeof(OctreeNode), octreeNodes.data(), fileSize);
-
-        // Debug: verify octree dataIndex bounds
-        {
-            uint32_t badIdx = 0, maxDI = 0, minDI = 0xFFFFFFFF;
-            uint32_t leafCount = 0, internalCount = 0;
-            // Calculate per-level node offsets
-            std::vector<uint32_t> levelStart(maxDepth + 2);
-            levelStart[0] = 0;
-            for (uint32_t i = 0; i <= maxDepth; i++)
-                levelStart[i + 1] = levelStart[i] + nodeCounts[i];
-
-            for (uint32_t lvl = 0; lvl <= maxDepth; lvl++)
-            {
-                uint32_t lvlBad = 0;
-                for (uint32_t n = levelStart[lvl]; n < levelStart[lvl + 1]; n++)
-                {
-                    auto& node = octreeNodes[n];
-                    bool isLeaf = (lvl == maxDepth) || (node.childMask == 0);
-                    if (isLeaf)
-                    {
-                        leafCount++;
-                        if (node.dataIndex > maxDI) maxDI = node.dataIndex;
-                        if (node.dataIndex < minDI) minDI = node.dataIndex;
-                        if (node.dataIndex >= gd.solidVoxelCount)
-                        {
-                            lvlBad++;
-                            if (badIdx < 5)
-                                std::cout << "  OOB leaf at lvl=" << lvl << " node=" << n
-                                          << " dataIndex=" << node.dataIndex
-                                          << " (max=" << gd.solidVoxelCount - 1 << ")" << std::endl;
-                        }
-                    }
-                    else
-                    {
-                        internalCount++;
-                    }
-                }
-                badIdx += lvlBad;
-                if (lvlBad > 0)
-                    std::cout << "  Level " << lvl << ": " << lvlBad << " OOB leaves" << std::endl;
-            }
-            std::cout << "Octree: leaves=" << leafCount << " internal=" << internalCount
-                      << " dataIndex range=[" << minDI << ", " << maxDI << "]"
-                      << " validRange=[0, " << gd.solidVoxelCount - 1 << "]"
-                      << " totalOOB=" << badIdx << std::endl;
-        }
-
-        // Read VoxelData
-        std::vector<VoxelData> voxelData(gd.solidVoxelCount);
-        tryRead(f, offset, gd.solidVoxelCount * sizeof(VoxelData), voxelData.data(), fileSize);
-
-        float maxArea = 0, minArea = FLT_MAX;
-        uint zeroAreaCount = 0;
-        for (auto& vd : voxelData)
-        {
-            float a = vd.ABSDF.area;
-            maxArea = max(maxArea, a);
-            minArea = min(minArea, a);
-            if (a <= 0) zeroAreaCount++;
-        }
-        std::cout << "VoxelData area: min=" << minArea << " max=" << maxArea
-                  << " zeroCount=" << zeroAreaCount << "/" << voxelData.size() << std::endl;
-
-        f.close();
-
-        std::cout << ", solidVoxels=" << gd.solidVoxelCount << std::endl;
-        for (uint32_t i = 0; i <= maxDepth; i++)
-            std::cout << "  Level " << i << ": " << nodeCounts[i] << " nodes" << std::endl;
-
-        // Create GPU buffer for octree nodes
-        auto pOctreeBuffer = mpDevice->createStructuredBuffer(
-            sizeof(OctreeNode), totalNodes, ResourceBindFlags::ShaderResource
-        );
-        pOctreeBuffer->setBlob(octreeNodes.data(), 0, totalNodes * sizeof(OctreeNode));
-
-        // Split data across buffers to avoid D3D12 i32 offset overflow:
-        // structured buffer byte offset = elementIndex * stride.
-        // For 388-byte TEBSDF, max safe index per buffer = (2^31-1)/388 ≈ 5,534,751.
-        const uint32_t totalVoxels = gd.solidVoxelCount;
-        const size_t maxElemsPerBuffer = kRayMarchingBufferByteLimit / sizeof(TEBSDF);
-        FALCOR_CHECK(maxElemsPerBuffer > 0, "TEBSDF is larger than the ray-marching buffer limit.");
-
-        const size_t splitCount64 = totalVoxels == 0
-            ? 1
-            : (size_t(totalVoxels) + maxElemsPerBuffer - 1) / maxElemsPerBuffer;
-        FALCOR_CHECK(splitCount64 <= std::numeric_limits<uint32_t>::max(), "Too many ray-marching buffer splits.");
-        const uint32_t splitCount = static_cast<uint32_t>(splitCount64);
-
-        std::vector<uint32_t> counts(splitCount, 0);
-        std::vector<uint32_t> bases(splitCount, 0);
-        std::vector<uint32_t> splits(splitCount, 0);
-        size_t globalBase = 0;
-        for (uint32_t b = 0; b < splitCount; ++b)
-        {
-            bases[b] = static_cast<uint32_t>(globalBase);
-            const size_t count = std::min(maxElemsPerBuffer, size_t(totalVoxels) - globalBase);
-            counts[b] = static_cast<uint32_t>(count);
-            globalBase += count;
-            splits[b] = static_cast<uint32_t>(globalBase);
-        }
-
-        // Debug: print struct sizes
-        std::cout << "sizeof(VoxelData)=" << sizeof(VoxelData)
-                  << " sizeof(TEBSDF)=" << sizeof(TEBSDF)
-                  << " sizeof(Ellipsoid)=" << sizeof(Ellipsoid) << std::endl;
-        std::cout << "RayMarching buffers=" << splitCount
-                  << ", maxElementsPerBuffer=" << maxElemsPerBuffer
-                  << ", maxGBufferBytes=" << kRayMarchingBufferByteLimit << std::endl;
-        for (uint32_t b = 0; b < splitCount; ++b)
-        {
-            std::cout << "count[" << b << "]=" << counts[b]
-                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0))
-                      << " MB gBuffer)" << std::endl;
-        }
-
-        // Convert VoxelData -> TEBSDF on the CPU and upload only the final
-        // gBuffer (TEBSDF) + pBuffer (Ellipsoid), split into chunks to avoid
-        // the D3D12 2^31-1 byte-offset limit. The raw VoxelData is never staged
-        // on the GPU, keeping VRAM at gBuffer + pBuffer only.
-        std::vector<ref<Buffer>> gBuffers(splitCount);
-        std::vector<ref<Buffer>> pBuffers(splitCount);
-
-        for (uint32_t b = 0; b < splitCount; ++b)
-        {
-            if (counts[b] == 0)
-                continue;
-
-            std::vector<TEBSDF> gbChunk(counts[b]);
-            std::vector<Ellipsoid> pChunk(counts[b]);
-
-            // Conversion is pure/read-only with respect to voxelData, so let
-            // the standard parallel algorithm use the CPU worker threads.
-            // GPU resource creation and setBlob() stay on this render thread.
-            const auto sourceBegin = voxelData.begin() + bases[b];
-            const auto sourceEnd = sourceBegin + counts[b];
-            std::transform(
-                std::execution::par_unseq,
-                sourceBegin,
-                sourceEnd,
-                gbChunk.begin(),
-                [](const VoxelData& data) { return convertVoxelData(data); }
-            );
-            std::transform(
-                std::execution::par_unseq,
-                sourceBegin,
-                sourceEnd,
-                pChunk.begin(),
-                [](const VoxelData& data) { return data.ellipsoid; }
-            );
-
-            gBuffers[b] = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), counts[b],
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            pBuffers[b] = mpDevice->createStructuredBuffer(
-                sizeof(Ellipsoid), counts[b],
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "gBuffer[" << b << "]: " << (gBuffers[b] ? "OK" : "NULL!")
-                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB)"
-                      << std::endl;
-            std::cout << "pBuffer[" << b << "]: " << (pBuffers[b] ? "OK" : "NULL!")
-                      << " (" << (size_t(counts[b]) * sizeof(Ellipsoid) / (1024.0 * 1024.0)) << " MB)"
-                      << std::endl;
-            if (gBuffers[b])
-                gBuffers[b]->setBlob(gbChunk.data(), 0, size_t(counts[b]) * sizeof(TEBSDF));
-            if (pBuffers[b])
-                pBuffers[b]->setBlob(pChunk.data(), 0, size_t(counts[b]) * sizeof(Ellipsoid));
-        }
-
-        // Flush the uploads before Step 2 reads the buffers.
-        pRenderContext->submit(true);
-
-        mGBuffers = std::move(gBuffers);
-        mPBuffers = std::move(pBuffers);
-        mGBufferSplits = std::move(splits);
-        mBufferCount = splitCount;
-        mOctreeBuffer = pOctreeBuffer;
-        mOctreeMaxDepth = maxDepth;
-        mOctreeNodeCounts = std::move(nodeCounts);
-
-        mComplete = true;
-    }
+    // Load and concatenate every scene-meta asset before tracing.
+    if (!mComplete && !loadVoxelResources(pRenderContext))
+        return;
+    if (mVoxelAssets.empty() || !mAssetBuffer || !mOctreeBuffer || mGBuffers.empty())
+        return;
 
     // ---- Step 2: Ray marching ----
     FALCOR_PROFILE(pRenderContext, "RayMarching");
@@ -751,6 +871,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         updateScreenSpaceLOD(viewProjNoJitter, mInstances[i], i == mInstanceEditIndex);
     }
     mScreenLOD = mInstances[mInstanceEditIndex].screenLOD;
+    if (mInstances[mInstanceEditIndex].assetIndex < mVoxelAssets.size())
+        gridData = mVoxelAssets[mInstances[mInstanceEditIndex].assetIndex].gridData;
     updateInstanceBuffer();
     if (!mSelectedVoxel)
     {
@@ -816,29 +938,16 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             var["pBuffer"][i] = mPBuffers[i];
         }
         var["octreeBuffer"] = mOctreeBuffer;
+        var["voxelAssets"] = mAssetBuffer;
         var["instances"] = mInstanceBuffer;
         var["selectedVoxel"] = mSelectedVoxel;
-
-        auto cb_GridData = var["GridData"];
-        cb_GridData["gridMin"] = gridData.gridMin;
-        cb_GridData["voxelSize"] = gridData.voxelSize;
-        cb_GridData["voxelCount"] = gridData.voxelCount;
-        cb_GridData["octreeMaxDepth"] = mOctreeMaxDepth;
 
         auto cb = var["CB"];
         cb["pixelCount"] = mOutputResolution;
         cb["invVP"] = math::inverse(viewProjNoJitter);
-        const VoxelInstance& debugInstance = mInstances[mInstanceEditIndex];
         cb["instanceCount"] = static_cast<uint32_t>(mInstances.size());
-        // These fields remain as a compatibility/fallback context for local
-        // helper paths. Scene tracing uses the per-instance structured buffer.
-        cb["instanceTransform"] = debugInstance.localToWorld;
-        cb["inverseInstanceTransform"] = debugInstance.worldToLocal;
-        cb["normalTransform"] = debugInstance.normalTransform;
-        cb["instanceScale"] = debugInstance.scale;
-        // The shader traces in local cell units. The bias is asset-local and
-        // therefore scales with the instance together with the voxel grid.
-        cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
+        cb["assetCount"] = static_cast<uint32_t>(mVoxelAssets.size());
+        cb["shadowBiasWorld"] = mShadowBias100 / 100;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
         cb["minPdf"] = mMinPdf100 / 100;
@@ -849,8 +958,6 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
-        cb["screenLOD"] = mScreenLOD;
-        cb["availableLODLevels"] = mAvailableLODLevels;
         for (size_t i = 0; i < mGBufferSplits.size(); ++i)
             cb["gbSplits"][i] = mGBufferSplits[i];
         cb["coverageBlend"] = mCoverageBlend;
@@ -967,16 +1074,24 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             {
                 const size_t fileSize = std::filesystem::file_size(binaryPath);
                 size_t offset = 0;
-                tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
+                GridData selectedGrid{};
+                if (!tryRead(f, offset, sizeof(GridData), &selectedGrid, fileSize))
+                    return;
                 f.close();
 
                 mVoxelFilePath = binaryPath;
                 mSceneMetaPath.clear();
-                mSceneMetaAssetId.clear();
                 mSceneMetaError.clear();
                 mSceneMetaLoaded = false;
                 resetInstancesToIdentity();
                 resetVoxelResources();
+
+                VoxelAsset asset;
+                asset.assetId = binaryPath.stem().string();
+                asset.voxelFile = binaryPath;
+                asset.gridData = selectedGrid;
+                mVoxelAssets.push_back(std::move(asset));
+                gridData = selectedGrid;
 
                 requestRecompile();
                 mComplete = false;
@@ -1012,23 +1127,16 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     if (mSceneMetaLoaded)
     {
         widget.text("Scene Meta: " + mSceneMetaPath.filename().string());
-        widget.text("Scene Asset: " + mSceneMetaAssetId);
-        widget.text("Scene Voxel Bin: " + mVoxelFilePath.filename().string());
+        widget.text("Scene Assets: " + std::to_string(mVoxelAssets.size()));
     }
     if (!mSceneMetaError.empty())
-        widget.text("Scene Meta Error: " + mSceneMetaError);
+        widget.text("Voxel Scene Error: " + mSceneMetaError);
 
-    widget.text("Voxel Size: " + ToString(gridData.voxelSize));
-    widget.text("Voxel Count: " + ToString((int3)gridData.voxelCount));
-    widget.text("Grid Min: " + ToString(gridData.gridMin));
-    widget.text("Solid Voxel Count: " + std::to_string(gridData.solidVoxelCount));
-    widget.text("Solid Rate: " + std::to_string(gridData.solidVoxelCount / (float)gridData.totalVoxelCount()));
-    widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
-    widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
-    widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
     if (mInstances.empty())
         mInstances.emplace_back();
-    widget.text("Instances: " + std::to_string(mInstances.size()) + " (shared single bin)");
+    widget.text("Assets: " + std::to_string(mVoxelAssets.size()));
+    widget.text("Instances: " + std::to_string(mInstances.size()));
+    widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
     if (widget.button("Add Instance") && mInstances.size() < 256)
     {
         VoxelInstance instance;
@@ -1042,6 +1150,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             ++nextInstanceId;
         }
         instance.instanceId = nextInstanceId;
+        if (mInstanceEditIndex < mInstances.size())
+            instance.assetIndex = mInstances[mInstanceEditIndex].assetIndex;
         mInstances.push_back(instance);
         mInstanceEditIndex = static_cast<uint32_t>(mInstances.size() - 1);
         mOptionsChanged = true;
@@ -1072,16 +1182,53 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     }
 
     VoxelInstance& instance = mInstances[mInstanceEditIndex];
+    if (!mVoxelAssets.empty())
+    {
+        instance.assetIndex = std::min<uint32_t>(
+            instance.assetIndex,
+            static_cast<uint32_t>(mVoxelAssets.size() - 1)
+        );
+        Gui::DropdownList assetList;
+        for (uint32_t assetIndex = 0; assetIndex < mVoxelAssets.size(); ++assetIndex)
+        {
+            const VoxelAsset& asset = mVoxelAssets[assetIndex];
+            assetList.push_back({
+                assetIndex,
+                asset.assetId + " (" + asset.voxelFile.filename().string() + ")"
+            });
+        }
+        uint32_t editedAssetIndex = instance.assetIndex;
+        if (widget.dropdown("Instance Asset", assetList, editedAssetIndex))
+        {
+            instance.assetIndex = editedAssetIndex;
+            mOptionsChanged = true;
+        }
+    }
+
+    const VoxelAsset* editedAsset = instance.assetIndex < mVoxelAssets.size()
+        ? &mVoxelAssets[instance.assetIndex]
+        : nullptr;
+    const GridData& displayGrid = editedAsset ? editedAsset->gridData : gridData;
+    gridData = displayGrid;
+    widget.text("Voxel Size: " + ToString(displayGrid.voxelSize));
+    widget.text("Voxel Count: " + ToString((int3)displayGrid.voxelCount));
+    widget.text("Grid Min: " + ToString(displayGrid.gridMin));
+    widget.text("Solid Voxel Count: " + std::to_string(displayGrid.solidVoxelCount));
+    const size_t totalGridVoxels = size_t(displayGrid.voxelCount.x) *
+        size_t(displayGrid.voxelCount.y) * size_t(displayGrid.voxelCount.z);
+    const float solidRate = totalGridVoxels > 0
+        ? displayGrid.solidVoxelCount / float(totalGridVoxels)
+        : 0.0f;
+    widget.text("Solid Rate: " + std::to_string(solidRate));
+    widget.text("Max Polygon Count: " + std::to_string(displayGrid.maxPolygonCount));
+    widget.text("Total Polygon Count: " + std::to_string(displayGrid.totalPolygonCount));
     if (widget.checkbox("Instance Enabled", instance.enabled))
         mOptionsChanged = true;
-    if (widget.var("Instance Translation", instance.translation, -1000.0f, 1000.0f, 0.01f))
-        mOptionsChanged = true;
-    if (widget.var("Instance Rotation XYZ (deg)", instance.rotationDegrees, -360.0f, 360.0f, 0.5f))
-        mOptionsChanged = true;
-    if (widget.var("Instance Scale XYZ", instance.scale, 0.01f, 100.0f, 0.01f))
+    if (widget.matrix("Instance Transform (row-major)", instance.assetToWorld, -1000000.0f, 1000000.0f))
         mOptionsChanged = true;
     widget.text("Editing Instance ID: " + std::to_string(instance.instanceId));
-    widget.text("Instance Rotation/Scale Pivot: Grid Center");
+    if (editedAsset)
+        widget.text("Editing Asset: " + editedAsset->assetId);
     if (mGridProjectionValid)
     {
         widget.text("Grid Projection (px): " + std::to_string(mGridProjectedWidthPixels) + " x " +
@@ -1096,18 +1243,20 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         widget.text("Grid Projection: invalid/near-plane, using leaf LOD");
     }
 
-    if (mOctreeMaxDepth > 0)
+    if (editedAsset && editedAsset->octreeMaxDepth > 0)
     {
-        widget.text("Octree Max Depth: " + std::to_string(mOctreeMaxDepth));
-        widget.text("Available LOD Levels: " + std::to_string(mAvailableLODLevels));
-        if (mHasVoxelMetadata)
+        widget.text("Octree Root Offset: " + std::to_string(editedAsset->octreeRoot));
+        widget.text("Voxel Data Offset: " + std::to_string(editedAsset->voxelDataOffset));
+        widget.text("Octree Max Depth: " + std::to_string(editedAsset->octreeMaxDepth));
+        widget.text("Available LOD Levels: " + std::to_string(editedAsset->availableLODLevels));
+        if (editedAsset->hasVoxelMetadata)
         {
-            widget.text("Voxel Format Version: " + std::to_string(mVoxelFormatVersion));
-            widget.text("Voxel Producer: " + mVoxelProducer);
-            widget.text("LOD Build Mode: " + mVoxelLodMode);
+            widget.text("Voxel Format Version: " + std::to_string(editedAsset->voxelFormatVersion));
+            widget.text("Voxel Producer: " + editedAsset->voxelProducer);
+            widget.text("LOD Build Mode: " + editedAsset->voxelLodMode);
         }
         uint32_t totalNodes = 0;
-        for (auto c : mOctreeNodeCounts)
+        for (auto c : editedAsset->octreeNodeCounts)
             totalNodes += c;
         widget.text("Octree Total Nodes: " + std::to_string(totalNodes));
     }
@@ -1117,7 +1266,9 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (mDebug)
     {
-        int maxLOD = (int)std::min(mOctreeMaxDepth, mAvailableLODLevels);
+        int maxLOD = editedAsset
+            ? int(std::min(editedAsset->octreeMaxDepth, editedAsset->availableLODLevels))
+            : 0;
         mForcedLOD = std::min(mForcedLOD, maxLOD);
         mMaxLODLevel = std::min(mMaxLODLevel, maxLOD);
         if (widget.slider("Forced LOD", mForcedLOD, -1, maxLOD))
@@ -1146,7 +1297,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         if (widget.slider("Coverage Blend", mCoverageBlend, 0.0f, 1.0f))
             mOptionsChanged = true;
     }
-    if (widget.slider("Shadow Bias(x100)", mShadowBias100, 0.0f, 0.2f))
+    if (widget.slider("Shadow Bias World(x100)", mShadowBias100, 0.0f, 0.2f))
         mOptionsChanged = true;
     if (widget.slider("Min Pdf(x100)", mMinPdf100, 0.0f, 0.2f))
         mOptionsChanged = true;
@@ -1203,7 +1354,6 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mUseEmissiveLight = false;
     mVoxelFilePath.clear();
     mSceneMetaPath.clear();
-    mSceneMetaAssetId.clear();
     mSceneMetaError.clear();
     mSceneMetaLoaded = false;
     resetInstancesToIdentity();
@@ -1223,12 +1373,16 @@ bool RayMarchingPass::onMouseEvent(const MouseEvent& mouseEvent)
 
 bool RayMarchingPass::tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize)
 {
-    if (offset + bytes > fileSize)
+    if (bytes > fileSize || offset > fileSize - bytes ||
+        offset > size_t(std::numeric_limits<std::streamoff>::max()) ||
+        bytes > size_t(std::numeric_limits<std::streamsize>::max()))
         return false;
     if (dst)
     {
-        f.seekg(offset, std::ios::beg);
-        f.read(reinterpret_cast<char*>(dst), bytes);
+        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        f.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(bytes));
+        if (!f)
+            return false;
     }
     offset += bytes;
     return true;

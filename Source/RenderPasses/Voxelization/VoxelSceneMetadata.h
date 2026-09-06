@@ -1,35 +1,43 @@
 #pragma once
 
-// Scene composition metadata for the single-bin voxel ray marcher.
+// Scene composition metadata for the multi-bin voxel ray marcher.
 //
 // This file deliberately does not replace VoxelizationMetadata.h. The latter
 // describes the contents of one voxel binary and its LOD sidecar, while this
 // file describes how that binary is placed in a scene.
 //
-// Version 1 scene files have the following shape:
+// Version 2 scene files have the following shape. Instance transforms are
+// complete asset-local-to-world affine matrices serialized in row-major order:
 // {
 //   "format": "FalcorVoxelScene",
-//   "version": 1,
-//   "assets": [{ "id": "model", "voxelFile": "model.bin" }],
+//   "version": 2,
+//   "assets": [
+//     { "id": "modelA", "voxelFile": "modelA.bin" },
+//     { "id": "modelB", "voxelFile": "modelB.bin" }
+//   ],
 //   "instances": [{
 //     "id": 0,
-//     "asset": "model",
-//     "translation": [0, 0, 0],
-//     "rotationXYZDegrees": [0, 0, 0],
-//     "scale": [1, 1, 1],
-//     "pivot": "gridCenter",
+//     "asset": "modelA",
+//     "transform": [
+//       1, 0, 0, 0,
+//       0, 1, 0, 0,
+//       0, 0, 1, 0,
+//       0, 0, 0, 1
+//     ],
 //     "enabled": true
 //   }]
 // }
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <exception>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <unordered_set>
@@ -40,21 +48,42 @@ namespace VoxelSceneMetadata
 {
 
 inline constexpr const char* kFormat = "FalcorVoxelScene";
-inline constexpr uint32_t kCurrentVersion = 1;
+inline constexpr uint32_t kCurrentVersion = 2;
+inline constexpr uint32_t kMaxAssets = 256;
 inline constexpr uint32_t kMaxInstances = 256;
+
+using Transform16 = std::array<float, 16>;
+
+// Transform16 is row-major in the JSON file and matches Falcor's host-side
+// float4x4 storage. Matrix multiplication still uses the existing
+// column-vector convention: world = transform * float4(local, 1).
+inline constexpr Transform16 kIdentityTransform = {
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 1.0f,
+};
+
+struct Asset
+{
+    std::string assetId;
+    std::filesystem::path voxelFile;
+};
 
 struct Instance
 {
     uint32_t instanceId = 0;
+    uint32_t assetIndex = 0;
     bool enabled = true;
-    std::array<float, 3> translation = {0.0f, 0.0f, 0.0f};
-    std::array<float, 3> rotationDegrees = {0.0f, 0.0f, 0.0f};
-    std::array<float, 3> scale = {1.0f, 1.0f, 1.0f};
+    Transform16 transform = kIdentityTransform;
 };
 
 struct Scene
 {
     std::filesystem::path sourcePath;
+    std::vector<Asset> assets;
+    // Compatibility aliases for callers written against the original
+    // single-asset parser. They always identify assets[0].
     std::string assetId;
     std::filesystem::path voxelFile;
     std::vector<Instance> instances;
@@ -102,20 +131,19 @@ inline bool readUint32(
     return true;
 }
 
-inline bool readFloat3(
+inline bool readFloat16(
     const nlohmann::json& value,
     const std::string& fieldName,
-    std::array<float, 3>& output,
+    Transform16& output,
     std::string& error
 )
 {
-    if (!value.is_array() || value.size() != 3)
+    if (!value.is_array() || value.size() != 16)
     {
-        return fail(error, "Scene meta field '" + fieldName + "' must be an array of three numbers.");
+        return fail(error, "Scene meta field '" + fieldName + "' must be an array of 16 numbers.");
     }
 
-    float components[3] = {};
-    for (size_t i = 0; i < 3; ++i)
+    for (size_t i = 0; i < 16; ++i)
     {
         if (!value[i].is_number())
         {
@@ -137,10 +165,50 @@ inline bool readFloat3(
         {
             return fail(error, "Scene meta field '" + fieldName + "' contains a non-finite or out-of-range component.");
         }
-        components[i] = static_cast<float>(component);
+        output[i] = static_cast<float>(component);
     }
 
-    output = {components[0], components[1], components[2]};
+    return true;
+}
+
+inline bool validateAffineTransform(
+    const Transform16& transform,
+    const std::string& fieldName,
+    std::string& error
+)
+{
+    constexpr double kAffineEpsilon = 1e-5;
+
+    // An instance transform is affine. The final row must therefore be
+    // [0, 0, 0, 1] in the row-major representation.
+    if (std::abs(double(transform[12])) > kAffineEpsilon ||
+        std::abs(double(transform[13])) > kAffineEpsilon ||
+        std::abs(double(transform[14])) > kAffineEpsilon ||
+        std::abs(double(transform[15]) - 1.0) > kAffineEpsilon)
+    {
+        return fail(error, "Scene meta field '" + fieldName + "' must be an affine matrix.");
+    }
+
+    // Reject singular transforms before RayMarchingPass computes the inverse.
+    const double m00 = transform[0];
+    const double m01 = transform[1];
+    const double m02 = transform[2];
+    const double m10 = transform[4];
+    const double m11 = transform[5];
+    const double m12 = transform[6];
+    const double m20 = transform[8];
+    const double m21 = transform[9];
+    const double m22 = transform[10];
+    const double determinant =
+        m00 * (m11 * m22 - m12 * m21) -
+        m01 * (m10 * m22 - m12 * m20) +
+        m02 * (m10 * m21 - m11 * m20);
+
+    if (!std::isfinite(determinant) || std::abs(determinant) <= 1e-12)
+    {
+        return fail(error, "Scene meta field '" + fieldName + "' must be invertible.");
+    }
+
     return true;
 }
 
@@ -196,9 +264,12 @@ inline bool read(const std::filesystem::path& scenePath, Scene& scene, std::stri
     {
         return false;
     }
-    if (version == 0 || version > kCurrentVersion)
+    if (version != kCurrentVersion)
     {
-        return fail(error, "Unsupported scene meta version " + std::to_string(version) + ".");
+        return fail(
+            error,
+            "Only scene meta version " + std::to_string(kCurrentVersion) + " is supported."
+        );
     }
 
     if (!document.contains("assets") || !document["assets"].is_array() ||
@@ -206,33 +277,44 @@ inline bool read(const std::filesystem::path& scenePath, Scene& scene, std::stri
     {
         return fail(error, "Scene meta must contain a non-empty 'assets' array.");
     }
-    if (document["assets"].size() != 1)
+    if (document["assets"].size() > kMaxAssets)
     {
-        return fail(error, "This RayMarchingPass version supports exactly one shared asset per scene meta file.");
-    }
-
-    const nlohmann::json& asset = document["assets"][0];
-    if (!asset.is_object())
-        return fail(error, "Each scene meta asset must be a JSON object.");
-    if (!asset.contains("id") || !asset["id"].is_string() || asset["id"].get<std::string>().empty())
-        return fail(error, "The scene meta asset must contain a non-empty string 'id'.");
-    if (!asset.contains("voxelFile") || !asset["voxelFile"].is_string() ||
-        asset["voxelFile"].get<std::string>().empty())
-    {
-        return fail(error, "The scene meta asset must contain a non-empty string 'voxelFile'.");
+        return fail(error, "Scene meta contains more than " + std::to_string(kMaxAssets) + " assets.");
     }
 
     Scene parsed;
     parsed.sourcePath = scenePath;
-    parsed.assetId = asset["id"].get<std::string>();
-    parsed.voxelFile = resolveRelativePath(scenePath, asset["voxelFile"].get<std::string>());
-
-    std::error_code fileEc;
-    if (!std::filesystem::is_regular_file(parsed.voxelFile, fileEc))
+    std::unordered_set<std::string> assetIds;
+    for (size_t i = 0; i < document["assets"].size(); ++i)
     {
-        return fail(error, "Scene meta voxel file does not exist or is not a regular file: " +
-                            parsed.voxelFile.string());
+        const nlohmann::json& value = document["assets"][i];
+        const std::string prefix = "assets[" + std::to_string(i) + "]";
+        if (!value.is_object())
+            return fail(error, prefix + " must be a JSON object.");
+        if (!value.contains("id") || !value["id"].is_string() || value["id"].get<std::string>().empty())
+            return fail(error, prefix + " must contain a non-empty string 'id'.");
+        if (!value.contains("voxelFile") || !value["voxelFile"].is_string() ||
+            value["voxelFile"].get<std::string>().empty())
+        {
+            return fail(error, prefix + " must contain a non-empty string 'voxelFile'.");
+        }
+
+        Asset asset;
+        asset.assetId = value["id"].get<std::string>();
+        if (!assetIds.insert(asset.assetId).second)
+            return fail(error, prefix + ".id duplicates an earlier asset id.");
+
+        asset.voxelFile = resolveRelativePath(scenePath, value["voxelFile"].get<std::string>());
+        std::error_code fileEc;
+        if (!std::filesystem::is_regular_file(asset.voxelFile, fileEc))
+        {
+            return fail(error, prefix + ".voxelFile does not exist or is not a regular file: " +
+                                asset.voxelFile.string());
+        }
+        parsed.assets.push_back(std::move(asset));
     }
+    parsed.assetId = parsed.assets.front().assetId;
+    parsed.voxelFile = parsed.assets.front().voxelFile;
 
     if (!document.contains("instances") || !document["instances"].is_array() ||
         document["instances"].empty())
@@ -266,12 +348,28 @@ inline bool read(const std::filesystem::path& scenePath, Scene& scene, std::stri
         if (!instanceIds.insert(instance.instanceId).second)
             return fail(error, prefix + " duplicates an earlier instance id.");
 
-        if (value.contains("asset"))
+        if (!value.contains("asset"))
         {
-            if (!value["asset"].is_string() || value["asset"].get<std::string>() != parsed.assetId)
+            if (parsed.assets.size() != 1)
             {
-                return fail(error, prefix + ".asset must reference the only asset '" + parsed.assetId + "'.");
+                return fail(error, prefix + ".asset is required when the scene contains multiple assets.");
             }
+            instance.assetIndex = 0;
+        }
+        else
+        {
+            if (!value["asset"].is_string())
+                return fail(error, prefix + ".asset must be a string asset id.");
+
+            const std::string assetId = value["asset"].get<std::string>();
+            auto assetIt = std::find_if(
+                parsed.assets.begin(),
+                parsed.assets.end(),
+                [&assetId](const Asset& asset) { return asset.assetId == assetId; }
+            );
+            if (assetIt == parsed.assets.end())
+                return fail(error, prefix + ".asset references unknown asset '" + assetId + "'.");
+            instance.assetIndex = static_cast<uint32_t>(std::distance(parsed.assets.begin(), assetIt));
         }
 
         if (value.contains("enabled"))
@@ -281,43 +379,127 @@ inline bool read(const std::filesystem::path& scenePath, Scene& scene, std::stri
             instance.enabled = value["enabled"].get<bool>();
         }
 
-        if (value.contains("translation") &&
-            !readFloat3(value["translation"], prefix + ".translation", instance.translation, error))
+        if (!value.contains("transform") ||
+            !readFloat16(value["transform"], prefix + ".transform", instance.transform, error))
         {
             return false;
         }
-
-        const char* rotationField = value.contains("rotationXYZDegrees")
-            ? "rotationXYZDegrees"
-            : (value.contains("rotationDegrees") ? "rotationDegrees" : nullptr);
-        if (rotationField &&
-            !readFloat3(value[rotationField], prefix + "." + rotationField, instance.rotationDegrees, error))
+        if (!validateAffineTransform(instance.transform, prefix + ".transform", error))
         {
             return false;
-        }
-
-        if (value.contains("scale") &&
-            !readFloat3(value["scale"], prefix + ".scale", instance.scale, error))
-        {
-            return false;
-        }
-        if (instance.scale[0] <= 0.0f || instance.scale[1] <= 0.0f || instance.scale[2] <= 0.0f)
-        {
-            return fail(error, prefix + ".scale must contain only positive values.");
-        }
-
-        if (value.contains("pivot"))
-        {
-            if (!value["pivot"].is_string() || value["pivot"].get<std::string>() != "gridCenter")
-            {
-                return fail(error, prefix + ".pivot must be 'gridCenter' in this version.");
-            }
         }
 
         parsed.instances.push_back(instance);
     }
 
     scene = std::move(parsed);
+    return true;
+}
+
+inline bool write(
+    const std::filesystem::path& scenePath,
+    const Scene& scene,
+    std::string& error
+)
+{
+    error.clear();
+
+    if (scene.assets.empty())
+        return fail(error, "Scene meta must contain at least one asset.");
+    if (scene.assets.size() > kMaxAssets)
+        return fail(error, "Scene meta contains more than " + std::to_string(kMaxAssets) + " assets.");
+    if (scene.instances.empty())
+        return fail(error, "Scene meta must contain at least one instance.");
+    if (scene.instances.size() > kMaxInstances)
+        return fail(error, "Scene meta contains more than " + std::to_string(kMaxInstances) + " instances.");
+
+    nlohmann::json document = nlohmann::json::object();
+    document["format"] = kFormat;
+    document["version"] = kCurrentVersion;
+    document["assets"] = nlohmann::json::array();
+    document["instances"] = nlohmann::json::array();
+
+    const std::filesystem::path sceneDirectory = scenePath.parent_path();
+    for (size_t i = 0; i < scene.assets.size(); ++i)
+    {
+        const Asset& asset = scene.assets[i];
+        if (asset.assetId.empty())
+            return fail(error, "assets[" + std::to_string(i) + "] has an empty id.");
+        if (asset.voxelFile.empty())
+        {
+            return fail(
+                error,
+                "assets[" + std::to_string(i) + "] has an empty voxelFile."
+            );
+        }
+
+        std::filesystem::path voxelFile = asset.voxelFile;
+        if (voxelFile.is_absolute())
+        {
+            std::error_code relativeEc;
+            const std::filesystem::path relative =
+                std::filesystem::relative(voxelFile, sceneDirectory, relativeEc);
+            if (!relativeEc && !relative.empty())
+                voxelFile = relative;
+        }
+
+        nlohmann::json assetValue = nlohmann::json::object();
+        assetValue["id"] = asset.assetId;
+        assetValue["voxelFile"] = voxelFile.generic_string();
+        document["assets"].push_back(std::move(assetValue));
+    }
+
+    for (size_t i = 0; i < scene.instances.size(); ++i)
+    {
+        const Instance& instance = scene.instances[i];
+        if (instance.assetIndex >= scene.assets.size())
+        {
+            return fail(
+                error,
+                "instances[" + std::to_string(i) + "].assetIndex is out of range."
+            );
+        }
+        if (!validateAffineTransform(
+                instance.transform,
+                "instances[" + std::to_string(i) + "].transform",
+                error))
+        {
+            return false;
+        }
+
+        nlohmann::json transform = nlohmann::json::array();
+        for (float component : instance.transform)
+            transform.push_back(component);
+
+        nlohmann::json instanceValue = nlohmann::json::object();
+        instanceValue["id"] = instance.instanceId;
+        instanceValue["asset"] = scene.assets[instance.assetIndex].assetId;
+        instanceValue["transform"] = std::move(transform);
+        instanceValue["enabled"] = instance.enabled;
+        document["instances"].push_back(std::move(instanceValue));
+    }
+
+    if (!sceneDirectory.empty())
+    {
+        std::error_code directoryEc;
+        std::filesystem::create_directories(sceneDirectory, directoryEc);
+        if (directoryEc)
+        {
+            return fail(
+                error,
+                "Cannot create scene meta directory '" + sceneDirectory.string() + "'."
+            );
+        }
+    }
+
+    std::ofstream output(scenePath, std::ios::trunc);
+    if (!output)
+        return fail(error, "Cannot create scene meta file: " + scenePath.string());
+
+    output << document.dump(4) << '\n';
+    if (!output)
+        return fail(error, "Failed to write scene meta file: " + scenePath.string());
+
     return true;
 }
 

@@ -4,9 +4,16 @@
 #include <chrono>
 #include <thread>
 
+enum class VoxelizationOutputMode
+{
+    Global,
+    Instanced,
+};
+
 int main(int argc, char* argv[]) {
     std::string inputPath;
     std::string outputPath;
+    std::string outputDir;
     uint32_t resolution = 512;
     uint32_t sampleFrequency = 1024;
     uint32_t lodLevels = 0;
@@ -17,11 +24,27 @@ int main(int argc, char* argv[]) {
     bool keepTemp = true;              // default: preserve temp files
     bool useInMemory = false;
     bool useSpecGlossMaterials = false; // default matches Falcor FBX import
+    VoxelizationOutputMode outputMode = VoxelizationOutputMode::Global;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) {
             outputPath = argv[++i];
+        } else if (arg == "--output-dir" && i + 1 < argc) {
+            outputDir = argv[++i];
+        } else if (arg == "--instanced") {
+            outputMode = VoxelizationOutputMode::Instanced;
+        } else if ((arg == "--mode" || arg == "--voxelization-mode") && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "global") {
+                outputMode = VoxelizationOutputMode::Global;
+            } else if (mode == "instanced") {
+                outputMode = VoxelizationOutputMode::Instanced;
+            } else {
+                std::cerr << "Unknown voxelization mode: " << mode
+                          << " (expected global or instanced)\n";
+                return 1;
+            }
         } else if (arg == "-r" && i + 1 < argc) {
             resolution = (uint32_t)std::stoul(argv[++i]);
         } else if (arg == "-s" && i + 1 < argc) {
@@ -59,9 +82,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (inputPath.empty()) {
-        std::cout << "Usage: LargeSceneVoxelization <input.fbx> [options]\n\n"
+        std::cout << "Usage: LargeSceneVoxelization <input.gltf|input.glb|input.fbx> [options]\n\n"
                   << "Options:\n"
                   << "  -o <path>         Output file (default: <input>_voxelized.bin)\n"
+                  << "  --mode <mode>     global or instanced (default: global)\n"
+                  << "  --instanced       One voxel bin per unique mesh plus a v2 scene manifest\n"
+                  << "  --output-dir <path>  Output directory for --instanced\n"
                   << "  -r <N>            Grid resolution (default: 512)\n"
                   << "  -s <N>            Sample frequency per Lebedev direction (default: 1024)\n"
                   << "  -l, --lod-levels <N>  Additional coarse LOD levels (0 = leaves only)\n"
@@ -76,9 +102,22 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (outputPath.empty()) {
+    if (outputMode == VoxelizationOutputMode::Instanced) {
+        if (outputDir.empty())
+            outputDir = outputPath;
+        if (outputDir.empty()) {
+            auto dot = inputPath.find_last_of('.');
+            outputDir = (dot != std::string::npos ? inputPath.substr(0, dot) : inputPath) + "_instanced";
+        }
+    } else if (outputPath.empty()) {
         auto dot = inputPath.find_last_of('.');
         outputPath = (dot != std::string::npos ? inputPath.substr(0, dot) : inputPath) + "_voxelized.bin";
+    }
+
+    if (outputMode == VoxelizationOutputMode::Instanced && useInMemory) {
+        std::cerr << "--in-memory is not currently supported with --instanced; "
+                     "remove --in-memory to use the disk-backed per-asset pipeline.\n";
+        return 1;
     }
 
     if (numThreads == 0)
@@ -94,7 +133,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "=== LargeSceneVoxelization ===" << std::endl;
     std::cout << "  Input:       " << inputPath << std::endl;
-    std::cout << "  Output:      " << outputPath << std::endl;
+    if (outputMode == VoxelizationOutputMode::Instanced)
+        std::cout << "  Output dir:  " << outputDir << std::endl;
+    else
+        std::cout << "  Output:      " << outputPath << std::endl;
     std::cout << "  Resolution:  " << resolution << std::endl;
     std::cout << "  Samples:     " << sampleFrequency << std::endl;
     std::cout << "  LOD levels:  " << lodLevels << std::endl;
@@ -104,7 +146,11 @@ int main(int argc, char* argv[]) {
     std::cout << "  Poly cap:    " << maxPolygonsPerNode
               << (maxPolygonsPerNode == 0 ? " (unlimited)" : "") << std::endl;
     std::cout << "  Threads:     " << numThreads << std::endl;
-    std::cout << "  Mode:        " << (useInMemory ? "in-memory" : "disk-backed") << std::endl;
+    std::cout << "  Mode:        "
+              << (outputMode == VoxelizationOutputMode::Instanced
+                      ? "instanced per-asset"
+                      : (useInMemory ? "in-memory" : "disk-backed"))
+              << std::endl;
     std::cout << "  Materials:   " << (useSpecGlossMaterials ? "SpecGloss" : "MetalRough") << std::endl;
     if (!useInMemory) {
         std::cout << "  Temp dir:    " << tmpDir << std::endl;
@@ -119,7 +165,9 @@ int main(int argc, char* argv[]) {
     voxelizer.setKeepTemp(keepTemp);
 
     bool ok;
-    if (useInMemory) {
+    if (outputMode == VoxelizationOutputMode::Instanced) {
+        ok = voxelizer.processInstanced(inputPath, outputDir);
+    } else if (useInMemory) {
         ok = voxelizer.process(inputPath, outputPath);
     } else {
         ok = voxelizer.processDisk(inputPath, outputPath);

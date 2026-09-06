@@ -1,4 +1,3 @@
-#include "Voxel/VoxelGrid.slang"
 #include "Math/VoxelizationUtility.slang"
 #include "VoxelizationShared.slang"
 #include "MixLightSampler.slang"
@@ -26,28 +25,18 @@ static const uint kInvalidInstanceIndex = 0xffffffffu;
 StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
+StructuredBuffer<VoxelAssetData> voxelAssets;
 StructuredBuffer<VoxelInstanceData> instances;
 
 RWStructuredBuffer<float4> selectedVoxel;
-
-cbuffer GridData
-{
-    float3 gridMin;
-    float3 voxelSize;
-    uint3 voxelCount;
-    uint octreeMaxDepth;
-}
 
 cbuffer CB
 {
     uint2 pixelCount;
     float4x4 invVP;
     uint instanceCount;
-    float4x4 instanceTransform;        // selected-instance fallback context
-    float4x4 inverseInstanceTransform; // selected-instance fallback context
-    float4x4 normalTransform;           // selected-instance fallback context
-    float3 instanceScale;               // selected-instance fallback context
-    float shadowBias;
+    uint assetCount;
+    float shadowBiasWorld;
     uint drawMode;
     uint frameIndex;
     float minPdf;
@@ -58,8 +47,6 @@ cbuffer CB
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap screen-space LOD: -1=no cap, N=never select coarser than N
-    int screenLOD;      // selected-instance fallback; primary uses instance.screenLOD
-    uint availableLODLevels; // generated parent levels; 0 means leaf data only
     uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
 }
@@ -77,13 +64,14 @@ struct HitResult
     bool hit;
     int3 cellInt;    // in LOD-0 coordinate space
     float3 cell;     // in LOD-0 coordinate space
-    uint gbIndex;    // gBuffer offset at leaf node
+    uint gbIndex;    // global gBuffer/pBuffer index for the selected node
     uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
     float lodLevel;  // selected discrete LOD level; 0=leaf
+    float3 normalLocal; // geometric ellipsoid normal in asset-local space
 };
 
 // Scene hit expressed in world space while retaining the asset-local hit used
-// to access the shared voxel hierarchy and material buffers.
+// to access the concatenated voxel hierarchies and material buffers.
 struct WorldHitResult
 {
     bool hit;
@@ -92,8 +80,24 @@ struct WorldHitResult
     float3 positionW;
     float tWorld;
     float3 directionLocal;
+    float3 normalW;
     float rayConeBias;
     HitResult localHit;
+};
+
+// Intersections from several instances at nearly the same world-space ray
+// depth form one event. The representative supplies material/shading data;
+// unionCoverage prevents duplicated voxelized surfaces from being accumulated
+// more than once by the Coverage view.
+struct SceneHitEvent
+{
+    bool hit;
+    WorldHitResult representative;
+    float tMinWorld;
+    float tMaxWorld;
+    float mergeDistanceWorld;
+    float unionCoverage;
+    uint memberCount;
 };
 
 struct PsOut
@@ -101,9 +105,9 @@ struct PsOut
     float4 color : SV_Target0;
 };
 
-bool outsideGrid(int3 cellInt)
+bool outsideGrid(int3 cellInt, VoxelAssetData asset)
 {
-    return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
+    return any(cellInt < int3(0)) || any(cellInt >= (int3)asset.voxelCountAndDepth.xyz);
 }
 
 uint getBufferIndex(uint globalIdx)
@@ -144,7 +148,15 @@ float maxRoughness(uint gbIndex)
     return r;
 }
 
-HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
+HitResult rayHitTE(
+    Ellipsoid ellipsoid,
+    float3 cell,
+    float3 direction,
+    int3 cellInt,
+    uint gbIndex,
+    uint nodeSize,
+    VoxelAssetData asset
+)
 {
     // Compute node-local coordinates for ellipsoid intersection.
     // Ellipsoid is defined in node-local [0,1]³ space (fitted over the entire node),
@@ -172,21 +184,49 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     float3 hitCell = float3(nodeMinCell) + hitLocal * float(nodeSize);
     int3 hitCellInt = int3(floor(hitCell));
 
-    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize, 0.0f };
+    float3 normalLocal = float3(0.0f);
+    if (inOut.x >= 0.0f)
+    {
+        // Ellipsoid::B is expressed in node coordinates. Converting its
+        // gradient through the grid's voxel scale gives an asset-local
+        // geometric normal. The scalar nodeSize cancels during normalization.
+        float3 normalNode = mul(ellipsoid.B, hitLocal - ellipsoid.center);
+        normalLocal = normalizeSafe(normalNode / asset.voxelSize.xyz);
+        if (all(normalLocal == float3(0.0f)))
+            normalLocal = -normalizeSafe(direction * asset.voxelSize.xyz);
+    }
+
+    HitResult result = {
+        inOut.x >= 0,
+        hitCellInt,
+        hitCell,
+        gbIndex,
+        nodeSize,
+        0.0f,
+        normalLocal
+    };
     return result;
 }
 
-HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
+HitResult rayHitVoxel(
+    float3 cell,
+    float3 direction,
+    int3 cellInt,
+    uint gbIndex,
+    uint nodeSize,
+    VoxelAssetData asset
+)
 {
 #if !CHECK_ELLIPSOID
-    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
+    float3 normalLocal = -normalizeSafe(direction * asset.voxelSize.xyz);
+    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f, normalLocal };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex);
-    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
+    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize, asset);
     if (hit.hit)
         return hit;
 #endif
-    return { false, cellInt, cellInt + 0.5f, 0, nodeSize, 0.0f };
+    return { false, cellInt, cellInt + 0.5f, 0, nodeSize, 0.0f, float3(0.0f) };
 }
 
 // --- Parametric octree traversal (negative direction DDA) ---
@@ -199,63 +239,35 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 
 // Parametric octree traversal using Revelles 2000 negative-direction DDA.
 // Merges the speed of parametric space stepping with grid-wide screen-space LOD,
-// ellipsoid intersection tests, and ignoreNodeSize pre-skip from the original
-// parameterized stack-based traversal.
+// ellipsoid intersection tests, and optional near-origin hit rejection.
 // from: starting point in LOD-0 cell space
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, int fixedLod)
+HitResult rayMarching(
+    VoxelAssetData asset,
+    float3 from,
+    float3 direction,
+    float maxDistance,
+    float rejectNearHitDistanceCells,
+    int fixedLod
+)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
-        return { false, int3(from), from, 0, 0, 0.0f };
+        return { false, int3(from), from, 0, 0, 0.0f, float3(0.0f) };
 
-    // ===== Phase 1: ignoreNodeSize pre-skip (unchanged logic) =====
+    // A continuation ray no longer jumps directly to the boundary of a whole
+    // LOD node. It traverses normally and rejects only actual primitive hits
+    // that belong to the already-consumed origin event.
     float3 rayOrigin = from;
 
-    if (ignoreNodeSize > 0)
-    {
-        float3 cell = from;
-        int3 cellInt = int3(floor(from));
-        int3 dirs = int3(sign(direction));
-        float3 reciprocal = 1.0f / direction;
-
-        if (ignoreNodeSize == 1)
-        {
-            leave(cell, cellInt, dirs, direction, reciprocal);
-        }
-        else
-        {
-            float3 cellFloat = cell;
-            int3 blockMin;
-            blockMin.x = int(floor(cellFloat.x / float(ignoreNodeSize))) * int(ignoreNodeSize);
-            blockMin.y = int(floor(cellFloat.y / float(ignoreNodeSize))) * int(ignoreNodeSize);
-            blockMin.z = int(floor(cellFloat.z / float(ignoreNodeSize))) * int(ignoreNodeSize);
-
-            int3 exitFace;
-            exitFace.x = dirs.x > 0 ? blockMin.x + int(ignoreNodeSize) : blockMin.x;
-            exitFace.y = dirs.y > 0 ? blockMin.y + int(ignoreNodeSize) : blockMin.y;
-            exitFace.z = dirs.z > 0 ? blockMin.z + int(ignoreNodeSize) : blockMin.z;
-
-            float3 tToExit = (float3(exitFace) - cell) * reciprocal;
-            float tMin = 2.0f * float(ignoreNodeSize);
-            if (direction.x != 0 && tToExit.x < tMin) tMin = tToExit.x;
-            if (direction.y != 0 && tToExit.y < tMin) tMin = tToExit.y;
-            if (direction.z != 0 && tToExit.z < tMin) tMin = tToExit.z;
-            if (tMin < 0) tMin = 0;
-
-            cell += tMin * direction;
-            cellInt = int3(floor(cell + direction * RAY_BIAS));
-        }
-
-        rayOrigin = cell + direction * RAY_BIAS;
-    }
-
-    // ===== Phase 2: normalize + mirror for negative-direction traversal =====
+    // ===== Phase 1: normalize + mirror for negative-direction traversal =====
+    uint octreeMaxDepth = asset.voxelCountAndDepth.w;
+    uint availableLODLevels = asset.resourceInfo.y;
     uint rootSize = 1u << octreeMaxDepth;
 
     // LOD is selected once per frame from the projected grid size. The
     // optional arguments remain useful for explicit debug/test overrides, but
     // no ray-distance based LOD decision is made during traversal.
-    int targetLOD = fixedLod >= 0 ? fixedLod : screenLOD;
+    int targetLOD = max(fixedLod, 0);
     if (forcedLOD >= 0)
         targetLOD = forcedLOD;
     if (maxLODLevel >= 0)
@@ -281,7 +293,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     if (d.y > 0.0f) { octant_mask ^= 2; bias.y = 3.0f * coef.y - bias.y; }
     if (d.z > 0.0f) { octant_mask ^= 4; bias.z = 3.0f * coef.z - bias.z; }
 
-    // ===== Phase 3: root entry / exit in parametric space =====
+    // ===== Phase 2: root entry / exit in parametric space =====
     precise float t_min = max(max(2.0f * coef.x - bias.x, 2.0f * coef.y - bias.y), 2.0f * coef.z - bias.z);
     precise float t_max = min(min(1.0f * coef.x - bias.x, 1.0f * coef.y - bias.y), 1.0f * coef.z - bias.z);
 
@@ -293,12 +305,12 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         t_max = min(t_max, t_min + maxDistance / float(rootSize));
 
     if (t_min > t_max)
-        return { false, int3(0), float3(0), 0, 0, 0.0f };
+        return { false, int3(0), float3(0), 0, 0, 0.0f, float3(0.0f) };
 
-    // ===== Phase 4: initialize state machine =====
+    // ===== Phase 3: initialize state machine =====
     int2 stack[S_MAX + 1];
 
-    uint parent = 0;
+    uint parent = asset.resourceInfo.x;
     uint idx = 0;
     precise float3 pos = float3(1.0f, 1.0f, 1.0f);
     int scale = S_MAX - 1;
@@ -309,7 +321,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     if (1.5f * coef.y - bias.y > t_min) { idx ^= 2; pos.y = 1.5f; }
     if (1.5f * coef.z - bias.z > t_min) { idx ^= 4; pos.z = 1.5f; }
 
-    // ===== Phase 5: main traversal loop (INTERSECT → PUSH | ADVANCE → POP) =====
+    // ===== Phase 4: main traversal loop (INTERSECT → PUSH | ADVANCE → POP) =====
     uint maxIter = (1u << octreeMaxDepth) * 3u + 64u;
     uint iter = 0;
 
@@ -369,15 +381,26 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
                 // in LOD-0 cell space, the hit cell is:
                 int3 cellInt = int3(floor(hitCell));
 
-                if (!outsideGrid(cellInt))
+                if (!outsideGrid(cellInt, asset))
                 {
                     uint gbIndex = childNode.dataIndex;
 
-                    HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize);
+                    HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize, asset);
                     if (hit.hit)
                     {
                         hit.lodLevel = float(nodeLOD);
-                        return hit;
+#if CHECK_ELLIPSOID
+                        float hitDistanceCells = max(dot(hit.cell - from, direction), 0.0f);
+#else
+                        // The box fallback reports the voxel center as its hit
+                        // position, so use the traversed node-entry distance for
+                        // origin-event rejection instead.
+                        float hitDistanceCells = max(t_min * float(rootSize), 0.0f);
+#endif
+                        bool rejectOriginEventHit = rejectNearHitDistanceCells >= 0.0f &&
+                            hitDistanceCells <= rejectNearHitDistanceCells;
+                        if (!rejectOriginEventHit)
+                            return hit;
                     }
                 }
             }
@@ -451,17 +474,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         }
     }
 
-    return { false, int3(0), float3(0), 0, 0, 0.0f };
-}
-
-float3 localToCellDirection(float3 directionLocal)
-{
-    return normalizeSafe(directionLocal / voxelSize);
-}
-
-float3 localToWorldPoint(float3 pointLocal)
-{
-    return mul(instanceTransform, float4(pointLocal, 1.0f)).xyz;
+    return { false, int3(0), float3(0), 0, 0, 0.0f, float3(0.0f) };
 }
 
 float3 localToWorldPoint(float3 pointLocal, VoxelInstanceData instance)
@@ -469,19 +482,9 @@ float3 localToWorldPoint(float3 pointLocal, VoxelInstanceData instance)
     return mul(instance.localToWorld, float4(pointLocal, 1.0f)).xyz;
 }
 
-float3 localToWorldVector(float3 vectorLocal)
-{
-    return mul(instanceTransform, float4(vectorLocal, 0.0f)).xyz;
-}
-
 float3 localToWorldVector(float3 vectorLocal, VoxelInstanceData instance)
 {
     return mul(instance.localToWorld, float4(vectorLocal, 0.0f)).xyz;
-}
-
-float3 worldToLocalPoint(float3 pointWorld)
-{
-    return mul(inverseInstanceTransform, float4(pointWorld, 1.0f)).xyz;
 }
 
 float3 worldToLocalPoint(float3 pointWorld, VoxelInstanceData instance)
@@ -489,24 +492,14 @@ float3 worldToLocalPoint(float3 pointWorld, VoxelInstanceData instance)
     return mul(instance.worldToLocal, float4(pointWorld, 1.0f)).xyz;
 }
 
-float3 worldToLocalVector(float3 vectorWorld)
-{
-    return mul(inverseInstanceTransform, float4(vectorWorld, 0.0f)).xyz;
-}
-
 float3 worldToLocalVector(float3 vectorWorld, VoxelInstanceData instance)
 {
     return mul(instance.worldToLocal, float4(vectorWorld, 0.0f)).xyz;
 }
 
-float3 localToWorldNormal(float3 normalLocal)
-{
-    return normalize(mul(normalTransform, float4(normalLocal, 0.0f)).xyz);
-}
-
 float3 localToWorldNormal(float3 normalLocal, VoxelInstanceData instance)
 {
-    return normalize(mul(instance.normalTransform, float4(normalLocal, 0.0f)).xyz);
+    return normalizeSafe(mul(instance.normalTransform, float4(normalLocal, 0.0f)).xyz);
 }
 
 WorldHitResult makeWorldHitResult(
@@ -515,6 +508,7 @@ WorldHitResult makeWorldHitResult(
     float3 rayDirectionW,
     uint instanceIndex,
     VoxelInstanceData instance,
+    VoxelAssetData asset,
     float coneTan
 )
 {
@@ -528,63 +522,110 @@ WorldHitResult makeWorldHitResult(
     if (!localHit.hit)
         return result;
 
-    float3 positionLocal = gridMin + localHit.cell * voxelSize;
+    float3 positionLocal = asset.gridMin.xyz + localHit.cell * asset.voxelSize.xyz;
     result.positionW = localToWorldPoint(positionLocal, instance);
     result.tWorld = dot(result.positionW - rayOriginW, normalizeSafe(rayDirectionW));
-    float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(rayDirectionW), instance) / voxelSize;
+    result.normalW = localToWorldNormal(localHit.normalLocal, instance);
+    if (all(result.normalW == float3(0.0f)))
+        result.normalW = -normalizeSafe(rayDirectionW);
+    float3 directionCellPerWorld =
+        worldToLocalVector(normalizeSafe(rayDirectionW), instance) / asset.voxelSize.xyz;
     result.rayConeBias = max(result.tWorld, 0.0f) * length(directionCellPerWorld) * coneTan;
     result.hit = true;
     return result;
 }
 
-float worldDistanceToCellDistance(float3 directionWorld, float distanceWorld)
-{
-    float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(directionWorld)) / voxelSize;
-    return distanceWorld * length(directionCellPerWorld);
-}
-
 float worldDistanceToCellDistance(
     float3 directionWorld,
     float distanceWorld,
-    VoxelInstanceData instance
+    VoxelInstanceData instance,
+    VoxelAssetData asset
 )
 {
-    float3 directionCellPerWorld = worldToLocalVector(normalizeSafe(directionWorld), instance) / voxelSize;
+    float3 directionCellPerWorld =
+        worldToLocalVector(normalizeSafe(directionWorld), instance) / asset.voxelSize.xyz;
     return distanceWorld * length(directionCellPerWorld);
 }
 
-float worldVoxelSize()
-{
-    // Rotation preserves the length of each scaled local voxel axis. Use the
-    // largest world-space edge as a conservative emissive matching tolerance.
-    float3 worldVoxelSizes = abs(instanceScale * voxelSize);
-    return max(max(worldVoxelSizes.x, worldVoxelSizes.y), max(worldVoxelSizes.z, 1e-6f));
-}
-
-float worldVoxelSize(VoxelInstanceData instance)
+float worldVoxelSize(VoxelInstanceData instance, VoxelAssetData asset)
 {
     // Rotation preserves the length of each scaled local voxel axis. Use the
     // largest world-space edge as a conservative emissive matching tolerance.
     float3 worldVoxelSizes = float3(
-        length(mul((float3x3)instance.localToWorld, float3(voxelSize.x, 0, 0))),
-        length(mul((float3x3)instance.localToWorld, float3(0, voxelSize.y, 0))),
-        length(mul((float3x3)instance.localToWorld, float3(0, 0, voxelSize.z)))
+        length(mul((float3x3)instance.localToWorld, float3(asset.voxelSize.x, 0, 0))),
+        length(mul((float3x3)instance.localToWorld, float3(0, asset.voxelSize.y, 0))),
+        length(mul((float3x3)instance.localToWorld, float3(0, 0, asset.voxelSize.z)))
     );
     return max(max(worldVoxelSizes.x, worldVoxelSizes.y), max(worldVoxelSizes.z, 1e-6f));
 }
 
-float cellDistancePerWorldUnit(float3 directionWorld, VoxelInstanceData instance)
+float cellDistancePerWorldUnit(
+    float3 directionWorld,
+    VoxelInstanceData instance,
+    VoxelAssetData asset
+)
 {
     float3 directionCellPerWorld =
-        worldToLocalVector(normalizeSafe(directionWorld), instance) / voxelSize;
+        worldToLocalVector(normalizeSafe(directionWorld), instance) / asset.voxelSize.xyz;
     return length(directionCellPerWorld);
 }
 
-float worldRayAdvance(float3 directionWorld, VoxelInstanceData instance)
+float worldRayAdvance(
+    float3 directionWorld,
+    VoxelInstanceData instance,
+    VoxelAssetData asset
+)
 {
     // RAY_BIAS is defined in cell units. Convert it back to world units along
     // this ray, which is required for non-uniformly scaled instances.
-    return RAY_BIAS / max(cellDistancePerWorldUnit(directionWorld, instance), 1e-8f);
+    return RAY_BIAS / max(cellDistancePerWorldUnit(directionWorld, instance, asset), 1e-8f);
+}
+
+float worldDistanceForCellDistance(
+    float3 directionWorld,
+    float distanceCells,
+    VoxelInstanceData instance,
+    VoxelAssetData asset
+)
+{
+    return distanceCells /
+        max(cellDistancePerWorldUnit(directionWorld, instance, asset), 1e-8f);
+}
+
+float sceneHitMergeDistance(WorldHitResult hit, float3 rayDirectionW)
+{
+    if (!hit.hit)
+        return kSceneHitTieEpsilon;
+
+    VoxelInstanceData instance = instances[hit.instanceIndex];
+    VoxelAssetData asset = voxelAssets[instance.assetIndex];
+    return max(
+        worldDistanceForCellDistance(rayDirectionW, 4.0f * RAY_BIAS, instance, asset),
+        kSceneHitTieEpsilon
+    );
+}
+
+float3 offsetRayOriginAlongNormal(
+    WorldHitResult hit,
+    float3 outgoingDirectionW,
+    float normalBiasCells
+)
+{
+    VoxelInstanceData instance = instances[hit.instanceIndex];
+    VoxelAssetData asset = voxelAssets[instance.assetIndex];
+    float3 directionW = normalizeSafe(outgoingDirectionW);
+    float3 normalW = normalizeSafe(hit.normalW);
+    if (all(normalW == float3(0.0f)))
+        normalW = -directionW;
+
+    float side = dot(directionW, normalW) >= 0.0f ? 1.0f : -1.0f;
+    float biasWorld = worldDistanceForCellDistance(
+        normalW,
+        max(normalBiasCells, RAY_BIAS),
+        instance,
+        asset
+    );
+    return hit.positionW + side * biasWorld * normalW;
 }
 
 bool intersectRayBounds(
@@ -685,8 +726,7 @@ WorldHitResult traceInstance(
     float rayTMax,
     float coneTan,
     uint instanceIndex,
-    uint ignoreNodeSize,
-    bool skipOriginOverlapNode
+    float rejectOriginEventDistanceWorld
 )
 {
     VoxelInstanceData instance = instances[instanceIndex];
@@ -696,8 +736,10 @@ WorldHitResult traceInstance(
     result.tWorld = kSceneRayMax;
 
     float3 directionW = normalizeSafe(rayDirectionW);
-    if (instance.enabled == 0 || all(directionW == float3(0)) || rayTMax < rayTMin)
+    if (instance.enabled == 0 || instance.assetIndex >= assetCount ||
+        all(directionW == float3(0)) || rayTMax < rayTMin)
         return result;
+    VoxelAssetData asset = voxelAssets[instance.assetIndex];
 
     float broadEnterT = 0.0f;
     float broadExitT = 0.0f;
@@ -718,8 +760,9 @@ WorldHitResult traceInstance(
     // first. Its length is the exact cells-per-world-unit conversion for this
     // direction under a non-uniform instance transform.
     float3 originLocal = worldToLocalPoint(rayOriginW, instance);
-    float3 originCell = (originLocal - gridMin) / voxelSize;
-    float3 directionCellPerWorld = worldToLocalVector(directionW, instance) / voxelSize;
+    float3 originCell = (originLocal - asset.gridMin.xyz) / asset.voxelSize.xyz;
+    float3 directionCellPerWorld =
+        worldToLocalVector(directionW, instance) / asset.voxelSize.xyz;
     float cellsPerWorld = length(directionCellPerWorld);
     if (!(cellsPerWorld > 1e-8f))
         return result;
@@ -728,7 +771,7 @@ WorldHitResult traceInstance(
     float exactExitT = 0.0f;
     if (!intersectRayBounds(
         float3(0.0f),
-        float3(voxelCount),
+        float3(asset.voxelCountAndDepth.xyz),
         originCell,
         directionCellPerWorld,
         broadEnterT,
@@ -749,18 +792,23 @@ WorldHitResult traceInstance(
     float3 fromCell = originCell + exactEnterT * directionCellPerWorld +
         startBiasCells * directionCell;
 
-    // ignoreNodeSize is valid only when this ray starts inside the instance.
-    // If the ray enters it later, skipping the entry node would hide a real
-    // blocker or bounce target.
     bool startsInsideGrid = all(originCell >= float3(0.0f)) &&
-        all(originCell < float3(voxelCount));
-    uint effectiveIgnoreNodeSize = startsInsideGrid ? ignoreNodeSize : 0u;
+        all(originCell < float3(asset.voxelCountAndDepth.xyz));
+    float rejectNearHitDistanceCells = -1.0f;
+    if (startsInsideGrid && rejectOriginEventDistanceWorld >= 0.0f)
+    {
+        rejectNearHitDistanceCells = max(
+            rejectOriginEventDistanceWorld * cellsPerWorld,
+            4.0f * RAY_BIAS
+        );
+    }
 
     HitResult localHit = rayMarching(
+        asset,
         fromCell,
         directionCell,
         max(traceDistanceCells - startBiasCells, 0.0f),
-        effectiveIgnoreNodeSize,
+        rejectNearHitDistanceCells,
         instance.screenLOD
     );
     result = makeWorldHitResult(
@@ -769,42 +817,12 @@ WorldHitResult traceInstance(
         directionW,
         instanceIndex,
         instance,
+        asset,
         coneTan
     );
 
-    // A continuation ray can start inside an occupied node of another
-    // overlapping instance. Treat that node as part of the same union surface
-    // instead of reporting a near-zero hit and alternating between instances.
-    // Re-tracing with that node skipped still finds the next real layer in the
-    // target instance.
-    if (skipOriginOverlapNode && startsInsideGrid && result.hit)
-    {
-        float originMergeDistanceWorld = max(
-            4.0f * worldRayAdvance(directionW, instance),
-            kSceneHitTieEpsilon
-        );
-        if (result.tWorld <= rayTMin + originMergeDistanceWorld)
-        {
-            localHit = rayMarching(
-                fromCell,
-                directionCell,
-                max(traceDistanceCells - startBiasCells, 0.0f),
-                result.localHit.nodeSize,
-                instance.screenLOD
-            );
-            result = makeWorldHitResult(
-                localHit,
-                rayOriginW,
-                directionW,
-                instanceIndex,
-                instance,
-                coneTan
-            );
-        }
-    }
-
-    // ignoreNodeSize advances inside rayMarching(), so validate the returned
-    // world hit against the original finite query interval as a final guard.
+    // Validate the returned world hit against the original finite query
+    // interval as a final guard.
     if (result.hit &&
         (result.tWorld < exactEnterT - kSceneHitTieEpsilon ||
          result.tWorld > rayTMax + kSceneHitTieEpsilon ||
@@ -816,32 +834,32 @@ WorldHitResult traceInstance(
     return result;
 }
 
-// Returns the nearest enabled-instance hit. For continuation rays, the final
-// two arguments identify the source node: that node and coincident occupied
-// nodes in other instances are skipped as one overlap group at the origin.
-WorldHitResult traceScene(
+// Returns the nearest world-space hit event. Hits from different instances are
+// grouped when their ray depths differ only by a scale-aware merge tolerance.
+// A non-negative rejectOriginEventDistanceWorld consumes near-origin members
+// of the previous event without pre-skipping an entire LOD node.
+SceneHitEvent traceScene(
     float3 rayOriginW,
     float3 rayDirectionW,
     float rayTMin,
     float rayTMax,
     float coneTan,
-    uint ignoreNodeInstanceIndex,
-    uint ignoreNodeSize
+    float rejectOriginEventDistanceWorld
 )
 {
-    WorldHitResult closest = {};
-    closest.instanceIndex = kInvalidInstanceIndex;
-    closest.instanceId = 0xffffffffu;
-    closest.tWorld = kSceneRayMax;
+    SceneHitEvent event = {};
+    event.representative.instanceIndex = kInvalidInstanceIndex;
+    event.representative.instanceId = 0xffffffffu;
+    event.representative.tWorld = kSceneRayMax;
+    event.tMinWorld = kSceneRayMax;
+    event.tMaxWorld = -kSceneRayMax;
 
     float3 directionW = normalizeSafe(rayDirectionW);
     if (all(directionW == float3(0)) || rayTMax < rayTMin)
-        return closest;
+        return event;
 
     for (uint i = 0; i < instanceCount; ++i)
     {
-        uint instanceIgnoreNodeSize = i == ignoreNodeInstanceIndex ? ignoreNodeSize : 0u;
-        bool skipOriginOverlapNode = ignoreNodeSize > 0u && i != ignoreNodeInstanceIndex;
         WorldHitResult candidate = traceInstance(
             rayOriginW,
             directionW,
@@ -849,19 +867,55 @@ WorldHitResult traceScene(
             rayTMax,
             coneTan,
             i,
-            instanceIgnoreNodeSize,
-            skipOriginOverlapNode
+            rejectOriginEventDistanceWorld
         );
+        if (!candidate.hit)
+            continue;
 
-        bool strictlyCloser = candidate.tWorld < closest.tWorld - kSceneHitTieEpsilon;
-        bool sameDepth = abs(candidate.tWorld - closest.tWorld) <= kSceneHitTieEpsilon;
-        bool stableTieBreak = sameDepth &&
-            (candidate.instanceId < closest.instanceId ||
-             (candidate.instanceId == closest.instanceId && candidate.instanceIndex < closest.instanceIndex));
-        if (candidate.hit && (strictlyCloser || stableTieBreak))
-            closest = candidate;
+        float candidateMergeDistance = sceneHitMergeDistance(candidate, directionW);
+        float eventTolerance = max(event.mergeDistanceWorld, candidateMergeDistance);
+        bool startsCloserEvent = !event.hit ||
+            candidate.tWorld < event.tMinWorld - eventTolerance;
+        bool joinsCurrentEvent = event.hit && !startsCloserEvent &&
+            candidate.tWorld <= event.tMinWorld + eventTolerance;
+
+        if (!startsCloserEvent && !joinsCurrentEvent)
+            continue;
+
+        float candidateCoverage = 0.0f;
+        if (drawMode == uint(ABSDFDrawMode::Coverage))
+        {
+            TEBSDF candidateBSDF = loadGBuffer(candidate.localHit.gbIndex);
+            candidateCoverage = saturate(
+                candidateBSDF.calcCoverage(candidate.directionLocal, coverageBlend)
+            );
+        }
+
+        if (startsCloserEvent)
+        {
+            event.hit = true;
+            event.representative = candidate;
+            event.tMinWorld = candidate.tWorld;
+            event.tMaxWorld = candidate.tWorld;
+            event.mergeDistanceWorld = candidateMergeDistance;
+            event.unionCoverage = candidateCoverage;
+            event.memberCount = 1u;
+            continue;
+        }
+
+        event.tMinWorld = min(event.tMinWorld, candidate.tWorld);
+        event.tMaxWorld = max(event.tMaxWorld, candidate.tWorld);
+        event.mergeDistanceWorld = max(event.mergeDistanceWorld, candidateMergeDistance);
+        event.unionCoverage = max(event.unionCoverage, candidateCoverage);
+        event.memberCount++;
+
+        bool stableRepresentative = candidate.instanceId < event.representative.instanceId ||
+            (candidate.instanceId == event.representative.instanceId &&
+             candidate.instanceIndex < event.representative.instanceIndex);
+        if (stableRepresentative)
+            event.representative = candidate;
     }
-    return closest;
+    return event;
 }
 
 float calcTrasmissionVisibility(WorldHitResult hit, float3 directionWorld, RayCone cone)
@@ -869,17 +923,15 @@ float calcTrasmissionVisibility(WorldHitResult hit, float3 directionWorld, RayCo
     if (!hit.hit)
         return 1.0f;
 
-    VoxelInstanceData instance = instances[hit.instanceIndex];
     float3 directionW = normalizeSafe(directionWorld);
-    float3 originW = hit.positionW + worldRayAdvance(directionW, instance) * directionW;
-    WorldHitResult blocker = traceScene(
+    float3 originW = offsetRayOriginAlongNormal(hit, directionW, RAY_BIAS);
+    SceneHitEvent blocker = traceScene(
         originW,
         directionW,
         0.0f,
         kSceneRayMax,
         cone.tanHalfAngle,
-        hit.instanceIndex,
-        hit.localHit.nodeSize
+        sceneHitMergeDistance(hit, directionW)
     );
     return blocker.hit ? 0.0f : 1.0f;
 }
@@ -887,7 +939,6 @@ float calcTrasmissionVisibility(WorldHitResult hit, float3 directionWorld, RayCo
 float calcLightVisibility(
     WorldHitResult hit,
     float3 directionWorld,
-    float3 mainNormalLocal,
     float distanceWorld,
     RayCone cone
 )
@@ -896,54 +947,60 @@ float calcLightVisibility(
         return 1.0f;
 
     VoxelInstanceData instance = instances[hit.instanceIndex];
+    VoxelAssetData asset = voxelAssets[instance.assetIndex];
     float3 directionW = normalizeSafe(directionWorld);
     if (all(directionW == float3(0)))
         return 1.0f;
 
-    // Preserve the existing cell-space normal bias, then transform the biased
-    // point to world space. This remains valid under non-uniform scaling.
-    float3 biasedCell = hit.localHit.cell + shadowBias * mainNormalLocal;
-    float3 biasedLocal = gridMin + biasedCell * voxelSize;
-    float3 originW = localToWorldPoint(biasedLocal, instance);
+    // Spawn on the outgoing side of the geometric surface. Converting the
+    // normal offset from cells to world units keeps it stable under a
+    // non-uniform instance transform.
+    float3 originW = offsetRayOriginAlongNormal(
+        hit,
+        directionW,
+        max(
+            worldDistanceToCellDistance(hit.normalW, shadowBiasWorld, instance, asset),
+            RAY_BIAS
+        )
+    );
 
     const float ignoreDistanceCells = 2.0f;
     float ignoreDistanceWorld = ignoreDistanceCells /
-        max(cellDistancePerWorldUnit(directionW, instance), 1e-8f);
+        max(cellDistancePerWorldUnit(directionW, instance, asset), 1e-8f);
     if (distanceWorld >= 0.0f && distanceWorld <= ignoreDistanceWorld)
         return 1.0f;
 
     float maxDistanceWorld = distanceWorld >= 0.0f
         ? max(distanceWorld - ignoreDistanceWorld, 0.0f)
         : kSceneRayMax;
-    WorldHitResult blocker = traceScene(
+    SceneHitEvent blocker = traceScene(
         originW,
         directionW,
         0.0f,
         maxDistanceWorld,
         cone.tanHalfAngle,
-        hit.instanceIndex,
-        hit.localHit.nodeSize
+        sceneHitMergeDistance(hit, directionW)
     );
     return blocker.hit ? 0.0f : 1.0f;
 }
 
-float3 coverageTest(WorldHitResult firstHit, float3 directionWorld, RayCone cone)
+float3 coverageTest(SceneHitEvent firstEvent, float3 directionWorld, RayCone cone)
 {
-    if (!firstHit.hit)
+    if (!firstEvent.hit)
         return valueToColor(0.0f);
 
     float3 directionW = normalizeSafe(directionWorld);
-    WorldHitResult currentHit = firstHit;
+    SceneHitEvent currentEvent = firstEvent;
     float coverage = 0.0f;
 
     // Include the first hit and then continue through the complete instance
     // scene. MAX_BOUNCE therefore controls the number of additional layers.
     for (uint layer = 0; layer < MAX_BOUNCE + 1; ++layer)
     {
+        WorldHitResult currentHit = currentEvent.representative;
         VoxelInstanceData instance = instances[currentHit.instanceIndex];
-        float3 directionLocal = normalizeSafe(worldToLocalVector(directionW, instance));
-        TEBSDF bsdf = loadGBuffer(currentHit.localHit.gbIndex);
-        coverage += (1.0f - coverage) * bsdf.calcCoverage(directionLocal, coverageBlend);
+        VoxelAssetData asset = voxelAssets[instance.assetIndex];
+        coverage += (1.0f - coverage) * currentEvent.unionCoverage;
         if (coverage >= 1.0f - transmittanceThreshold)
         {
             coverage = 1.0f;
@@ -951,19 +1008,21 @@ float3 coverageTest(WorldHitResult firstHit, float3 directionWorld, RayCone cone
         }
 
         float3 nextOriginW = currentHit.positionW +
-            worldRayAdvance(directionW, instance) * directionW;
-        WorldHitResult nextHit = traceScene(
+            worldRayAdvance(directionW, instance, asset) * directionW;
+        SceneHitEvent nextEvent = traceScene(
             nextOriginW,
             directionW,
             0.0f,
             kSceneRayMax,
             cone.tanHalfAngle,
-            currentHit.instanceIndex,
-            currentHit.localHit.nodeSize
+            max(
+                currentEvent.mergeDistanceWorld,
+                sceneHitMergeDistance(currentHit, directionW)
+            )
         );
-        if (!nextHit.hit)
+        if (!nextEvent.hit)
             break;
-        currentHit = nextHit;
+        currentEvent = nextEvent;
     }
     return valueToColor(coverage);
 }
@@ -1049,11 +1108,9 @@ float3 shadingDirect(
     // equivalent to the half-vector of the transformed directions.
     float3 halfLocal = normalize(lightLocal + viewLocal);
     ls.pdf = max(ls.pdf, minPdf);
-    float3 mainNormal = BSDF.surface.getMainNormal(lightLocal);
     float visibility = calcLightVisibility(
         worldHit,
         ls.l,
-        mainNormal,
         ls.distance,
         cone
     );
@@ -1064,17 +1121,19 @@ float3 shadingDirect(
 }
 
 float3 shadingGlobal(
-    WorldHitResult firstHit,
+    SceneHitEvent firstEvent,
     inout UniformSampleGenerator sg,
     RayCone cone
 )
 {
     WorldHitResult[MAX_BOUNCE + 1] hits;
+    float[MAX_BOUNCE + 1] eventMergeDistances;
     float3[MAX_BOUNCE + 1] sampledDirectionsLocal;
     float3[MAX_BOUNCE + 1] sampledDirectionsWorld;
     float3[MAX_BOUNCE + 1] sampledHalfVectorsLocal;
     float[MAX_BOUNCE + 1] pdfs;
-    hits[0] = firstHit;
+    hits[0] = firstEvent.representative;
+    eventMergeDistances[0] = firstEvent.mergeDistanceWorld;
     uint shadingPointCount = 1;
     bool escapedScene = false;
 
@@ -1108,24 +1167,30 @@ float3 shadingGlobal(
         if (all(sampledDirectionsWorld[i] == float3(0.0f)))
             break;
 
-        float3 nextOriginW = currentHit.positionW +
-            worldRayAdvance(sampledDirectionsWorld[i], instance) * sampledDirectionsWorld[i];
-        WorldHitResult nextHit = traceScene(
+        float3 nextOriginW = offsetRayOriginAlongNormal(
+            currentHit,
+            sampledDirectionsWorld[i],
+            RAY_BIAS
+        );
+        SceneHitEvent nextEvent = traceScene(
             nextOriginW,
             sampledDirectionsWorld[i],
             0.0f,
             kSceneRayMax,
             cone.tanHalfAngle,
-            currentHit.instanceIndex,
-            currentHit.localHit.nodeSize
+            max(
+                eventMergeDistances[i],
+                sceneHitMergeDistance(currentHit, sampledDirectionsWorld[i])
+            )
         );
-        if (!nextHit.hit)
+        if (!nextEvent.hit)
         {
             escapedScene = true;
             break;
         }
 
-        hits[i + 1] = nextHit;
+        hits[i + 1] = nextEvent.representative;
+        eventMergeDistances[i + 1] = nextEvent.mergeDistanceWorld;
         shadingPointCount = i + 2;
     }
 
@@ -1181,14 +1246,6 @@ float3 screenCoordToWorld(float2 screenCoord, float NDCDepth)
     float4 NDC = float4(2 * screenCoord.x - 1, 1 - 2 * screenCoord.y, NDCDepth, 1);
     float4 temp = mul(invVP, NDC);
     return (temp / temp.w).xyz;
-}
-
-float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
-{
-    float3 posWorld = screenCoordToWorld(screenCoord, NDCDepth);
-    float3 posLocal = worldToLocalPoint(posWorld);
-    float3 cell = (posLocal - gridMin) / voxelSize;
-    return cell;
 }
 
 float2 randomJitter()
@@ -1253,7 +1310,6 @@ float3 lambertShading(
     float visibility = calcLightVisibility(
         worldHit,
         ls.l,
-        N,
         ls.distance,
         cone
     );
@@ -1275,7 +1331,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     float3 directionWorld = normalize(rayEndWorld - rayOriginWorld);
     psOut.color = renderBackground(directionWorld);
 
-    if (octreeMaxDepth == 0)
+    if (assetCount == 0 || instanceCount == 0)
         return psOut;
 
     // Primary ray cone: pixel footprint
@@ -1284,18 +1340,22 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 
     UniformSampleGenerator sg = UniformSampleGenerator(pixel, frameIndex);
     float primaryMaxDistance = length(rayEndWorld - rayOriginWorld);
-    WorldHitResult worldHit = traceScene(
+    SceneHitEvent primaryEvent = traceScene(
         rayOriginWorld,
         directionWorld,
         0.0f,
         primaryMaxDistance,
         coneTan,
-        kInvalidInstanceIndex,
-        0u
+        -1.0f
     );
+    WorldHitResult worldHit = primaryEvent.representative;
     VoxelInstanceData selectedInstance = {};
+    VoxelAssetData selectedAsset = {};
     if (worldHit.hit)
+    {
         selectedInstance = instances[worldHit.instanceIndex];
+        selectedAsset = voxelAssets[selectedInstance.assetIndex];
+    }
 
     if (all(pixel == selectedPixel))
     {
@@ -1325,17 +1385,21 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         case ABSDFDrawMode::Default:
 #if USE_EMISSIVE_LIGHTS
         {
-            if (checkHitEmissive(worldHit.positionW, worldVoxelSize(selectedInstance), color))
+            if (checkHitEmissive(
+                worldHit.positionW,
+                worldVoxelSize(selectedInstance, selectedAsset),
+                color
+            ))
             {
                 psOut.color = float4(color, 1);
                 return psOut;
             }
         }
 #endif
-            color = shadingGlobal(worldHit, sg, primaryCone);
+            color = shadingGlobal(primaryEvent, sg, primaryCone);
             break;
         case ABSDFDrawMode::Coverage:
-            color = coverageTest(worldHit, directionWorld, primaryCone);
+            color = coverageTest(primaryEvent, directionWorld, primaryCone);
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
@@ -1349,7 +1413,9 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODLevel:
         {
-            float t = saturate(hit.lodLevel / max(float(octreeMaxDepth), 1.0f));
+            float t = saturate(
+                hit.lodLevel / max(float(selectedAsset.voxelCountAndDepth.w), 1.0f)
+            );
             uint lodLevel = firstbithigh(hit.nodeSize);
 
             const float3 colors[] = {

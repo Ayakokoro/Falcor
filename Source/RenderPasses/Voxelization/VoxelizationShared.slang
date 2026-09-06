@@ -44,9 +44,18 @@ struct OctreeNode
     uint dataIndex;   // Index into gBuffer/pBuffer for this node's own data (independent per-node)
 };
 
-// Per-placement data for the single-bin multi-instance ray marcher. This is
-// shared with C++ so the structured-buffer layout cannot drift between host
-// upload code and Slang.
+// Per-bin data after all voxel assets have been concatenated into the shared
+// scene buffers. float4/uint4 fields keep the host/device layout explicit.
+struct VoxelAssetData
+{
+    float4 gridMin;
+    float4 voxelSize;
+    uint4 voxelCountAndDepth; // xyz: LOD-0 dimensions, w: octree max depth
+    uint4 resourceInfo;       // x: octree root, y: available LODs, z: data base, w: data count
+};
+
+// Per-placement data for the multi-asset ray marcher. assetIndex selects the
+// bin metadata above; the octree and shading payload remain shared.
 struct VoxelInstanceData
 {
     float4x4 localToWorld;
@@ -57,7 +66,7 @@ struct VoxelInstanceData
     uint instanceId;
     int screenLOD;
     uint enabled;
-    uint padding;
+    uint assetIndex;
 };
 
 END_NAMESPACE_FALCOR

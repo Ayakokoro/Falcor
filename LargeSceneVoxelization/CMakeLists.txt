@@ -100,6 +100,7 @@ target_include_directories(LargeSceneVoxelization PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${stb_SOURCE_DIR}
     ${glm_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../external/include  # nlohmann/json.hpp for scene manifests
 )
 
 target_include_directories(VoxelizationInspector PRIVATE
@@ -144,7 +145,7 @@ if(assimp_BINARY_DIR AND WIN32)
     foreach(target LargeSceneVoxelization VoxelizationInspector)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${assimp_BINARY_DIR}/bin/$<CONFIG>/assimp-vc143-mt.dll"
+                "$<TARGET_FILE:assimp>"
                 "$<TARGET_FILE_DIR:${target}>"
             COMMENT "Copying assimp DLL to output directory"
         )
