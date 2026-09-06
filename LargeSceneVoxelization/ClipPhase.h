@@ -154,10 +154,10 @@ static void clipWorker(
         const MeshInstance& inst = scene.instances[instIdx];
         const MeshGeometry& mesh = scene.meshes[inst.meshID];
         const glm::mat4& worldM = inst.transform;
-        uint32_t matID = mesh.materialID;
 
         for (uint32_t localTid = 0; localTid < (uint32_t)mesh.triangles.size(); localTid++) {
             uint3 idx = mesh.triangles[localTid];
+            uint32_t matID = mesh.triangleMaterialID(localTid);
 
             Triangle tri;
             tri.vertices[0] = localToVoxel(mesh.positions[idx.x], worldM, grid.gridMin, invVoxelSize);

@@ -110,10 +110,10 @@ public:
             const MeshInstance& inst = scene.instances[instIdx];
             const MeshGeometry& mesh = scene.meshes[inst.meshID];
             const glm::mat4& worldM = inst.transform;
-            uint matID = mesh.materialID;
 
             for (uint localTid = 0; localTid < (uint)mesh.triangles.size(); localTid++) {
                 uint3 idx = mesh.triangles[localTid];
+                uint matID = mesh.triangleMaterialID(localTid);
 
                 Triangle tri;
                 tri.vertices[0] = localToVoxel(mesh.positions[idx.x], worldM, mGrid.gridMin, invVoxelSize);
@@ -198,7 +198,7 @@ public:
                     uint meshID     = poly.triRef.meshID;
                     uint instIdx    = poly.triRef.instanceIdx;
                     const MeshGeometry& mesh = scene.meshes[meshID];
-                    uint matID = mesh.materialID;
+                    uint matID = mesh.triangleMaterialID(localTid);
 
                     // Reconstruct original triangle in voxel space
                     uint3 localIdx = mesh.triangles[localTid];

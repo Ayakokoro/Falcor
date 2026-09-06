@@ -1,8 +1,10 @@
 #pragma once
 #include "Types.h"
 #include "Triangle.h"
+#include <algorithm>
 #include <vector>
 #include <string>
+#include <map>
 #include <unordered_map>
 #include <cctype>
 #include <fstream>
@@ -64,17 +66,27 @@ struct LoadedScene {
 // ---- Instanced mode: unique meshes in local space ----
 struct MeshGeometry {
     uint meshID = 0;
-    uint materialID = 0;
-    uint aiMeshIndex = 0;  // Assimp mesh index for dedup
+    uint materialID = 0;   // fallback/first primitive material
+    uint aiMeshIndex = 0;  // first Assimp primitive index
+    uint primitiveCount = 0;
     std::string name;
     std::vector<float3> positions;
     std::vector<float3> normals;
     std::vector<float2> texCoords;
     std::vector<uint3>  triangles;
+    // One material per triangle. This is required when a glTF mesh is made
+    // from multiple primitives, because each primitive may use a different
+    // material after Assimp expands it to an aiMesh.
+    std::vector<uint> triangleMaterialIDs;
     float3 localMin = float3(1e30f);
     float3 localMax = float3(-1e30f);
     uint vertexCount() const { return (uint)positions.size(); }
     uint triangleCount() const { return (uint)triangles.size(); }
+    uint triangleMaterialID(uint triangleIndex) const {
+        return triangleIndex < triangleMaterialIDs.size()
+            ? triangleMaterialIDs[triangleIndex]
+            : materialID;
+    }
 };
 
 
@@ -206,61 +218,96 @@ public:
         // Phase 1: Load materials
         loadMaterials(ai, outScene.materials, getImportMode(filePath));
 
-        // Phase 2: Collect all instances (aiMeshIndex, transform, materialID)
-        struct RawInstance { uint meshIndex; aiMatrix4x4 transform; uint materialID; };
+        // Phase 2: Collect instances. For glTF/GLB, Assimp expands one
+        // logical glTF mesh into one aiMesh per primitive. Keep the complete
+        // primitive list attached to the node so it can be grouped back into
+        // one logical mesh below.
+        struct RawInstance {
+            std::vector<uint> meshIndices;
+            aiMatrix4x4 transform;
+            uint meshID = 0;
+        };
         std::vector<RawInstance> rawInstances;
+        const bool groupGltfPrimitives = getImportMode(filePath) == MaterialImportMode::GLTF2;
         auto collectInstances = [&](aiNode* node, const aiMatrix4x4& parentXf, auto& self) -> void {
             aiMatrix4x4 world = parentXf * node->mTransformation;
-            for (uint i = 0; i < node->mNumMeshes; i++) {
-                uint meshIdx = node->mMeshes[i];
-                uint matID = ai->mMeshes[meshIdx]->mMaterialIndex;
-                rawInstances.push_back({meshIdx, world, matID});
+            if (groupGltfPrimitives && node->mNumMeshes > 0) {
+                std::vector<uint> meshIndices(node->mMeshes, node->mMeshes + node->mNumMeshes);
+                // The order of primitives is irrelevant to the logical mesh
+                // identity. Sorting makes the key stable across nodes.
+                std::sort(meshIndices.begin(), meshIndices.end());
+                rawInstances.push_back({std::move(meshIndices), world});
+            } else {
+                for (uint i = 0; i < node->mNumMeshes; i++) {
+                    rawInstances.push_back({{node->mMeshes[i]}, world});
+                }
             }
             for (uint i = 0; i < node->mNumChildren; i++)
                 self(node->mChildren[i], world, self);
         };
         collectInstances(ai->mRootNode, aiMatrix4x4(), collectInstances);
 
-        // Phase 3: Deduplicate unique meshes by aiMeshIndex
-        std::unordered_map<uint, uint> aiMeshToUnique;  // aiMeshIndex -> uniqueMeshID
+        // Phase 3: Deduplicate by logical mesh primitive set. A glTF node
+        // with N primitives now produces one MeshGeometry containing all N
+        // primitives, rather than N independent instance sources.
+        std::map<std::vector<uint>, uint> meshGroupToUnique;
         for (auto& ri : rawInstances) {
-            if (aiMeshToUnique.find(ri.meshIndex) == aiMeshToUnique.end()) {
-                uint uid = (uint)outScene.meshes.size();
-                aiMeshToUnique[ri.meshIndex] = uid;
-                aiMesh* aim = ai->mMeshes[ri.meshIndex];
+            auto [groupIt, inserted] = meshGroupToUnique.emplace(
+                ri.meshIndices, static_cast<uint>(outScene.meshes.size()));
+            if (inserted) {
+                const uint uid = groupIt->second;
                 MeshGeometry geom;
                 geom.meshID = uid;
-                geom.materialID = ri.materialID;
-                geom.aiMeshIndex = ri.meshIndex;
-                geom.name = aim->mName.C_Str();
-                for (uint v = 0; v < aim->mNumVertices; v++) {
-                    float3 pos(aim->mVertices[v].x, aim->mVertices[v].y, aim->mVertices[v].z);
-                    geom.positions.push_back(pos);
-                    geom.localMin = glm::min(geom.localMin, pos);
-                    geom.localMax = glm::max(geom.localMax, pos);
-                    if (aim->HasNormals())
-                        geom.normals.push_back(float3(aim->mNormals[v].x, aim->mNormals[v].y, aim->mNormals[v].z));
-                    else
-                        geom.normals.push_back(float3(0, 1, 0));
-                    if (aim->HasTextureCoords(0))
-                        geom.texCoords.push_back(float2(aim->mTextureCoords[0][v].x, aim->mTextureCoords[0][v].y));
-                    else
-                        geom.texCoords.push_back(float2(0));
-                }
-                for (uint f = 0; f < aim->mNumFaces; f++) {
-                    if (aim->mFaces[f].mNumIndices == 3)
-                        geom.triangles.push_back(uint3(aim->mFaces[f].mIndices[0],
-                                                        aim->mFaces[f].mIndices[1],
-                                                        aim->mFaces[f].mIndices[2]));
+                geom.aiMeshIndex = ri.meshIndices.front();
+                geom.primitiveCount = static_cast<uint>(ri.meshIndices.size());
+
+                bool firstPrimitive = true;
+                for (uint meshIndex : ri.meshIndices) {
+                    aiMesh* aim = ai->mMeshes[meshIndex];
+                    if (!aim->HasPositions())
+                        continue;
+
+                    if (firstPrimitive) {
+                        geom.name = aim->mName.C_Str();
+                        geom.materialID = aim->mMaterialIndex;
+                        firstPrimitive = false;
+                    }
+
+                    const uint baseVertex = static_cast<uint>(geom.positions.size());
+                    for (uint v = 0; v < aim->mNumVertices; v++) {
+                        float3 pos(aim->mVertices[v].x, aim->mVertices[v].y, aim->mVertices[v].z);
+                        geom.positions.push_back(pos);
+                        geom.localMin = glm::min(geom.localMin, pos);
+                        geom.localMax = glm::max(geom.localMax, pos);
+                        if (aim->HasNormals())
+                            geom.normals.push_back(float3(aim->mNormals[v].x, aim->mNormals[v].y, aim->mNormals[v].z));
+                        else
+                            geom.normals.push_back(float3(0, 1, 0));
+                        if (aim->HasTextureCoords(0))
+                            geom.texCoords.push_back(float2(aim->mTextureCoords[0][v].x, aim->mTextureCoords[0][v].y));
+                        else
+                            geom.texCoords.push_back(float2(0));
+                    }
+
+                    for (uint f = 0; f < aim->mNumFaces; f++) {
+                        if (aim->mFaces[f].mNumIndices == 3) {
+                            geom.triangles.push_back(uint3(
+                                baseVertex + aim->mFaces[f].mIndices[0],
+                                baseVertex + aim->mFaces[f].mIndices[1],
+                                baseVertex + aim->mFaces[f].mIndices[2]));
+                            geom.triangleMaterialIDs.push_back(aim->mMaterialIndex);
+                        }
+                    }
                 }
                 outScene.meshes.push_back(std::move(geom));
             }
+            ri.meshID = groupIt->second;
         }
 
         // Phase 4: Build instance list with unique mesh IDs
         for (auto& ri : rawInstances) {
             MeshInstance inst;
-            inst.meshID = aiMeshToUnique[ri.meshIndex];
+            inst.meshID = ri.meshID;
             inst.transform = glm::mat4(
                 ri.transform.a1, ri.transform.b1, ri.transform.c1, ri.transform.d1,
                 ri.transform.a2, ri.transform.b2, ri.transform.c2, ri.transform.d2,
@@ -277,6 +324,7 @@ public:
             std::cout << "    mesh[" << geom.meshID << "] \"" << geom.name
                       << "\" verts=" << geom.positions.size()
                       << " tris=" << geom.triangles.size()
+                      << " primitives=" << geom.primitiveCount
                       << " mat=" << geom.materialID << std::endl;
         }
         return true;

@@ -31,7 +31,7 @@ cmake --build build --config Release --target VoxelizationCore VoxelizationInspe
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\RainbowCoralReef\coral_reef.glb" -o "..\resource\Coral_reef_appx.bin" -r 512 -s 1024 --lod-levels 2 --lod-mode approximate
 
 # 实例化输出
-.\build\Release\LargeSceneVoxelization.exe "..\Scene\Metropolis\Metropolis_2.glb" --instanced --output-dir "..\resource\Metropolis_2_instanced" -r 512 -s 1024 --lod-levels 4 --lod-mode approximate
+.\build\Release\LargeSceneVoxelization.exe "..\Scene\Metropolis\Metropolis_2.glb" --instanced --output-dir "..\resource\Metropolis_2_instanced" -r 512 -s 1024 --lod-levels  --lod-mode approximate
 
 
 # 先生成并保留中间文件。为了查看节点内全部多边形，建议关闭单节点截断：
