@@ -54,6 +54,7 @@ struct VoxelInstance
 // included by the ray-marching shader.
 using VoxelInstanceGPU = VoxelInstanceData;
 using VoxelAssetGPU = VoxelAssetData;
+using VoxelInstanceBVHNodeGPU = InstanceBVHNode;
 
 class RayMarchingPass : public RenderPass
 {
@@ -80,6 +81,9 @@ private:
     void updateInstanceTransforms();
     void updateScreenSpaceLOD(const float4x4& viewProj, VoxelInstance& instance, bool updateDebugStats);
     void updateInstanceBuffer();
+    void buildInstanceBVH();
+    void updateInstanceBVHBuffer();
+    void rebuildInstanceBVHIfDirty();
 
     ref<Scene> mpScene;
     ref<Device> mpDevice;
@@ -124,6 +128,10 @@ private:
     uint32_t mInstanceEditIndex = 0;
     ref<Buffer> mInstanceBuffer;
     ref<Buffer> mAssetBuffer;
+    std::vector<VoxelInstanceBVHNodeGPU> mInstanceBVH;
+    ref<Buffer> mInstanceBVHBuffer;
+    bool mInstanceBVHDirty = false;
+    bool mUseInstanceBVH = true;
 
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     int mMaxLODLevel = -1; // -1=no cap, N=do not select a coarser level than N

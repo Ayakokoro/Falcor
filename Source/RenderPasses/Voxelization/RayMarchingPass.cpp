@@ -318,6 +318,160 @@ void RayMarchingPass::updateInstanceBuffer()
     }
 }
 
+// Recursively build a balanced BVH. The recursion permutes instancePositions,
+// whose entries are *actual indices into the GPU instance buffer* (== indices
+// into mInstances). The parallel boundsMin/BoundsMax vectors are indexed by
+// that same buffer position. Interior nodes are emitted depth-first so the
+// left child of a node always follows it at node+1; the right child is placed
+// at node + rightChildOffset. Leaves hold exactly one instance position.
+static uint32_t buildBVHRecursive(
+    std::vector<uint32_t>& instancePositions,
+    const std::vector<float3>& boundsMinByPosition,
+    const std::vector<float3>& boundsMaxByPosition,
+    uint32_t first,
+    uint32_t last,
+    uint32_t nextFree,
+    std::vector<VoxelInstanceBVHNodeGPU>& nodes
+)
+{
+    const uint32_t nodeIndex = nextFree++;
+    const uint32_t count = last - first;
+
+    if (count == 1)
+    {
+        const uint32_t position = instancePositions[first];
+        VoxelInstanceBVHNodeGPU node{};
+        node.boundsMin = float4(boundsMinByPosition[position], 0.0f);
+        node.boundsMax = float4(boundsMaxByPosition[position], 0.0f);
+        node.info = uint4(1u, 0u, position, 0u);
+        nodes[nodeIndex] = node;
+        return nextFree;
+    }
+
+    // Union AABB of this range.
+    float3 rangeMin(std::numeric_limits<float>::max());
+    float3 rangeMax(-std::numeric_limits<float>::max());
+    for (uint32_t i = first; i < last; ++i)
+    {
+        rangeMin = min(rangeMin, boundsMinByPosition[instancePositions[i]]);
+        rangeMax = max(rangeMax, boundsMaxByPosition[instancePositions[i]]);
+    }
+
+    VoxelInstanceBVHNodeGPU node{};
+    node.boundsMin = float4(rangeMin, 0.0f);
+    node.boundsMax = float4(rangeMax, 0.0f);
+    node.info = uint4(0u, 0u, 0u, 0u);
+
+    // Median split on the longest axis.
+    const float3 extent = rangeMax - rangeMin;
+    const uint32_t axis = (extent.x >= extent.y && extent.x >= extent.z) ? 0u :
+                          (extent.y >= extent.z) ? 1u : 2u;
+    const uint32_t median = first + count / 2;
+    std::nth_element(
+        instancePositions.begin() + first,
+        instancePositions.begin() + median,
+        instancePositions.begin() + last,
+        [axis, &boundsMinByPosition](uint32_t a, uint32_t b)
+        {
+            const float3& ca = boundsMinByPosition[a];
+            const float3& cb = boundsMinByPosition[b];
+            return axis == 0 ? ca.x < cb.x :
+                   axis == 1 ? ca.y < cb.y : ca.z < cb.z;
+        }
+    );
+
+    // Left child emitted first (node+1); right child follows the whole subtree.
+    nextFree = buildBVHRecursive(instancePositions, boundsMinByPosition, boundsMaxByPosition, first, median, nextFree, nodes);
+    const uint32_t rightStart = nextFree;
+    nextFree = buildBVHRecursive(instancePositions, boundsMinByPosition, boundsMaxByPosition, median, last, nextFree, nodes);
+
+    node.info.y = rightStart - nodeIndex;
+    nodes[nodeIndex] = node;
+    return nextFree;
+}
+
+void RayMarchingPass::buildInstanceBVH()
+{
+    mInstanceBVH.clear();
+
+    // Gather the *mInstances positions* of instances that participate in ray
+    // marching. The GPU instance buffer preserves mInstances order, so BVH
+    // leaves must reference those same positions for traceInstance().
+    std::vector<uint32_t> instancePositions;
+    std::vector<float3> boundsMinByPosition(mInstances.size(), float3(0.0f));
+    std::vector<float3> boundsMaxByPosition(mInstances.size(), float3(0.0f));
+    for (size_t i = 0; i < mInstances.size(); ++i)
+    {
+        const VoxelInstance& instance = mInstances[i];
+        if (!instance.enabled ||
+            instance.assetIndex >= mVoxelAssets.size() ||
+            !all(instance.worldBoundsMax - instance.worldBoundsMin > float3(0.0f)))
+            continue;
+        boundsMinByPosition[i] = instance.worldBoundsMin;
+        boundsMaxByPosition[i] = instance.worldBoundsMax;
+        instancePositions.push_back(static_cast<uint32_t>(i));
+    }
+
+    if (instancePositions.empty())
+    {
+        updateInstanceBVHBuffer();
+        return;
+    }
+
+    // Two nodes per instance in the worst case (one leaf plus shared interiors).
+    mInstanceBVH.resize(instancePositions.size() * 2u);
+    const uint32_t nodeCount = buildBVHRecursive(
+        instancePositions,
+        boundsMinByPosition,
+        boundsMaxByPosition,
+        0u,
+        static_cast<uint32_t>(instancePositions.size()),
+        0u,
+        mInstanceBVH
+    );
+    mInstanceBVH.resize(nodeCount);
+
+    updateInstanceBVHBuffer();
+}
+
+void RayMarchingPass::updateInstanceBVHBuffer()
+{
+    if (mInstanceBVH.empty())
+    {
+        mInstanceBVHBuffer = nullptr;
+        return;
+    }
+
+    const uint32_t nodeCount = static_cast<uint32_t>(mInstanceBVH.size());
+    if (!mInstanceBVHBuffer || mInstanceBVHBuffer->getElementCount() != nodeCount)
+    {
+        mInstanceBVHBuffer = mpDevice->createStructuredBuffer(
+            sizeof(VoxelInstanceBVHNodeGPU),
+            nodeCount,
+            ResourceBindFlags::ShaderResource,
+            MemoryType::DeviceLocal,
+            mInstanceBVH.data(),
+            false
+        );
+    }
+    else
+    {
+        mInstanceBVHBuffer->setBlob(
+            mInstanceBVH.data(),
+            0,
+            mInstanceBVH.size() * sizeof(VoxelInstanceBVHNodeGPU)
+        );
+    }
+}
+
+void RayMarchingPass::rebuildInstanceBVHIfDirty()
+{
+    if (!mInstanceBVHDirty)
+        return;
+    buildInstanceBVH();
+    mInstanceBVHDirty = false;
+}
+
 void RayMarchingPass::resetVoxelResources()
 {
     // The shader array size is compiled from mBufferCount. These resources and
@@ -332,6 +486,9 @@ void RayMarchingPass::resetVoxelResources()
     mVoxelAssets.clear();
     mBufferCount = 1;
     mInstanceBuffer = nullptr;
+    mInstanceBVH.clear();
+    mInstanceBVHBuffer = nullptr;
+    mInstanceBVHDirty = true;
     mSelectedVoxel = nullptr;
     mpSelectedVoxelStaging = nullptr;
     mSelectedHit = false;
@@ -350,6 +507,9 @@ void RayMarchingPass::resetInstancesToIdentity()
     mInstances.emplace_back();
     mInstanceEditIndex = 0;
     mInstanceBuffer = nullptr;
+    mInstanceBVH.clear();
+    mInstanceBVHBuffer = nullptr;
+    mInstanceBVHDirty = true;
     mSelectedHit = false;
     mSelectedGbOffset = 0xFFFFFFFF;
     mSelectedCellInt = int3(-1);
@@ -403,6 +563,7 @@ bool RayMarchingPass::loadSceneMeta(const std::filesystem::path& path)
     requestRecompile();
     mComplete = false;
     mOptionsChanged = true;
+    mInstanceBVHDirty = true;
     return true;
 }
 
@@ -818,6 +979,7 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mOptionsChanged = false;
     mFrameIndex = 0;
     selectedFile = 0;
+    mInstanceBVHDirty = true;
 
     Sampler::Desc samplerDesc;
     samplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point)
@@ -874,6 +1036,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     if (mInstances[mInstanceEditIndex].assetIndex < mVoxelAssets.size())
         gridData = mVoxelAssets[mInstances[mInstanceEditIndex].assetIndex].gridData;
     updateInstanceBuffer();
+    rebuildInstanceBVHIfDirty();
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
@@ -903,6 +1066,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mpFullScreenPass->addDefine("CHECK_COVERAGE", mCheckCoverage ? "1" : "0");
         mpFullScreenPass->addDefine("DEBUG", mDebug ? "1" : "0");
         mpFullScreenPass->addDefine("MAX_BOUNCE", std::to_string(mMaxBounce));
+        mpFullScreenPass->addDefine("USE_INSTANCE_BVH", mUseInstanceBVH ? "1" : "0");
 
         ref<EnvMap> pEnvMap = mpScene->getEnvMap();
         mpFullScreenPass->addDefine("USE_ENV_MAP", pEnvMap ? "1" : "0");
@@ -940,6 +1104,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         var["octreeBuffer"] = mOctreeBuffer;
         var["voxelAssets"] = mAssetBuffer;
         var["instances"] = mInstanceBuffer;
+        // USE_INSTANCE_BVH is compiled out when the checkbox is off, so the
+        // buffer and count are only bound while the macro is active (mirrors
+        // how USE_ENV_MAP gates the env-map sampler binding).
+        if (mUseInstanceBVH)
+            var["instanceBVH"] = mInstanceBVHBuffer;
         var["selectedVoxel"] = mSelectedVoxel;
 
         auto cb = var["CB"];
@@ -947,6 +1116,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["invVP"] = math::inverse(viewProjNoJitter);
         cb["instanceCount"] = static_cast<uint32_t>(mInstances.size());
         cb["assetCount"] = static_cast<uint32_t>(mVoxelAssets.size());
+        if (mUseInstanceBVH)
+            cb["instanceBVHNodeCount"] = static_cast<uint32_t>(mInstanceBVH.size());
         cb["shadowBiasWorld"] = mShadowBias100 / 100;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
@@ -1137,6 +1308,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Assets: " + std::to_string(mVoxelAssets.size()));
     widget.text("Instances: " + std::to_string(mInstances.size()));
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
+    if (widget.checkbox("Use Instance BVH Traversal", mUseInstanceBVH))
+        mOptionsChanged = true;
     if (widget.button("Add Instance") && mInstances.size() < 256)
     {
         VoxelInstance instance;
@@ -1155,6 +1328,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mInstances.push_back(instance);
         mInstanceEditIndex = static_cast<uint32_t>(mInstances.size() - 1);
         mOptionsChanged = true;
+        mInstanceBVHDirty = true;
     }
     if (mInstances.size() > 1 && widget.button("Remove Selected Instance"))
     {
@@ -1164,6 +1338,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             static_cast<uint32_t>(mInstances.size() - 1)
         );
         mOptionsChanged = true;
+        mInstanceBVHDirty = true;
     }
 
     mInstanceEditIndex = std::min<uint32_t>(
@@ -1202,6 +1377,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         {
             instance.assetIndex = editedAssetIndex;
             mOptionsChanged = true;
+            mInstanceBVHDirty = true;
         }
     }
 
@@ -1223,9 +1399,15 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Max Polygon Count: " + std::to_string(displayGrid.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(displayGrid.totalPolygonCount));
     if (widget.checkbox("Instance Enabled", instance.enabled))
+    {
         mOptionsChanged = true;
+        mInstanceBVHDirty = true;
+    }
     if (widget.matrix("Instance Transform (row-major)", instance.assetToWorld, -1000000.0f, 1000000.0f))
+    {
         mOptionsChanged = true;
+        mInstanceBVHDirty = true;
+    }
     widget.text("Editing Instance ID: " + std::to_string(instance.instanceId));
     if (editedAsset)
         widget.text("Editing Asset: " + editedAsset->assetId);

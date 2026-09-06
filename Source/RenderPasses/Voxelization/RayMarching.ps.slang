@@ -16,17 +16,31 @@ import Utils.Sampling.UniformSampleGenerator;
 #define RAY_MARCHING_BUFFER_COUNT 1
 #endif
 
+// Compile-time switch for the instance-level BVH traversal. The host injects
+// this via FullScreenPass::addDefine, driven by a UI checkbox (mUseInstanceBVH).
+// 1 = the BVH traversal is compiled in; 0 = it is compiled out and traversal
+// is always the linear scan. Changing it recompiles the pass shader.
+#ifndef USE_INSTANCE_BVH
+#define USE_INSTANCE_BVH 1
+#endif
+
 #define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
 static const float kSceneRayMax = 1e30f;
 static const float kSceneHitTieEpsilon = 1e-5f;
 static const uint kInvalidInstanceIndex = 0xffffffffu;
+// Worst-case instance BVH stack depth for a balanced median tree: the tree
+// over N instances has ⌈log2 N⌉ levels, plus a safety margin.
+static const uint kInstanceBVHMaxStack = 64u;
+// Safety margin for the near-to-far early-termination test.
+static const float kBVHPruneEpsilon = 1e-6f;
 
 StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
 StructuredBuffer<VoxelAssetData> voxelAssets;
 StructuredBuffer<VoxelInstanceData> instances;
+StructuredBuffer<InstanceBVHNode> instanceBVH;
 
 RWStructuredBuffer<float4> selectedVoxel;
 
@@ -36,6 +50,7 @@ cbuffer CB
     float4x4 invVP;
     uint instanceCount;
     uint assetCount;
+    uint instanceBVHNodeCount;
     float shadowBiasWorld;
     uint drawMode;
     uint frameIndex;
@@ -838,6 +853,23 @@ WorldHitResult traceInstance(
 // grouped when their ray depths differ only by a scale-aware merge tolerance.
 // A non-negative rejectOriginEventDistanceWorld consumes near-origin members
 // of the previous event without pre-skipping an entire LOD node.
+#if USE_INSTANCE_BVH
+SceneHitEvent traceSceneBVH(
+    float3 rayOriginW,
+    float3 rayDirectionW,
+    float rayTMin,
+    float rayTMax,
+    float coneTan,
+    float rejectOriginEventDistanceWorld
+);
+#endif
+
+void mergeCandidate(
+    inout SceneHitEvent event,
+    WorldHitResult candidate,
+    float3 directionW
+);
+
 SceneHitEvent traceScene(
     float3 rayOriginW,
     float3 rayDirectionW,
@@ -858,6 +890,11 @@ SceneHitEvent traceScene(
     if (all(directionW == float3(0)) || rayTMax < rayTMin)
         return event;
 
+#if USE_INSTANCE_BVH
+    if (instanceBVHNodeCount > 0)
+        return traceSceneBVH(rayOriginW, directionW, rayTMin, rayTMax, coneTan, rejectOriginEventDistanceWorld);
+#endif
+
     for (uint i = 0; i < instanceCount; ++i)
     {
         WorldHitResult candidate = traceInstance(
@@ -872,51 +909,188 @@ SceneHitEvent traceScene(
         if (!candidate.hit)
             continue;
 
-        float candidateMergeDistance = sceneHitMergeDistance(candidate, directionW);
-        float eventTolerance = max(event.mergeDistanceWorld, candidateMergeDistance);
-        bool startsCloserEvent = !event.hit ||
-            candidate.tWorld < event.tMinWorld - eventTolerance;
-        bool joinsCurrentEvent = event.hit && !startsCloserEvent &&
-            candidate.tWorld <= event.tMinWorld + eventTolerance;
-
-        if (!startsCloserEvent && !joinsCurrentEvent)
-            continue;
-
-        float candidateCoverage = 0.0f;
-        if (drawMode == uint(ABSDFDrawMode::Coverage))
-        {
-            TEBSDF candidateBSDF = loadGBuffer(candidate.localHit.gbIndex);
-            candidateCoverage = saturate(
-                candidateBSDF.calcCoverage(candidate.directionLocal, coverageBlend)
-            );
-        }
-
-        if (startsCloserEvent)
-        {
-            event.hit = true;
-            event.representative = candidate;
-            event.tMinWorld = candidate.tWorld;
-            event.tMaxWorld = candidate.tWorld;
-            event.mergeDistanceWorld = candidateMergeDistance;
-            event.unionCoverage = candidateCoverage;
-            event.memberCount = 1u;
-            continue;
-        }
-
-        event.tMinWorld = min(event.tMinWorld, candidate.tWorld);
-        event.tMaxWorld = max(event.tMaxWorld, candidate.tWorld);
-        event.mergeDistanceWorld = max(event.mergeDistanceWorld, candidateMergeDistance);
-        event.unionCoverage = max(event.unionCoverage, candidateCoverage);
-        event.memberCount++;
-
-        bool stableRepresentative = candidate.instanceId < event.representative.instanceId ||
-            (candidate.instanceId == event.representative.instanceId &&
-             candidate.instanceIndex < event.representative.instanceIndex);
-        if (stableRepresentative)
-            event.representative = candidate;
+        mergeCandidate(event, candidate, directionW);
     }
     return event;
 }
+
+// Merge a single traced instance candidate into the running scene event.
+// Shared by both the linear scan and the BVH traversal so the two paths keep
+// identical event semantics.
+void mergeCandidate(
+    inout SceneHitEvent event,
+    WorldHitResult candidate,
+    float3 directionW
+)
+{
+    if (!candidate.hit)
+        return;
+
+    float candidateMergeDistance = sceneHitMergeDistance(candidate, directionW);
+    float eventTolerance = max(event.mergeDistanceWorld, candidateMergeDistance);
+    bool startsCloserEvent = !event.hit ||
+        candidate.tWorld < event.tMinWorld - eventTolerance;
+    bool joinsCurrentEvent = event.hit && !startsCloserEvent &&
+        candidate.tWorld <= event.tMinWorld + eventTolerance;
+
+    if (!startsCloserEvent && !joinsCurrentEvent)
+        return;
+
+    float candidateCoverage = 0.0f;
+    if (drawMode == uint(ABSDFDrawMode::Coverage))
+    {
+        TEBSDF candidateBSDF = loadGBuffer(candidate.localHit.gbIndex);
+        candidateCoverage = saturate(
+            candidateBSDF.calcCoverage(candidate.directionLocal, coverageBlend)
+        );
+    }
+
+    if (startsCloserEvent)
+    {
+        event.hit = true;
+        event.representative = candidate;
+        event.tMinWorld = candidate.tWorld;
+        event.tMaxWorld = candidate.tWorld;
+        event.mergeDistanceWorld = candidateMergeDistance;
+        event.unionCoverage = candidateCoverage;
+        event.memberCount = 1u;
+        return;
+    }
+
+    event.tMinWorld = min(event.tMinWorld, candidate.tWorld);
+    event.tMaxWorld = max(event.tMaxWorld, candidate.tWorld);
+    event.mergeDistanceWorld = max(event.mergeDistanceWorld, candidateMergeDistance);
+    event.unionCoverage = max(event.unionCoverage, candidateCoverage);
+    event.memberCount++;
+
+    bool stableRepresentative = candidate.instanceId < event.representative.instanceId ||
+        (candidate.instanceId == event.representative.instanceId &&
+         candidate.instanceIndex < event.representative.instanceIndex);
+    if (stableRepresentative)
+        event.representative = candidate;
+}
+
+#if USE_INSTANCE_BVH
+// Traverse the instance-level BVH near-to-far. Nodes are pruned once their
+// AABB entry lies beyond the running event's merge window, so spatially distant
+// clusters of instances are skipped without ever tracing them.
+SceneHitEvent traceSceneBVH(
+    float3 rayOriginW,
+    float3 rayDirectionW,
+    float rayTMin,
+    float rayTMax,
+    float coneTan,
+    float rejectOriginEventDistanceWorld
+)
+{
+    SceneHitEvent event = {};
+    event.representative.instanceIndex = kInvalidInstanceIndex;
+    event.representative.instanceId = 0xffffffffu;
+    event.representative.tWorld = kSceneRayMax;
+    event.tMinWorld = kSceneRayMax;
+    event.tMaxWorld = -kSceneRayMax;
+
+    float3 directionW = normalizeSafe(rayDirectionW);
+    if (all(directionW == float3(0)) || rayTMax < rayTMin)
+        return event;
+
+    // Fixed-size stack. instanceBVHNodeCount is a CB-sized constant so this
+    // unrolls to a fully compile-time stack depth.
+    uint stack[kInstanceBVHMaxStack];
+    uint stackTop = 0;
+    stack[stackTop++] = 0u; // root
+
+    while (stackTop > 0)
+    {
+        const uint nodeIndex = stack[--stackTop];
+        InstanceBVHNode node = instanceBVH[nodeIndex];
+
+        float nodeEnterT = 0.0f;
+        float nodeExitT = 0.0f;
+        if (!intersectRayBounds(
+            node.boundsMin.xyz,
+            node.boundsMax.xyz,
+            rayOriginW,
+            directionW,
+            rayTMin,
+            rayTMax,
+            nodeEnterT,
+            nodeExitT
+        ))
+            continue;
+
+        // Prune this node: its box begins beyond the running event depth plus
+        // the accumulated merge tolerance, so any surface inside it lies beyond
+        // the event's accept window and cannot join. Only this node is skipped
+        // -- a plain stack does not guarantee global near-to-far order, so
+        // remaining entries may still be nearer and must still be visited.
+        // Assumes no *later* candidate needs a larger merge window than the
+        // accumulated max, i.e. instance voxel scales are comparable.
+        if (event.hit &&
+            nodeEnterT > event.tMinWorld + event.mergeDistanceWorld + kBVHPruneEpsilon)
+            continue;
+
+        if (node.info.x > 0u) // leaf
+        {
+            WorldHitResult candidate = traceInstance(
+                rayOriginW,
+                directionW,
+                rayTMin,
+                rayTMax,
+                coneTan,
+                node.info.z, // instance position (== index into instances[])
+                rejectOriginEventDistanceWorld
+            );
+            mergeCandidate(event, candidate, directionW);
+            continue;
+        }
+
+        // Interior: push both intersecting children so the nearer one is
+        // popped first.
+        const uint leftChild = nodeIndex + 1u;
+        const uint rightChild = nodeIndex + node.info.y;
+
+        float leftEnterT = 0.0f;
+        float rightEnterT = 0.0f;
+        float childExitT = 0.0f;
+        InstanceBVHNode leftNode = instanceBVH[leftChild];
+        InstanceBVHNode rightNode = instanceBVH[rightChild];
+
+        bool leftHit = intersectRayBounds(
+            leftNode.boundsMin.xyz, leftNode.boundsMax.xyz,
+            rayOriginW, directionW, rayTMin, rayTMax,
+            leftEnterT, childExitT);
+        bool rightHit = intersectRayBounds(
+            rightNode.boundsMin.xyz, rightNode.boundsMax.xyz,
+            rayOriginW, directionW, rayTMin, rayTMax,
+            rightEnterT, childExitT);
+
+        if (leftHit && rightHit)
+        {
+            if (leftEnterT <= rightEnterT)
+            {
+                stack[stackTop++] = rightChild;
+                stack[stackTop++] = leftChild;
+            }
+            else
+            {
+                stack[stackTop++] = leftChild;
+                stack[stackTop++] = rightChild;
+            }
+        }
+        else if (leftHit)
+        {
+            stack[stackTop++] = leftChild;
+        }
+        else if (rightHit)
+        {
+            stack[stackTop++] = rightChild;
+        }
+    }
+
+    return event;
+}
+#endif // USE_INSTANCE_BVH
 
 float calcTrasmissionVisibility(WorldHitResult hit, float3 directionWorld, RayCone cone)
 {

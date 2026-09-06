@@ -69,4 +69,17 @@ struct VoxelInstanceData
     uint assetIndex;
 };
 
+// BVH over instance world AABBs. Flat, depth-first encoding: an interior
+// node's left child is always node+1 and its right child is at
+// node + info.y. A leaf holds a single instance index (info.z). float4/uint4
+// fields keep the host/device layout explicit.
+struct InstanceBVHNode
+{
+    float4 boundsMin;  // xyz: AABB min (world)
+    float4 boundsMax;  // xyz: AABB max (world)
+    uint4  info;       // x: nPrimitives (0 = interior, 1 = leaf),
+                       // y: interior -> right child offset, leaf -> unused
+                       // z: leaf -> instance index, interior -> unused
+};
+
 END_NAMESPACE_FALCOR
