@@ -1,7 +1,6 @@
 #pragma once
 #include "../HostDeviceShared.slang"
 #include "Sampling.slang"
-#include "SphericalHarmonics.slang"
 
 #if !defined(HOST_CODE)
 #include "Random.slang"

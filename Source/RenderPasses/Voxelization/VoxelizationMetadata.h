@@ -1,8 +1,8 @@
 #pragma once
 
 // Text sidecar metadata shared by the CPU voxelizer, the GPU voxelization
-// pass, and RayMarchingPass.  The binary voxel data layout is intentionally
-// kept unchanged; metadata is stored next to <file>.bin as <file>.bin.meta.
+// pass, and RayMarchingPass. The binary voxel data layout is identified by
+// the metadata stored next to <file>.bin as <file>.bin.meta.
 
 #include <cstdint>
 #include <filesystem>
@@ -16,7 +16,7 @@ namespace VoxelizationMetadata
 {
 
 inline constexpr const char* kFormat = "FalcorVoxelization";
-inline constexpr uint32_t kCurrentVersion = 1;
+inline constexpr uint32_t kCurrentVersion = 2;
 inline constexpr const char* kSidecarSuffix = ".meta";
 
 struct Metadata
@@ -24,6 +24,8 @@ struct Metadata
     uint32_t version = kCurrentVersion;
     uint32_t maxDepth = 0;
     uint32_t generatedLodLevels = 0;
+    std::string projectionEncoding = "unknown";
+    uint32_t projectionResolution = 0;
     std::string lodMode = "unknown";
     std::string producer = "unknown";
     uint64_t totalNodes = 0;
@@ -99,6 +101,8 @@ inline bool write(const std::filesystem::path& binaryPath, Metadata metadata)
     out << "version=" << metadata.version << '\n';
     out << "maxDepth=" << metadata.maxDepth << '\n';
     out << "generatedLodLevels=" << metadata.generatedLodLevels << '\n';
+    out << "projectionEncoding=" << metadata.projectionEncoding << '\n';
+    out << "projectionResolution=" << metadata.projectionResolution << '\n';
     out << "lodMode=" << metadata.lodMode << '\n';
     out << "producer=" << metadata.producer << '\n';
     out << "totalNodes=" << metadata.totalNodes << '\n';
@@ -142,6 +146,8 @@ inline bool read(const std::filesystem::path& binaryPath, Metadata& metadata)
     bool hasVersion = false;
     bool hasMaxDepth = false;
     bool hasGeneratedLodLevels = false;
+    bool hasProjectionEncoding = false;
+    bool hasProjectionResolution = false;
 
     std::string line;
     while (std::getline(in, line))
@@ -173,6 +179,15 @@ inline bool read(const std::filesystem::path& binaryPath, Metadata& metadata)
         {
             hasGeneratedLodLevels = parseUint32(value, parsed.generatedLodLevels);
         }
+        else if (key == "projectionEncoding")
+        {
+            parsed.projectionEncoding = value;
+            hasProjectionEncoding = !value.empty();
+        }
+        else if (key == "projectionResolution")
+        {
+            hasProjectionResolution = parseUint32(value, parsed.projectionResolution);
+        }
         else if (key == "lodMode")
         {
             parsed.lodMode = value;
@@ -195,9 +210,10 @@ inline bool read(const std::filesystem::path& binaryPath, Metadata& metadata)
         // breaking older readers.
     }
 
-    if (!hasFormat || !hasVersion || !hasMaxDepth || !hasGeneratedLodLevels)
+    if (!hasFormat || !hasVersion || !hasMaxDepth || !hasGeneratedLodLevels ||
+        !hasProjectionEncoding || !hasProjectionResolution)
         return false;
-    if (parsed.version == 0 || parsed.version > kCurrentVersion)
+    if (parsed.version != kCurrentVersion)
         return false;
     if (parsed.binarySize != 0)
     {

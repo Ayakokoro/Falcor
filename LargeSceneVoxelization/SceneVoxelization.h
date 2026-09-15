@@ -4,7 +4,6 @@
 #include "VoxelData.h"
 #include "ABSDF.h"
 #include "Ellipsoid.h"
-#include "SphericalHarmonics.h"
 #include "Estimate.h"
 #include "TextureSampler.h"
 #include "PolygonGenerator.h"
@@ -28,7 +27,7 @@ enum class LODBuildMode {
 
 struct VoxelizationConfig {
     uint baseResolution = 512;     // N = 2^D
-    uint sampleFrequency = 1024;   // rays per Lebedev direction
+    uint sampleFrequency = 1024;   // rays per octahedral direction
 
     // Match Falcor's SceneBuilder::Flags::UseSpecGlossMaterials behavior.
     // FBX/GLTF materials use MetalRough by default; SpecGloss is opt-in.
@@ -313,16 +312,11 @@ public:
                 if (vd.isSolid()) {
                     vd.ellipsoid.fit(gen.polygonArrays[nodeIdx], range);
 
-                    SphericalFunc polyF = vd.polygonsProjAreaFunc;
-                    SphericalFunc primF = vd.primitiveProjAreaFunc;
-                    SphericalFunc totalF = vd.totalProjAreaFunc;
-
-                    Estimate(vd.ellipsoid, range, polyF, primF, totalF,
-                             gen.polygonArrays[nodeIdx], mConfig.sampleFrequency);
-
-                    vd.polygonsProjAreaFunc = polyF;
-                    vd.primitiveProjAreaFunc = primF;
-                    vd.totalProjAreaFunc = totalF;
+                    computeOctahedralProjectionAreas(
+                        vd,
+                        range,
+                        gen.polygonArrays[nodeIdx],
+                        mConfig.sampleFrequency);
                 }
 
 #endif
@@ -361,11 +355,12 @@ public:
                             rawNormal[li]    += childVd.ABSDF.lobes[li].normal * lobeArea;
                         }
 
-                        // SH: sum children coefficients (placeholder for full leaf iteration)
-                        for (int si = 0; si < EVEN_SH_COUNT; si++) {
-                            vd.polygonsProjAreaFunc.coefficients[si]  += childVd.polygonsProjAreaFunc.coefficients[si];
-                            vd.primitiveProjAreaFunc.coefficients[si] += childVd.primitiveProjAreaFunc.coefficients[si];
-                            vd.totalProjAreaFunc.coefficients[si]     += childVd.totalProjAreaFunc.coefficients[si];
+                        // Approximate LOD: sum the sampled projection-area
+                        // functions at corresponding octahedral texels.
+                        for (uint32_t i = 0; i < OCTA_COUNT; ++i) {
+                            vd.polygonsProjAreaFunc.coefficients[i]  += childVd.polygonsProjAreaFunc.coefficients[i];
+                            vd.primitiveProjAreaFunc.coefficients[i] += childVd.primitiveProjAreaFunc.coefficients[i];
+                            vd.totalProjAreaFunc.coefficients[i]     += childVd.totalProjAreaFunc.coefficients[i];
                         }
 
                         childBFS++;
@@ -669,6 +664,8 @@ private:
         VoxelizationMetadata::Metadata metadata;
         metadata.maxDepth = mMaxDepth;
         metadata.generatedLodLevels = mGeneratedLodLevels;
+        metadata.projectionEncoding = "octahedral";
+        metadata.projectionResolution = OCTA_RES;
         metadata.lodMode = mConfig.lodMode == LODBuildMode::Approximate
             ? "approximate" : "brute-force";
         metadata.producer = "LargeSceneVoxelization";
@@ -744,6 +741,8 @@ private:
         VoxelizationMetadata::Metadata metadata;
         metadata.maxDepth = mMaxDepth;
         metadata.generatedLodLevels = mGeneratedLodLevels;
+        metadata.projectionEncoding = "octahedral";
+        metadata.projectionResolution = OCTA_RES;
         metadata.lodMode = mConfig.lodMode == LODBuildMode::Approximate
             ? "approximate" : "brute-force";
         metadata.producer = "LargeSceneVoxelization";
@@ -803,10 +802,10 @@ private:
                         rawNormal[li]    += childVd.ABSDF.lobes[li].normal * lobeArea;
                     }
 
-                    for (int si = 0; si < EVEN_SH_COUNT; si++) {
-                        vd.polygonsProjAreaFunc.coefficients[si]  += childVd.polygonsProjAreaFunc.coefficients[si];
-                        vd.primitiveProjAreaFunc.coefficients[si] += childVd.primitiveProjAreaFunc.coefficients[si];
-                        vd.totalProjAreaFunc.coefficients[si]     += childVd.totalProjAreaFunc.coefficients[si];
+                    for (uint32_t i = 0; i < OCTA_COUNT; ++i) {
+                        vd.polygonsProjAreaFunc.coefficients[i]  += childVd.polygonsProjAreaFunc.coefficients[i];
+                        vd.primitiveProjAreaFunc.coefficients[i] += childVd.primitiveProjAreaFunc.coefficients[i];
+                        vd.totalProjAreaFunc.coefficients[i]     += childVd.totalProjAreaFunc.coefficients[i];
                     }
 
                     childBFS++;

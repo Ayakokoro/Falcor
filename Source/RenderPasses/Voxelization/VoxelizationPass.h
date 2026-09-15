@@ -35,14 +35,16 @@ public:
     // Find a node's gBuffer index by traversing the octree from root
     uint32_t findNodeByLODAndCell(int3 targetCellInt, uint32_t targetLOD);
 
-    // Validate SH fitting: compare ground truth (rasterization) vs SH reconstruction
+    // Validate exact projection areas against bilinear interpolation of the
+    // stored octahedral maps.
     // directions are in world space, normalized
     void validateProjection(RenderContext* pRenderContext, uint32_t lodLevel,
                             int3 cellInt, const std::vector<float3>& directions);
 
-    // Spherical function visualization: compute exact map + display sphere
-    void computeSphericalFuncMap(RenderContext* pRenderContext);
-    void displaySphericalFunc(RenderContext* pRenderContext, const RenderData& renderData);
+    // Octahedral projection-area visualization: compute exact map + display
+    // the selected direction-dependent function on a sphere.
+    void computeOctahedralMap(RenderContext* pRenderContext);
+    void displayOctahedralMap(RenderContext* pRenderContext, const RenderData& renderData);
 
     // Splitting approximation error visualization
     void computeSplittingError(RenderContext* pRenderContext);
@@ -56,8 +58,8 @@ protected:
     ref<ComputePass> mAnalyzePolygonPass;
     ref<ComputePass> mLoadMeshPass;
     ref<ComputePass> mValidationPass;
-    ref<ComputePass> mSphericalMapPass;
-    ref<FullScreenPass> mDisplaySphericalFuncPass;
+    ref<ComputePass> mOctahedralMapPass;
+    ref<FullScreenPass> mDisplayOctahedralMapPass;
     ref<ComputePass> mSplittingErrorPass;
     ref<FullScreenPass> mDisplaySplittingErrorPass;
 
@@ -73,7 +75,7 @@ protected:
     ref<Buffer> octreeBuffer;
     ref<Buffer> polygonRangeBuffer;
 
-    ref<Texture> mSphericalFuncMap;   // precomputed exact-value texture
+    ref<Texture> mOctahedralMap;   // precomputed exact-value octahedral map
     ref<Texture> mSplittingErrorMap;  // splitting error texture (RGBA: GT, Approx, Error, unused)
 
     PolygonBufferGroup polygonGroup;
@@ -97,17 +99,17 @@ protected:
     // voxelization deterministic before the UI has written this value.
     bool mLerpNormal = true;
 
-    // Spherical function visualization state
-    bool mShowSphericalFunc = false;
-    bool mSphericalFuncDirty = false;
-    uint32_t mSphericalFuncType = 0;     // 0=primitiveProjArea, 1=polygonsProjArea, 2=totalProjArea
-    uint32_t mVisualizationMode = 0;     // 0=SH Approx, 1=Exact, 2=Error
-    uint32_t mMapResolution = 256;       // precomputed map resolution (width, height=res/2)
+    // Octahedral projection-area visualization state.
+    bool mShowOctahedralMap = false;
+    bool mOctahedralMapDirty = false;
+    uint32_t mProjectionFunctionType = 0; // 0=primitive, 1=visible, 2=total
+    uint32_t mVisualizationMode = 0;      // 0=octa approx, 1=exact, 2=error
+    uint32_t mMapResolution = 256;        // exact debug map resolution (square)
     uint32_t mDisplayResolution = 512;   // output render target size
     uint32_t mPrimSampleFreq = 64;       // sample frequency for primitive area exact computation
     uint32_t mTargetGBufferIndex = 0xFFFFFFFF;  // cached gBuffer index for selected voxel
-    float mSphericalFuncValueMin = 0.0f;
-    float mSphericalFuncValueMax = 1.0f;
+    float mProjectionValueMin = 0.0f;
+    float mProjectionValueMax = 1.0f;
 
     // Splitting error visualization state
     bool mShowSplittingError = false;

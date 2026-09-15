@@ -50,7 +50,7 @@ struct AnalysisContext
     const TextureSet& textures;
 };
 
-enum class SphericalFunctionType : uint32_t
+enum class ProjectionAreaFunctionType : uint32_t
 {
     PrimitiveProjArea = 0,
     PolygonsProjArea = 1,
@@ -77,15 +77,16 @@ struct ProjectionValidation
 {
     float3 direction = float3(0);
     float exactVisibleArea = 0;
-    float shVisibleArea = 0;
+    float octaVisibleArea = 0;
     float exactTotalArea = 0;
-    float shTotalArea = 0;
+    float octaTotalArea = 0;
 };
 
 struct FunctionMap
 {
-    // Spherical maps use an upper-hemisphere unit disk: width == height ==
-    // spherical resolution, and pixels outside the disk remain zero.
+    // Diagnostic maps use an upper-hemisphere unit disk: width == height ==
+    // spherical resolution, and pixels outside the disk remain zero. The
+    // approximation is reconstructed from the octahedral projection table.
     uint32_t width = 0;
     uint32_t height = 0;
     std::vector<float> exact;
@@ -107,7 +108,7 @@ struct AnalysisResult
 
     VoxelData voxelData;
     std::vector<ProjectionValidation> projectionValidation;
-    std::array<FunctionMap, 3> sphericalMaps;
+    std::array<FunctionMap, 3> projectionMaps;
     Float4Map splittingError;
     Float4Map ndf;
 };

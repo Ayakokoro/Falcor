@@ -12,8 +12,8 @@ target_sources(Voxelization PRIVATE
     Math/Polygon.slang
     Math/Triangle.slang
     Math/Sampling.slang
-    Math/SphericalHarmonics.slang
-    Math/LebedevQuadrature.slang
+    Math/OctahedralMap.slang
+    Math/OctahedralProjection.slang
     Math/VoxelizationUtility.h
     Math/VoxelizationUtility.slang
     Math/Random.h
@@ -39,9 +39,9 @@ target_sources(Voxelization PRIVATE
     RayMarching.ps.slang
     DisplayNDF.ps.slang
 
-    ComputeSphericalFuncMap.cs.slang
+    ComputeOctahedralMap.cs.slang
     ComputeSplittingError.cs.slang
-    DisplaySphericalFunc.ps.slang
+    DisplayOctahedralMap.ps.slang
     DisplaySplittingError.ps.slang
 )
 target_copy_shaders(Voxelization RenderPasses/Voxelization)

@@ -392,9 +392,9 @@ struct TEBSDF
 #if !defined(HOST_CODE)
     DeltaBTDF delta; // GPU上，没有成员变量的结构体不占空间(人为添加无意义的成员变量也会被优化掉)
 #endif
-    SphericalFunc primitiveProjAreaFunc;
-    SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
-    SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
+    ProjectionAreaFunc primitiveProjAreaFunc;
+    ProjectionAreaFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
+    ProjectionAreaFunc totalProjAreaFunc;    // 所有多边形的总投影面积
     float area;
 
     float coverage; // 临时变量

@@ -29,9 +29,9 @@ void main(uint3 tid : SV_DispatchThreadID)
     DirectionValidation result;
     result.direction = dir;
     result.exactVisibleArea = range.calcVisibleProjAreaRaster(polygonBuffer, dir);
-    result.shVisibleArea = data.polygonsProjAreaFunc.calc(dir);
+    result.approxVisibleArea = data.polygonsProjAreaFunc.calc(dir);
     result.exactTotalArea = range.calcTotalProjArea(polygonBuffer, dir);
-    result.shTotalArea = data.totalProjAreaFunc.calc(dir);
+    result.approxTotalArea = data.totalProjAreaFunc.calc(dir);
 
     validationOutput[dirIdx] = result;
 }

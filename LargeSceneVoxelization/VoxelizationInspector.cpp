@@ -467,28 +467,28 @@ int main(int argc, char* argv[])
             std::ofstream csv(args.outputDir / "projection.csv");
             if (!csv)
                 throw std::runtime_error("cannot write projection.csv");
-            csv << "index,dx,dy,dz,exactVisible,shVisible,exactTotal,shTotal,visibleError,totalError\n";
+            csv << "index,dx,dy,dz,exactVisible,octaVisible,exactTotal,octaTotal,visibleError,totalError\n";
             csv << std::setprecision(9);
             for (size_t i = 0; i < result.projectionValidation.size(); ++i)
             {
                 const auto& value = result.projectionValidation[i];
                 csv << i << ',' << value.direction.x << ',' << value.direction.y << ','
                     << value.direction.z << ',' << value.exactVisibleArea << ','
-                    << value.shVisibleArea << ',' << value.exactTotalArea << ','
-                    << value.shTotalArea << ','
-                    << std::abs(value.exactVisibleArea - value.shVisibleArea) << ','
-                    << std::abs(value.exactTotalArea - value.shTotalArea) << '\n';
+                    << value.octaVisibleArea << ',' << value.exactTotalArea << ','
+                    << value.octaTotalArea << ','
+                    << std::abs(value.exactVisibleArea - value.octaVisibleArea) << ','
+                    << std::abs(value.exactTotalArea - value.octaTotalArea) << '\n';
             }
         }
 
         if (args.analysis.computeSphericalMaps)
         {
             writeFunctionMap(args.outputDir, "spherical_primitive",
-                result.sphericalMaps[static_cast<size_t>(VoxelizationCore::SphericalFunctionType::PrimitiveProjArea)]);
+                result.projectionMaps[static_cast<size_t>(VoxelizationCore::ProjectionAreaFunctionType::PrimitiveProjArea)]);
             writeFunctionMap(args.outputDir, "spherical_polygons",
-                result.sphericalMaps[static_cast<size_t>(VoxelizationCore::SphericalFunctionType::PolygonsProjArea)]);
+                result.projectionMaps[static_cast<size_t>(VoxelizationCore::ProjectionAreaFunctionType::PolygonsProjArea)]);
             writeFunctionMap(args.outputDir, "spherical_total",
-                result.sphericalMaps[static_cast<size_t>(VoxelizationCore::SphericalFunctionType::TotalProjArea)]);
+                result.projectionMaps[static_cast<size_t>(VoxelizationCore::ProjectionAreaFunctionType::TotalProjArea)]);
         }
 
         if (args.analysis.computeSplittingError)

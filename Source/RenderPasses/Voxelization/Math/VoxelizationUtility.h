@@ -3,7 +3,6 @@
 #include "Profiler.h"
 #include "Random.h"
 #include "Polygon.slang"
-#include "SphericalHarmonics.slang"
 #include "Sampling.slang"
 #include "Triangle.slang"
 #include <unordered_set>

@@ -680,51 +680,22 @@ bool upperHemisphereDiskDirection(uint32_t x, uint32_t y,
     return true;
 }
 
-float primitiveProjectionArea(const Ellipsoid& ellipsoid, const PolygonRange& range,
-                              const float3& direction, uint32_t sampleFrequency)
-{
-    const float3 cellMin = float3(range.cellInt);
-    const float3 cellCenter = cellMin + float3(0.5f);
-    const Basis2 basis = orthonormal_basis(safeNormalize(direction));
-    uint32_t hitCount = 0;
-    sampleFrequency = std::max(1u, sampleFrequency);
-
-    for (uint32_t sample = 0; sample < sampleFrequency; ++sample)
-    {
-        const SamplingRay ray = rayToVoxel(
-            Hammersley2D(sample, sampleFrequency), direction, basis, cellCenter);
-        const float3 to = ray.origin + 2.0f * ray.direction;
-        float2 inOut = clipAABB(cellMin, cellMin + float3(1), ray.origin, to);
-        if (inOut.x < 0)
-            continue;
-
-        const float3 delta = to - ray.origin;
-        const float3 fromLocal = ray.origin + inOut.x * delta - cellMin;
-        const float3 toLocal = ray.origin + inOut.y * delta - cellMin;
-        inOut = ellipsoid.clip(fromLocal, toLocal);
-        if (inOut.x >= 0)
-            ++hitCount;
-    }
-    return PROJECT_CIRCLE_AREA * static_cast<float>(hitCount) /
-        static_cast<float>(sampleFrequency);
-}
-
-const SphericalFunc& selectSphericalFunction(const VoxelData& voxelData,
-                                             SphericalFunctionType type)
+const OctahedralFunc& selectProjectionAreaFunction(
+    const VoxelData& voxelData, ProjectionAreaFunctionType type)
 {
     switch (type)
     {
-    case SphericalFunctionType::PrimitiveProjArea:
+    case ProjectionAreaFunctionType::PrimitiveProjArea:
         return voxelData.primitiveProjAreaFunc;
-    case SphericalFunctionType::PolygonsProjArea:
+    case ProjectionAreaFunctionType::PolygonsProjArea:
         return voxelData.polygonsProjAreaFunc;
-    case SphericalFunctionType::TotalProjArea:
+    case ProjectionAreaFunctionType::TotalProjArea:
     default:
         return voxelData.totalProjAreaFunc;
     }
 }
 
-void computeSphericalMap(FunctionMap& output, SphericalFunctionType type,
+void computeProjectionMap(FunctionMap& output, ProjectionAreaFunctionType type,
                          const VoxelData& voxelData, const PolygonRange& range,
                          const std::vector<Polygon>& polygons,
                          uint32_t resolution, uint32_t sampleFrequency)
@@ -737,7 +708,8 @@ void computeSphericalMap(FunctionMap& output, SphericalFunctionType type,
     output.approximation.assign(count, 0);
     output.error.assign(count, 0);
 
-    const SphericalFunc& approximation = selectSphericalFunction(voxelData, type);
+    const OctahedralFunc& approximation =
+        selectProjectionAreaFunction(voxelData, type);
     for (uint32_t y = 0; y < output.height; ++y)
     {
         for (uint32_t x = 0; x < output.width; ++x)
@@ -747,10 +719,10 @@ void computeSphericalMap(FunctionMap& output, SphericalFunctionType type,
                 continue; // output arrays were initialized to zero
 
             float exact = 0;
-            if (type == SphericalFunctionType::PrimitiveProjArea)
+            if (type == ProjectionAreaFunctionType::PrimitiveProjArea)
                 exact = primitiveProjectionArea(
                     voxelData.ellipsoid, range, direction, sampleFrequency);
-            else if (type == SphericalFunctionType::PolygonsProjArea)
+            else if (type == ProjectionAreaFunctionType::PolygonsProjArea)
                 exact = range.calcVisibleProjAreaRaster(polygons, direction);
             else
                 exact = range.calcTotalProjArea(polygons, direction);
@@ -1323,20 +1295,11 @@ AnalysisResult analyzeNode(const NodeData& node,
     {
         result.voxelData.ellipsoid.fit(node.polygons, range);
 
-        SphericalFunc polygonsFunc = result.voxelData.polygonsProjAreaFunc;
-        SphericalFunc primitiveFunc = result.voxelData.primitiveProjAreaFunc;
-        SphericalFunc totalFunc = result.voxelData.totalProjAreaFunc;
-        Estimate(
-            result.voxelData.ellipsoid,
+        computeOctahedralProjectionAreas(
+            result.voxelData,
             range,
-            polygonsFunc,
-            primitiveFunc,
-            totalFunc,
             node.polygons,
             std::max(1u, options.sampleFrequency));
-        result.voxelData.polygonsProjAreaFunc = polygonsFunc;
-        result.voxelData.primitiveProjAreaFunc = primitiveFunc;
-        result.voxelData.totalProjAreaFunc = totalFunc;
     }
 
     if (options.computeProjectionValidation)
@@ -1349,29 +1312,29 @@ AnalysisResult analyzeNode(const NodeData& node,
             validation.direction = direction;
             validation.exactVisibleArea = range.calcVisibleProjAreaRaster(
                 node.polygons, direction);
-            validation.shVisibleArea = result.voxelData.polygonsProjAreaFunc.eval(direction);
+            validation.octaVisibleArea = result.voxelData.polygonsProjAreaFunc.eval(direction);
             validation.exactTotalArea = range.calcTotalProjArea(
                 node.polygons, direction);
-            validation.shTotalArea = result.voxelData.totalProjAreaFunc.eval(direction);
+            validation.octaTotalArea = result.voxelData.totalProjAreaFunc.eval(direction);
             result.projectionValidation.push_back(validation);
         }
     }
 
     if (options.computeSphericalMaps)
     {
-        computeSphericalMap(
-            result.sphericalMaps[static_cast<size_t>(SphericalFunctionType::PrimitiveProjArea)],
-            SphericalFunctionType::PrimitiveProjArea,
+        computeProjectionMap(
+            result.projectionMaps[static_cast<size_t>(ProjectionAreaFunctionType::PrimitiveProjArea)],
+            ProjectionAreaFunctionType::PrimitiveProjArea,
             result.voxelData, range, node.polygons,
             options.sphericalResolution, options.sampleFrequency);
-        computeSphericalMap(
-            result.sphericalMaps[static_cast<size_t>(SphericalFunctionType::PolygonsProjArea)],
-            SphericalFunctionType::PolygonsProjArea,
+        computeProjectionMap(
+            result.projectionMaps[static_cast<size_t>(ProjectionAreaFunctionType::PolygonsProjArea)],
+            ProjectionAreaFunctionType::PolygonsProjArea,
             result.voxelData, range, node.polygons,
             options.sphericalResolution, options.sampleFrequency);
-        computeSphericalMap(
-            result.sphericalMaps[static_cast<size_t>(SphericalFunctionType::TotalProjArea)],
-            SphericalFunctionType::TotalProjArea,
+        computeProjectionMap(
+            result.projectionMaps[static_cast<size_t>(ProjectionAreaFunctionType::TotalProjArea)],
+            ProjectionAreaFunctionType::TotalProjArea,
             result.voxelData, range, node.polygons,
             options.sphericalResolution, options.sampleFrequency);
     }

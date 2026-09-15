@@ -1,7 +1,6 @@
 #include "RayMarchingPass.h"
 #include "VoxelizationMetadata.h"
 #include "Shading.slang"
-#include "Math/SphericalHarmonics.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/FalcorMath.h"
 #include <algorithm>
@@ -169,15 +168,14 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         for (uint32_t i = 0; i <= maxDepth; i++)
             totalNodes += nodeCounts[i];
 
-        // The binary layout is shared with the original voxelization pass.
-        // The optional text sidecar carries the producer/version and, for
-        // CPU-generated files, how many parent LOD levels contain data.
+        // CPU files use the Octahedral projection-area layout. Do not fall
+        // back to the old SH/legacy layout because VoxelData has changed.
         VoxelizationMetadata::Metadata metadata;
         const auto& binaryPath = filePaths[selectedFile];
-        std::error_code metadataEc;
-        const bool hasSidecar = std::filesystem::exists(
-            VoxelizationMetadata::sidecarPath(binaryPath), metadataEc);
         if (VoxelizationMetadata::read(binaryPath, metadata) &&
+            metadata.version == VoxelizationMetadata::kCurrentVersion &&
+            metadata.projectionEncoding == "octahedral" &&
+            metadata.projectionResolution == OCTA_RES &&
             metadata.maxDepth == maxDepth &&
             (metadata.totalNodes == 0 || metadata.totalNodes == totalNodes))
         {
@@ -191,32 +189,19 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
                       << ", lodMode=" << mVoxelLodMode
                       << ", availableLODLevels=" << mAvailableLODLevels << std::endl;
         }
-        else if (hasSidecar)
+        else
         {
-            // A present but invalid sidecar is not treated as a legacy file:
-            // conservatively expose leaves only instead of stopping at a
-            // possibly unavailable parent node.
             mHasVoxelMetadata = false;
             mVoxelFormatVersion = 0;
             mVoxelLodMode.clear();
             mVoxelProducer.clear();
             mAvailableLODLevels = 0;
-            std::cerr << "Voxel metadata is missing, invalid, or does not "
-                      << "match the binary: "
+            std::cerr << "Voxel metadata is missing, not Octahedral, or does "
+                      << "not match the binary: "
                       << VoxelizationMetadata::sidecarPath(binaryPath)
-                      << ". Falling back to leaf-only LOD." << std::endl;
-        }
-        else
-        {
-            // Files written before sidecar support generated data for every
-            // tree level, so preserve their historical behavior.
-            mHasVoxelMetadata = false;
-            mVoxelFormatVersion = 0;
-            mVoxelLodMode = "legacy";
-            mVoxelProducer = "legacy";
-            mAvailableLODLevels = maxDepth;
-            std::cout << "No voxel metadata sidecar; treating file as legacy "
-                      << "with all LOD levels available." << std::endl;
+                      << ". Refusing to load the voxel file." << std::endl;
+            f.close();
+            return;
         }
 
         std::cout << "Octree: maxDepth=" << maxDepth << ", totalNodes=" << totalNodes;
@@ -301,7 +286,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         // Split data across buffers to avoid D3D12 i32 offset overflow:
         // structured buffer byte offset = elementIndex * stride.
-        // For 388-byte TEBSDF, max safe index per buffer = (2^31-1)/388 ≈ 5,534,751.
+        // The maximum element count is derived from the current TEBSDF size.
         const uint32_t totalVoxels = gd.solidVoxelCount;
         const size_t maxElemsPerBuffer = kRayMarchingBufferByteLimit / sizeof(TEBSDF);
         FALCOR_CHECK(maxElemsPerBuffer > 0, "TEBSDF is larger than the ray-marching buffer limit.");

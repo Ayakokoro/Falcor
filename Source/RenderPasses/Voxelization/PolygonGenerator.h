@@ -3,7 +3,6 @@
 #include "Profiler.h"
 #include "Math/Polygon.slang"
 #include "Math/Triangle.slang"
-#include "Math/SphericalHarmonics.slang"
 #include <unordered_map>
 #include <mutex>
 #include <thread>

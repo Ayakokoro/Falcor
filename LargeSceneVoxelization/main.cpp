@@ -63,7 +63,7 @@ int main(int argc, char* argv[]) {
                   << "Options:\n"
                   << "  -o <path>         Output file (default: <input>_voxelized.bin)\n"
                   << "  -r <N>            Grid resolution (default: 512)\n"
-                  << "  -s <N>            Sample frequency per Lebedev direction (default: 1024)\n"
+                  << "  -s <N>            Ray samples per octahedral direction (default: 1024)\n"
                   << "  -l, --lod-levels <N>  Additional coarse LOD levels (0 = leaves only)\n"
                   << "  --lod-mode <mode>     approximate or brute-force (default: approximate)\n"
                   << "  --max-polygons-per-node <N>  Per-node cap; 0 = unlimited\n"
@@ -97,6 +97,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  Output:      " << outputPath << std::endl;
     std::cout << "  Resolution:  " << resolution << std::endl;
     std::cout << "  Samples:     " << sampleFrequency << std::endl;
+    std::cout << "  Octa SPP:    " << OCTA_SAMPLES_PER_TEXEL << std::endl;
     std::cout << "  LOD levels:  " << lodLevels << std::endl;
     std::cout << "  LOD mode:    "
               << (lodMode == LODBuildMode::Approximate ? "approximate" : "brute-force")

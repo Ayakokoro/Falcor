@@ -9,8 +9,8 @@ namespace
 const std::string kAnalyzePolygonProgramFile = "RenderPasses/Voxelization/AnalyzePolygon.cs.slang";
 const std::string kLoadMeshProgramFile = "RenderPasses/Voxelization/LoadMesh.cs.slang";
 const std::string kValidationProgramFile = "RenderPasses/Voxelization/ValidateProjection.cs.slang";
-const std::string kComputeSphericalFuncMapProgramFile = "RenderPasses/Voxelization/ComputeSphericalFuncMap.cs.slang";
-const std::string kDisplaySphericalFuncProgramFile = "RenderPasses/Voxelization/DisplaySphericalFunc.ps.slang";
+const std::string kComputeOctahedralMapProgramFile = "RenderPasses/Voxelization/ComputeOctahedralMap.cs.slang";
+const std::string kDisplayOctahedralMapProgramFile = "RenderPasses/Voxelization/DisplayOctahedralMap.ps.slang";
 const std::string kComputeSplittingErrorProgramFile = "RenderPasses/Voxelization/ComputeSplittingError.cs.slang";
 const std::string kDisplaySplittingErrorProgramFile = "RenderPasses/Voxelization/DisplaySplittingError.ps.slang";
 }; // namespace
@@ -42,7 +42,7 @@ RenderPassReflection VoxelizationPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
     uint2 outRes = uint2(1, 1);
-    if (mShowSphericalFunc)
+    if (mShowOctahedralMap)
         outRes = uint2(mDisplayResolution, mDisplayResolution);
     else if (mShowSplittingError)
         outRes = uint2(mSplittingBlockCount * mSplittingBlockSize, mSplittingBlockCount * mSplittingBlockSize);
@@ -81,7 +81,7 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
         mVoxelizationDirty = false;
     }
 
-    // ===== Phase 6: Validate SH fitting (on demand, independent of voxelization) =====
+    // ===== Phase 6: Validate octahedral projection maps (on demand) =====
     if (mValidationRequested && gBuffer && polygonGroup.size() > 0)
     {
         std::vector<float3> dirs;
@@ -99,17 +99,17 @@ void VoxelizationPass::execute(RenderContext* pRenderContext, const RenderData& 
         mValidationRequested = false;
     }
 
-    // ===== Phase 7: Spherical function visualization =====
-    if (mShowSphericalFunc && gBuffer && polygonGroup.size() > 0)
+    // ===== Phase 7: Octahedral projection-map visualization =====
+    if (mShowOctahedralMap && gBuffer && polygonGroup.size() > 0)
     {
-        if (mSphericalFuncDirty)
+        if (mOctahedralMapDirty)
         {
-            computeSphericalFuncMap(pRenderContext);
-            mSphericalFuncDirty = false;
+            computeOctahedralMap(pRenderContext);
+            mOctahedralMapDirty = false;
         }
 
-        if (mSphericalFuncMap)
-            displaySphericalFunc(pRenderContext, renderData);
+        if (mOctahedralMap)
+            displayOctahedralMap(pRenderContext, renderData);
     }
 
     // ===== Phase 8: Splitting error visualization =====
@@ -162,10 +162,10 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
     widget.checkbox("Multi-threaded Clip", mUseMultiThread);
     widget.checkbox("Debug Output", mEnableDebug);
 
-    // ---- SH Validation ----
+    // ---- Octahedral projection validation ----
     if (polygonGenerator.mOctreeMaxDepth > 0)
     {
-        widget.text("--- SH Validation ---");
+        widget.text("--- Projection Validation ---");
         int lodMax = (int)polygonGenerator.mOctreeMaxDepth;
         widget.var("LOD Level", (int&)mValidationLOD, 0, lodMax);
 
@@ -175,7 +175,7 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
         widget.var("CellInt Y", (int&)mValidationCellInt.y, 0, maxCoord);
         widget.var("CellInt Z", (int&)mValidationCellInt.z, 0, maxCoord);
 
-        if (widget.button("Validate SH"))
+        if (widget.button("Validate Projection"))
         {
             mValidationRequested = true;
             requestRecompile();
@@ -184,13 +184,13 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
 
     widget.checkbox("LerpNormal", mLerpNormal);
 
-    // ---- Spherical Function Visualization ----
+    // ---- Octahedral Projection Map Visualization ----
     if (polygonGenerator.mOctreeMaxDepth > 0)
     {
-        widget.text("--- Spherical Func Visualization ---");
+        widget.text("--- Octahedral Projection Map ---");
 
-        widget.checkbox("Show Sphere", mShowSphericalFunc);
-        if (mShowSphericalFunc)
+        widget.checkbox("Show Octahedral Map", mShowOctahedralMap);
+        if (mShowOctahedralMap)
         {
             // Voxel selection (shared with validation)
             int lodMax = (int)polygonGenerator.mOctreeMaxDepth;
@@ -208,11 +208,11 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
                 Gui::DropdownList list;
                 for (uint32_t i = 0; i < 3; i++)
                     list.push_back({i, funcTypes[i]});
-                widget.dropdown("Function", list, mSphericalFuncType);
+                widget.dropdown("Function", list, mProjectionFunctionType);
             }
 
             // Visualization mode
-            static const char* visModes[] = {"SH Approx", "Exact", "Error (|SH-Exact|)"};
+            static const char* visModes[] = {"Octa Approx", "Exact", "Error (|Approx-Exact|)"};
             {
                 Gui::DropdownList list;
                 for (uint32_t i = 0; i < 3; i++)
@@ -239,7 +239,7 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
             }
 
             // Primitive sample frequency (only for primitive mode)
-            if (mSphericalFuncType == 0)
+            if (mProjectionFunctionType == 0)
             {
                 static const uint primFreqs[] = {16, 32, 64, 128, 256};
                 {
@@ -250,12 +250,12 @@ void VoxelizationPass::renderUI(Gui::Widgets& widget)
                 }
             }
 
-            widget.var("Value Range Min", mSphericalFuncValueMin, 0.0f, 10.0f, 0.01f);
-            widget.var("Value Range Max", mSphericalFuncValueMax, 0.0f, 10.0f, 0.01f);
+            widget.var("Value Range Min", mProjectionValueMin, 0.0f, 10.0f, 0.01f);
+            widget.var("Value Range Max", mProjectionValueMax, 0.0f, 10.0f, 0.01f);
 
-            if (widget.button("Update Sphere"))
+            if (widget.button("Update Octahedral Map"))
             {
-                mSphericalFuncDirty = true;
+                mOctahedralMapDirty = true;
                 requestRecompile();
             }
         }
@@ -366,11 +366,11 @@ void VoxelizationPass::setScene(RenderContext* pRenderContext, const ref<Scene>&
     mAnalyzePolygonPass = nullptr;
     mLoadMeshPass = nullptr;
     mValidationPass = nullptr;
-    mSphericalMapPass = nullptr;
-    mDisplaySphericalFuncPass = nullptr;
+    mOctahedralMapPass = nullptr;
+    mDisplayOctahedralMapPass = nullptr;
     mSplittingErrorPass = nullptr;
     mDisplaySplittingErrorPass = nullptr;
-    mSphericalFuncMap = nullptr;
+    mOctahedralMap = nullptr;
     mSplittingErrorMap = nullptr;
     VoxelizationBase::UpdateVoxelGrid(mpScene, mMaxVoxelResolution);
 }
@@ -765,6 +765,8 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer)
     // The GPU pass uses hierarchical clipping and analyzes every populated
     // tree level in one dispatch sequence, so all levels are available.
     metadata.generatedLodLevels = polygonGenerator.mOctreeMaxDepth;
+    metadata.projectionEncoding = "octahedral";
+    metadata.projectionResolution = OCTA_RES;
     metadata.lodMode = "gpu-hierarchical";
     metadata.producer = "VoxelizationPass";
     metadata.totalNodes = polygonGenerator.gBuffer.size();
@@ -774,7 +776,7 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer)
 }
 
 // ========================================================================
-// SH Validation: find octree node + compare exact vs SH projection area
+// Projection validation: find octree node + compare exact and stored values
 // ========================================================================
 
 uint32_t VoxelizationPass::findNodeByLODAndCell(int3 targetCellInt, uint32_t targetLOD)
@@ -899,7 +901,7 @@ void VoxelizationPass::validateProjection(RenderContext* pRenderContext, uint32_
     const DirectionValidation* pResults =
         reinterpret_cast<const DirectionValidation*>(cpuBuffer->map());
 
-    std::cout << "\n===== SH Validation Results =====" << std::endl;
+    std::cout << "\n===== Projection Validation Results =====" << std::endl;
     std::cout << "LOD=" << lodLevel << " cellInt=" << ToString(cellInt)
               << " gbIndex=" << targetIdx << " batch=" << batchIdx << std::endl;
     std::cout << "DirectionCount=" << dirCount << std::endl;
@@ -909,18 +911,18 @@ void VoxelizationPass::validateProjection(RenderContext* pRenderContext, uint32_
     {
         const auto& r = pResults[i];
         float visError = (r.exactVisibleArea > 0)
-            ? abs(r.shVisibleArea - r.exactVisibleArea) / r.exactVisibleArea * 100.0f
+            ? abs(r.approxVisibleArea - r.exactVisibleArea) / r.exactVisibleArea * 100.0f
             : 0.0f;
         float totalError = (r.exactTotalArea > 0)
-            ? abs(r.shTotalArea - r.exactTotalArea) / r.exactTotalArea * 100.0f
+            ? abs(r.approxTotalArea - r.exactTotalArea) / r.exactTotalArea * 100.0f
             : 0.0f;
 
         std::cout << "Dir[" << i << "] (" << r.direction.x << "," << r.direction.y << "," << r.direction.z << ")"
                   << "  visExact=" << r.exactVisibleArea
-                  << " visSH=" << r.shVisibleArea
+                  << " visApprox=" << r.approxVisibleArea
                   << " err=" << visError << "%"
                   << "  |  totExact=" << r.exactTotalArea
-                  << " totSH=" << r.shTotalArea
+                  << " totApprox=" << r.approxTotalArea
                   << " err=" << totalError << "%"
                   << std::endl;
     }
@@ -932,20 +934,20 @@ void VoxelizationPass::validateProjection(RenderContext* pRenderContext, uint32_
 }
 
 // ========================================================================
-// Phase 7a: Compute spherical function exact map
+// Phase 7a: Compute exact octahedral projection-area map
 // ========================================================================
 
-void VoxelizationPass::computeSphericalFuncMap(RenderContext* pRenderContext)
+void VoxelizationPass::computeOctahedralMap(RenderContext* pRenderContext)
 {
-    Tools::Profiler::BeginSample("Compute Spherical Func Map");
+    Tools::Profiler::BeginSample("Compute Octahedral Projection Map");
 
     // Find the target node
     uint32_t targetIdx = findNodeByLODAndCell(mValidationCellInt, mValidationLOD);
     if (targetIdx == UINT32_MAX)
     {
-        std::cerr << "[SphericalFunc] Node not found at LOD=" << mValidationLOD
+        std::cerr << "[OctahedralMap] Node not found at LOD=" << mValidationLOD
                   << " cellInt=" << ToString(mValidationCellInt) << std::endl;
-        mSphericalFuncMap = nullptr;
+        mOctahedralMap = nullptr;
         return;
     }
 
@@ -963,98 +965,98 @@ void VoxelizationPass::computeSphericalFuncMap(RenderContext* pRenderContext)
     }
     if (batchIdx < 0)
     {
-        std::cerr << "[SphericalFunc] Node gbIndex=" << targetIdx << " not found in any batch" << std::endl;
-        mSphericalFuncMap = nullptr;
+        std::cerr << "[OctahedralMap] Node gbIndex=" << targetIdx << " not found in any batch" << std::endl;
+        mOctahedralMap = nullptr;
         return;
     }
 
     mTargetGBufferIndex = targetIdx;
 
     // Create or reuse the compute pass
-    if (!mSphericalMapPass)
+    if (!mOctahedralMapPass)
     {
         ProgramDesc desc;
         desc.addShaderModules(mpScene->getShaderModules());
-        desc.addShaderLibrary(kComputeSphericalFuncMapProgramFile).csEntry("main");
+        desc.addShaderLibrary(kComputeOctahedralMapProgramFile).csEntry("main");
         desc.addTypeConformances(mpScene->getTypeConformances());
-        mSphericalMapPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
+        mOctahedralMapPass = ComputePass::create(mpDevice, desc, mpScene->getSceneDefines(), true);
     }
 
-    uint2 mapRes(mMapResolution, mMapResolution / 2);  // hemisphere only needs half height
+    uint2 mapRes(mMapResolution, mMapResolution);  // square octahedral UV domain
 
-    // Create output texture for exact values
-    mSphericalFuncMap = mpDevice->createTexture2D(
+    // Create output texture for exact directional values in octahedral UVs.
+    mOctahedralMap = mpDevice->createTexture2D(
         mapRes.x, mapRes.y, ResourceFormat::R32Float, 1, 1, nullptr,
         ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess
     );
 
-    ShaderVar var = mSphericalMapPass->getRootVar();
+    ShaderVar var = mOctahedralMapPass->getRootVar();
     var["polygonBuffer"] = polygonGroup.get(batchIdx);
     var["polygonRangeBuffer"] = polygonRangeBuffer;
     var["gBuffer"] = gBuffer;
-    var["outputMap"] = mSphericalFuncMap;
+    var["outputMap"] = mOctahedralMap;
 
     auto cb = var["CB"];
     cb["targetGBufferIndex"] = targetIdx;
     cb["mapResolution"] = mapRes;
-    cb["functionType"] = mSphericalFuncType;
+    cb["functionType"] = mProjectionFunctionType;
     cb["sampleFrequency"] = mPrimSampleFreq;
 
-    mSphericalMapPass->execute(pRenderContext, uint3(mapRes.x, mapRes.y, 1));
+    mOctahedralMapPass->execute(pRenderContext, uint3(mapRes.x, mapRes.y, 1));
     pRenderContext->submit(true);
 
-    std::cout << "[SphericalFunc] Compute map: targetIdx=" << targetIdx
+    std::cout << "[OctahedralMap] Compute map: targetIdx=" << targetIdx
               << " batch=" << batchIdx
               << " resolution=" << mapRes.x << "x" << mapRes.y
-              << " funcType=" << mSphericalFuncType << std::endl;
+              << " funcType=" << mProjectionFunctionType << std::endl;
 
-    Tools::Profiler::EndSample("Compute Spherical Func Map");
+    Tools::Profiler::EndSample("Compute Octahedral Projection Map");
 }
 
 // ========================================================================
-// Phase 7b: Display spherical function sphere
+// Phase 7b: Display octahedral projection-area map on a sphere
 // ========================================================================
 
-void VoxelizationPass::displaySphericalFunc(RenderContext* pRenderContext, const RenderData& renderData)
+void VoxelizationPass::displayOctahedralMap(RenderContext* pRenderContext, const RenderData& renderData)
 {
-    Tools::Profiler::BeginSample("Display Spherical Func");
+    Tools::Profiler::BeginSample("Display Octahedral Projection Map");
 
-    if (!mDisplaySphericalFuncPass)
+    if (!mDisplayOctahedralMapPass)
     {
         ProgramDesc desc;
-        desc.addShaderLibrary(kDisplaySphericalFuncProgramFile).psEntry("main");
+        desc.addShaderLibrary(kDisplayOctahedralMapProgramFile).psEntry("main");
         desc.setShaderModel(ShaderModel::SM6_5);
-        mDisplaySphericalFuncPass = FullScreenPass::create(mpDevice, desc);
+        mDisplayOctahedralMapPass = FullScreenPass::create(mpDevice, desc);
     }
 
     // Get the output render target
     ref<Texture> pOutputColor = renderData.getTexture("dummy");
     if (!pOutputColor)
     {
-        Tools::Profiler::EndSample("Display Spherical Func");
+        Tools::Profiler::EndSample("Display Octahedral Projection Map");
         return;
     }
 
     pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0.2f, 0.2f, 0.2f, 1.0f));
 
-    ShaderVar var = mDisplaySphericalFuncPass->getRootVar();
+    ShaderVar var = mDisplayOctahedralMapPass->getRootVar();
     var["gBuffer"] = gBuffer;
-    var["exactMap"] = mSphericalFuncMap;
+    var["exactMap"] = mOctahedralMap;
     var["pointSampler"] = mpPointSampler;
 
     auto cb = var["CB"];
     cb["targetGBufferIndex"] = mTargetGBufferIndex;
-    cb["mapResolution"] = uint2(mMapResolution, mMapResolution / 2);
-    cb["functionType"] = mSphericalFuncType;
+    cb["mapResolution"] = uint2(mMapResolution, mMapResolution);
+    cb["functionType"] = mProjectionFunctionType;
     cb["visualizationMode"] = mVisualizationMode;
-    cb["valueMin"] = mSphericalFuncValueMin;
-    cb["valueMax"] = mSphericalFuncValueMax;
+    cb["valueMin"] = mProjectionValueMin;
+    cb["valueMax"] = mProjectionValueMax;
     cb["clearColor"] = float4(0.2f, 0.2f, 0.2f, 1.0f);
 
     mpFbo->attachColorTarget(pOutputColor, 0);
-    mDisplaySphericalFuncPass->execute(pRenderContext, mpFbo);
+    mDisplayOctahedralMapPass->execute(pRenderContext, mpFbo);
 
-    Tools::Profiler::EndSample("Display Spherical Func");
+    Tools::Profiler::EndSample("Display Octahedral Projection Map");
 }
 
 // ========================================================================

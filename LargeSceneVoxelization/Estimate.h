@@ -1,70 +1,129 @@
 #pragma once
-#include "Types.h"
-#include "Sampling.h"
-#include "Ellipsoid.h"
-#include "SphericalHarmonics.h"
-#include "LebedevQuadrature.h"
-#include "VoxelData.h"
-#include "Polygon.h"
 
-// AABB clip: returns (tEnter, tExit) for ray from->to against unit voxel [cellMin, cellMin+1]
+#include "Ellipsoid.h"
+#include "OctahedralMap.h"
+#include "Polygon.h"
+#include "Sampling.h"
+#include "Types.h"
+#include "VoxelData.h"
+
+// AABB clip: returns (tEnter, tExit) for ray from->to against the box.
 inline float2 clipAABB(const float3& cellMin, const float3& cellMax,
-                       const float3& from, const float3& to) {
-    float uIn = 0.0f, uOut = 1.0f;
-    float3 v = to - from;
-    for (int a = 0; a < 3; a++) {
-        if (std::abs(v[a]) < 1e-12f) {
-            if (from[a] < cellMin[a] || from[a] > cellMax[a])
-                return float2(-1, -1);
-        } else {
-            float t0 = (cellMin[a] - from[a]) / v[a];
-            float t1 = (cellMax[a] - from[a]) / v[a];
-            if (t0 > t1) std::swap(t0, t1);
+                       const float3& from, const float3& to)
+{
+    float uIn = 0.0f;
+    float uOut = 1.0f;
+    const float3 v = to - from;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        if (std::abs(v[axis]) < 1e-12f)
+        {
+            if (from[axis] < cellMin[axis] || from[axis] > cellMax[axis])
+                return float2(-1.0f);
+        }
+        else
+        {
+            float t0 = (cellMin[axis] - from[axis]) / v[axis];
+            float t1 = (cellMax[axis] - from[axis]) / v[axis];
+            if (t0 > t1)
+                std::swap(t0, t1);
             uIn = std::max(uIn, t0);
             uOut = std::min(uOut, t1);
-            if (uIn > uOut) return float2(-1, -1);
+            if (uIn > uOut)
+                return float2(-1.0f);
         }
     }
     return float2(uIn, uOut);
 }
 
-// CPU port of AnalyzePolygon.cs.slang:Estimate()
-// Performs Lebedev quadrature to estimate projected area SH functions
-inline void Estimate(Ellipsoid& e, PolygonRange& range,
-                     SphericalFunc& polygonFunc,
-                     SphericalFunc& primitiveFunc,
-                     SphericalFunc& totalFunc,
-                     const std::vector<Polygon>& polygonBuffer,
-                     uint sampleFrequency) {
-    float3 cellMin = float3(range.cellInt);
-    float3 cellCenter = cellMin + float3(0.5f);
+// Estimate the ellipsoid's projected area for one direction. This is the
+// same Monte Carlo estimator that was previously used while accumulating SH,
+// but it now returns one actual function value for the octahedral table.
+inline float primitiveProjectionArea(const Ellipsoid& ellipsoid,
+                                     const PolygonRange& range,
+                                     const float3& direction,
+                                     uint32_t sampleFrequency)
+{
+    const float3 cellMin = float3(range.cellInt);
+    const float3 cellCenter = cellMin + float3(0.5f);
+    const Basis2 basis = orthonormal_basis(safeNormalize(direction));
+    uint32_t hitCount = 0;
+    sampleFrequency = std::max(1u, sampleFrequency);
 
-    for (uint i = 0; i < LEBEDEV_DIRECTION_COUNT; i += 2) {
-        const LebedevSample& sample = LebedevSamples[i];
-        float3 direction = sample.direction;
-        Basis2 basis = orthonormal_basis(direction);
+    for (uint32_t sample = 0; sample < sampleFrequency; ++sample)
+    {
+        const SamplingRay ray = rayToVoxel(
+            Hammersley2D(sample, sampleFrequency), direction, basis, cellCenter);
+        const float3 to = ray.origin + 2.0f * ray.direction;
+        float2 inOut = clipAABB(cellMin, cellMin + float3(1.0f), ray.origin, to);
+        if (inOut.x < 0.0f)
+            continue;
 
-        uint hitCount = 0;
-        for (uint j = 0; j < sampleFrequency; j++) {
-            SamplingRay ray = rayToVoxel(Hammersley2D(j, sampleFrequency), direction, basis, cellCenter);
-            float3 to = ray.origin + 2.0f * ray.direction;
-            float2 inOut = clipAABB(cellMin, cellMin + float3(1.0f), ray.origin, to);
-            if (inOut.x >= 0) {
-                float3 v = to - ray.origin;
-                float3 from = ray.origin + inOut.x * v - cellMin;
-                float3 tto  = ray.origin + inOut.y * v - cellMin;
-                inOut = e.clip(from, tto);
-                if (inOut.x >= 0) hitCount++;
+        const float3 delta = to - ray.origin;
+        const float3 fromLocal = ray.origin + inOut.x * delta - cellMin;
+        const float3 toLocal = ray.origin + inOut.y * delta - cellMin;
+        inOut = ellipsoid.clip(fromLocal, toLocal);
+        if (inOut.x >= 0.0f)
+            ++hitCount;
+    }
+
+    return PROJECT_CIRCLE_AREA * static_cast<float>(hitCount) /
+        static_cast<float>(sampleFrequency);
+}
+
+// Fill three direction-dependent projection-area functions. Each texel is
+// supersampled inside its octahedral cell and stores the average area; no
+// Lebedev weight or SH basis evaluation is involved.
+inline void computeOctahedralProjectionAreas(
+    VoxelData& voxelData,
+    const PolygonRange& range,
+    const std::vector<Polygon>& polygons,
+    uint32_t sampleFrequency)
+{
+    voxelData.primitiveProjAreaFunc.init();
+    voxelData.polygonsProjAreaFunc.init();
+    voxelData.totalProjAreaFunc.init();
+
+    const uint32_t frequency = std::max(1u, sampleFrequency);
+    constexpr uint32_t samplesPerTexel = OCTA_SAMPLES_PER_TEXEL;
+    static_assert(samplesPerTexel > 0);
+
+    for (uint32_t y = 0; y < OCTA_RES; ++y)
+    {
+        for (uint32_t x = 0; x < OCTA_RES; ++x)
+        {
+            const uint32_t index = y * OCTA_RES + x;
+            float primitiveArea = 0.0f;
+            float visibleArea = 0.0f;
+            float totalArea = 0.0f;
+
+            for (uint32_t sample = 0; sample < samplesPerTexel; ++sample)
+            {
+                // Hammersley2D provides deterministic sub-texel directions.
+                // The same direction set is used for all three functions so
+                // their ratios remain stable.
+                const float2 localUV = Hammersley2D(sample, samplesPerTexel);
+                const float2 uv(
+                    (static_cast<float>(x) + localUV.x) /
+                        static_cast<float>(OCTA_RES),
+                    (static_cast<float>(y) + localUV.y) /
+                        static_cast<float>(OCTA_RES));
+                const float3 direction = octahedralDecode(uv);
+
+                primitiveArea += primitiveProjectionArea(
+                    voxelData.ellipsoid, range, direction, frequency);
+                visibleArea += range.calcVisibleProjAreaRaster(
+                    polygons, direction);
+                totalArea += range.calcTotalProjArea(polygons, direction);
             }
+
+            const float inverseSampleCount = 1.0f / float(samplesPerTexel);
+            voxelData.primitiveProjAreaFunc.coefficients[index] =
+                primitiveArea * inverseSampleCount;
+            voxelData.polygonsProjAreaFunc.coefficients[index] =
+                visibleArea * inverseSampleCount;
+            voxelData.totalProjAreaFunc.coefficients[index] =
+                totalArea * inverseSampleCount;
         }
-
-        float weight = 8.0f * M_PI_F * sample.weight;
-        float primitiveProjArea = PROJECT_CIRCLE_AREA * (float)hitCount / (float)sampleFrequency;
-        primitiveFunc.accumulate(weight * primitiveProjArea, direction);
-
-        float totalProjArea = range.calcTotalProjArea(polygonBuffer, direction);
-        float visibleProjArea = range.calcVisibleProjAreaRaster(polygonBuffer, direction);
-        polygonFunc.accumulate(weight * visibleProjArea, direction);
-        totalFunc.accumulate(weight * totalProjArea, direction);
     }
 }

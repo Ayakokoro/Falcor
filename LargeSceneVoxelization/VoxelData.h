@@ -1,16 +1,16 @@
 #pragma once
 #include "ABSDF.h"
 #include "Ellipsoid.h"
-#include "SphericalHarmonics.h"
+#include "OctahedralMap.h"
 
 #define PROJECT_CIRCLE_AREA 2.35619449f
 
 struct VoxelData {
     ABSDF ABSDF;
     Ellipsoid ellipsoid;
-    SphericalFunc primitiveProjAreaFunc;
-    SphericalFunc polygonsProjAreaFunc;
-    SphericalFunc totalProjAreaFunc;
+    OctahedralFunc primitiveProjAreaFunc;
+    OctahedralFunc polygonsProjAreaFunc;
+    OctahedralFunc totalProjAreaFunc;
 
     void init() {
         ABSDF.init();

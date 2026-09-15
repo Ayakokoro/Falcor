@@ -3,18 +3,18 @@
 #include "Voxel/ABSDF.slang"
 #include "Math/Ellipsoid.slang"
 #include "Math/Triangle.slang"
-#include "Math/SphericalHarmonics.slang"
+#include "Math/OctahedralMap.slang"
 BEGIN_NAMESPACE_FALCOR
 
-typedef EvenSphericalHarmonics SphericalFunc;
+typedef OctahedralFunc ProjectionAreaFunc;
 
 struct VoxelData
 {
     ABSDF ABSDF;
     Ellipsoid ellipsoid;
-    SphericalFunc primitiveProjAreaFunc;
-    SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
-    SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
+    ProjectionAreaFunc primitiveProjAreaFunc;
+    ProjectionAreaFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
+    ProjectionAreaFunc totalProjAreaFunc;    // 所有多边形的总投影面积
 
     MUTATING
     void init()
@@ -32,9 +32,9 @@ struct DirectionValidation
 {
     float3 direction;
     float exactVisibleArea; // ground truth visible projection area (rasterization)
-    float shVisibleArea;    // SH reconstruction from polygonsProjAreaFunc
+    float approxVisibleArea; // bilinear interpolation of polygonsProjAreaFunc
     float exactTotalArea;   // ground truth total projection area (no occlusion)
-    float shTotalArea;      // SH reconstruction from totalProjAreaFunc
+    float approxTotalArea;  // bilinear interpolation of totalProjAreaFunc
 };
 
 struct OctreeNode

@@ -1,4 +1,4 @@
-#include "Math/LebedevQuadrature.slang"
+#include "Math/OctahedralProjection.slang"
 #include "Math/Polygon.slang"
 #include "Math/Triangle.slang"
 #include "Voxel/VoxelGrid.slang"
@@ -32,47 +32,44 @@ cbuffer CB
     uint sampleFrequency;
 }
 
-void Estimate(
+void estimateOctahedralProjectionAreas(
     Ellipsoid e,
     PolygonRange range,
-    inout SphericalFunc polygonFunc,
-    inout SphericalFunc primitiveFunc,
-    inout SphericalFunc totalFunc
+    inout ProjectionAreaFunc polygonFunc,
+    inout ProjectionAreaFunc primitiveFunc,
+    inout ProjectionAreaFunc totalFunc,
+    uint sampleFrequency
 )
 {
-    float3 cellMin = range.cellInt;
-    float3 cellCenter = cellMin + 0.5f;
-    for (uint i = 0; i < LEBEDEV_DIRECTION_COUNT; i += 2)
+    polygonFunc.init();
+    primitiveFunc.init();
+    totalFunc.init();
+
+    for (uint y = 0; y < OCTA_RES; ++y)
     {
-        LebedevSample sample = LebedevSamples[i];
-        float3 direction = sample.direction;
-        Basis2 basis = orthonormal_basis(direction);
-        uint hitCount = 0;
-        for (uint j = 0; j < sampleFrequency; j++)
+        for (uint x = 0; x < OCTA_RES; ++x)
         {
-            SamplingRay ray = rayToVoxel(Hammersley2D(j, sampleFrequency), direction, basis, cellCenter);
-            float3 from = ray.origin;
-            float3 to = from + 2 * ray.direction;
-            float2 inOut = clip(cellMin, cellMin + 1.f, from, to);
-            if (inOut.x >= 0)
+            uint index = y * OCTA_RES + x;
+            float primitiveArea = 0.0f;
+            float visibleArea = 0.0f;
+            float totalArea = 0.0f;
+
+            [unroll]
+            for (uint sample = 0; sample < OCTA_SAMPLES_PER_TEXEL; ++sample)
             {
-                float3 v = to - from;
-                to = from + inOut.y * v - cellMin;
-                from = from + inOut.x * v - cellMin;
-                inOut = e.clip(from, to);
-                if (inOut.x >= 0)
-                    hitCount++;
+                float3 direction = octahedralTexelSampleDirection(uint2(x, y), sample);
+
+                primitiveArea += estimatePrimitiveProjectionArea(
+                    e, range, direction, sampleFrequency);
+                visibleArea += range.calcVisibleProjAreaRaster(polygonBuffer, direction);
+                totalArea += range.calcTotalProjArea(polygonBuffer, direction);
             }
+
+            float invSampleCount = 1.0f / float(OCTA_SAMPLES_PER_TEXEL);
+            primitiveFunc.coefficients[index] = primitiveArea * invSampleCount;
+            polygonFunc.coefficients[index] = visibleArea * invSampleCount;
+            totalFunc.coefficients[index] = totalArea * invSampleCount;
         }
-
-        float weight = 8 * PI * sample.weight;
-        float primitiveProjArea = PROJECT_CIRCLE_AREA * hitCount / (float)sampleFrequency;
-        primitiveFunc.accumulate(weight * primitiveProjArea, direction);
-
-        float totalProjArea = range.calcTotalProjArea(polygonBuffer, direction);
-        float visibleProjArea = range.calcVisibleProjAreaRaster(polygonBuffer, direction);
-        polygonFunc.accumulate(weight * visibleProjArea, direction);
-        totalFunc.accumulate(weight * totalProjArea, direction);
     }
 }
 
@@ -151,7 +148,8 @@ void calc(uint offset)
     VoxelData data = gBuffer[index];
     PolygonRange range = polygonRangeBuffer[index];
 
-    // Each node independently: sample textures, fit ellipsoid, estimate SH
+    // Each node independently: sample textures, fit ellipsoid, and fill the
+    // filtered octahedral projection-area maps.
     // Same path for all levels (root, internal, leaf)
     for (uint i = range.localHead; i < range.localHead + range.count; i++)
     {
@@ -165,11 +163,12 @@ void calc(uint offset)
 
     data.ellipsoid.fit(polygonBuffer, range);
 
-    SphericalFunc polyF = data.polygonsProjAreaFunc;
-    SphericalFunc primF = data.primitiveProjAreaFunc;
-    SphericalFunc totalF = data.totalProjAreaFunc;
+    ProjectionAreaFunc polyF = data.polygonsProjAreaFunc;
+    ProjectionAreaFunc primF = data.primitiveProjAreaFunc;
+    ProjectionAreaFunc totalF = data.totalProjAreaFunc;
 
-    Estimate(data.ellipsoid, range, polyF, primF, totalF);
+    estimateOctahedralProjectionAreas(
+        data.ellipsoid, range, polyF, primF, totalF, sampleFrequency);
 
     data.polygonsProjAreaFunc = polyF;
     data.primitiveProjAreaFunc = primF;
