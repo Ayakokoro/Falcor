@@ -475,6 +475,19 @@ struct TEBSDF
         return saturate(polygonsProjArea / totalProjArea);
     }
 
+    float calcCorrelationVisibility(float3 l, float3 v)
+    {
+        float Li = calcLambda(l);
+        float Lo = calcLambda(v);
+        return (1.0f + Lo) / (1.0f + Li + Lo);
+
+        // float polygonsProjAreaFromL = polygonsProjAreaFunc.calc(l);
+        // float polygonsProjAreaFromV = polygonsProjAreaFunc.calc(v);
+
+        // return min(1.0f, dot(l,v) * polygonsProjAreaFromL / max(1e-6f, polygonsProjAreaFromV));
+    }
+
+
     // Λ(ω) = (TPA(ω) - VPA(ω)) / VPA(ω)，Heitz 高度相关 Smith 的阴影因子
     float calcLambda(float3 direction)
     {
@@ -508,7 +521,7 @@ struct TEBSDF
     {
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
-        return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
+        return coverage * surface.eval(l, v, h) * calcCorrelationVisibility(l, v);
     }
 
     float evalPdf(float3 l, float3 v, float3 h)
