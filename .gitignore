@@ -22,6 +22,8 @@
 /CMakeUserPresets.json
 /.workbuddy/
 
+/Scene/
+
 # File types.
 *.user
 *.suo
