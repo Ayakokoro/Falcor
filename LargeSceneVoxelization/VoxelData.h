@@ -11,12 +11,16 @@ struct VoxelData {
     SphericalFunc primitiveProjAreaFunc;
     SphericalFunc polygonsProjAreaFunc;
     SphericalFunc totalProjAreaFunc;
+    // Per-voxel base visibility correlation. Runtime lifts this scalar to a
+    // direction-pair value, preserving c(w, w) = 1.
+    float visibilityCorrelation = 0.0f;
 
     void init() {
         ABSDF.init();
         primitiveProjAreaFunc.init();
         polygonsProjAreaFunc.init();
         totalProjAreaFunc.init();
+        visibilityCorrelation = 0.0f;
     }
 
     bool isSolid() const { return ABSDF.area > 0; }

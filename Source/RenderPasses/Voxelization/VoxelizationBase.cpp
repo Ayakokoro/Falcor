@@ -11,7 +11,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
 uint3 VoxelizationBase::MinFactor = uint3(1, 1, 1);
 bool VoxelizationBase::FileUpdated = true;
 bool VoxelizationBase::LightChanged = true;
-std::string VoxelizationBase::ResourceFolder = "D:/syc/Falcor/resource/";
+std::string VoxelizationBase::ResourceFolder = "E:/syc/Falcor/resource/";
 GridData VoxelizationBase::GlobalGridData = {};
 
 std::random_device rd;

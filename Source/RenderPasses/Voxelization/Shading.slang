@@ -418,6 +418,7 @@ struct TEBSDF
     SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
     SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
     float area;
+    float visibilityCorrelation;
 
     float coverage; // 临时变量
 
@@ -426,6 +427,7 @@ struct TEBSDF
     void init(VoxelData data)
     {
         area = data.ABSDF.area;
+        visibilityCorrelation = saturate(data.visibilityCorrelation);
         if (area > 0)
         {
             primitiveProjAreaFunc = data.primitiveProjAreaFunc;
@@ -477,14 +479,23 @@ struct TEBSDF
 
     float calcCorrelationVisibility(float3 l, float3 v)
     {
+#if !CHECK_VISIBILITY
+        return 1.f;
+#endif
         float Li = calcLambda(l);
         float Lo = calcLambda(v);
-        return (1.0f + Lo) / (1.0f + Li + Lo);
 
-        // float polygonsProjAreaFromL = polygonsProjAreaFunc.calc(l);
-        // float polygonsProjAreaFromV = polygonsProjAreaFunc.calc(v);
+        // A single stored scalar represents the correlation floor for widely
+        // separated directions. The fixed angular lift restores the exact
+        // identity V_i == V_o when l == v, for which c must be one.
+        float angular = saturate(0.5f * (1.0f + dot(l, v)));
+        float angular2 = angular * angular;
+        float angularCorrelation = angular2 * angular2;
+        float c = lerp(saturate(visibilityCorrelation), 1.0f, angularCorrelation);
+        c = 1;
 
-        // return min(1.0f, dot(l,v) * polygonsProjAreaFromL / max(1e-6f, polygonsProjAreaFromV));
+        float denominator = 1.0f + Li + Lo - c * min(Li, Lo);
+        return saturate((1.0f + Lo) / max(denominator, 1e-6f));
     }
 
 
@@ -498,15 +509,10 @@ struct TEBSDF
         return max(0, (tpa - vpa) / vpa);
     }
 
-    // 双向可见性（视线受光率）：V_vis(ωi, ωo) = (1 + Λ(ωo)) / (1 + Λ(ωi) + Λ(ωo))
+    // 双向可见性（视线受光率）：共享 calcCorrelationVisibility 的角度恢复模型。
     float calcVisibility(float3 wi, float3 wo)
     {
-#if !CHECK_VISIBILITY
-        return 1.f;
-#endif
-        float Li = calcLambda(wi);
-        float Lo = calcLambda(wo);
-        return (1.0f + Lo) / (1.0f + Li + Lo);
+        return calcCorrelationVisibility(wi, wo);
     }
 
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)

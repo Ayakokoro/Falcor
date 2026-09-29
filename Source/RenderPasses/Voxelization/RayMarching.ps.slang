@@ -38,6 +38,7 @@ cbuffer CB
     uint2 pixelCount;
     float4x4 invVP;
     float shadowBias;
+    float shadowNormalOffsetVoxels; // Additional shadow origin offset along the main normal, in LOD-0 cells.
     uint drawMode;
     uint frameIndex;
     float minPdf;
@@ -105,7 +106,7 @@ float maxRoughness(uint gbIndex)
     return r;
 }
 
-HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
+HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize, float maxTravelDistance)
 {
     // Compute node-local coordinates for ellipsoid intersection.
     // Ellipsoid is defined in node-local [0,1]³ space (fitted over the entire node),
@@ -124,6 +125,12 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     if (nodeDir.x != 0 && t.x < tMin) tMin = t.x;
     if (nodeDir.y != 0 && t.y < tMin) tMin = t.y;
     if (nodeDir.z != 0 && t.z < tMin) tMin = t.z;
+    if (maxTravelDistance >= 0.0f)
+    {
+        tMin = min(tMin, maxTravelDistance);
+        if (tMin <= 0.0f)
+            return { false, cellInt, cell, 0, nodeSize, 0.0f };
+    }
     float3 to = localOrigin + tMin * nodeDir;
 
     float2 inOut = ellipsoid.clip(localOrigin, to);
@@ -137,13 +144,15 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     return result;
 }
 
-HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
+HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize, float maxTravelDistance)
 {
+    if (maxTravelDistance == 0.0f)
+        return { false, cellInt, cell, 0, nodeSize, 0.0f };
 #if !CHECK_ELLIPSOID
     return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
-    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
+    HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize, maxTravelDistance);
     if (hit.hit)
         return hit;
 #endif
@@ -163,7 +172,7 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 // ellipsoid intersection tests, and ignoreNodeSize pre-skip from the original
 // parameterized stack-based traversal.
 // from: starting point in LOD-0 cell space
-HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance, int fixedLod)
+HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ignoreNodeSize, RayCone cone, float initialDistance, int fixedLod, bool preciseShadowSegment)
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
@@ -213,6 +222,19 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     // ===== Phase 2: normalize + mirror for negative-direction traversal =====
     uint rootSize = 1u << octreeMaxDepth;
 
+    if (preciseShadowSegment &&
+        (any(rayOrigin < float3(0.0f)) || any(rayOrigin > float3(rootSize))))
+    {
+        // A normal offset can begin outside the grid while the light ray
+        // points back in. Enter the root at its actual boundary in that case.
+        float rootTravel = length(float3(rootSize)) + length(rayOrigin) + 1.0f;
+        float2 rootInterval = clip(float3(0.0f), float3(rootSize), rayOrigin,
+                                   rayOrigin + direction * rootTravel);
+        if (rootInterval.x < 0.0f || rootInterval.x >= rootInterval.y)
+            return { false, int3(0), float3(0), 0, 0, 0.0f };
+        rayOrigin += direction * (rootInterval.x * rootTravel + RAY_BIAS);
+    }
+
     // Normalize ray origin to [1,2]³ space
     float3 p = rayOrigin / float(rootSize) + 1.0f;
     p = clamp(p, 1.0f, 2.0f);
@@ -239,9 +261,23 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
     float h = t_max;
     t_min = max(t_min, 0.0f);
 
-    // Clamp far end by maxDistance (convert cell-space distance → parametric t)
+    // The zero-offset path intentionally retains the legacy distance behavior.
+    // For a normal-offset shadow ray, maxDistance is measured from `from` in
+    // LOD-0 cells; subtract the source-node skip and convert to root space.
     if (maxDistance > 0)
-        t_max = min(t_max, t_min + maxDistance);
+    {
+        if (preciseShadowSegment)
+        {
+            float remainingDistance = maxDistance - dot(rayOrigin - from, direction);
+            if (remainingDistance <= 0.0f)
+                return { false, int3(0), float3(0), 0, 0, 0.0f };
+            t_max = min(t_max, remainingDistance / float(rootSize));
+        }
+        else
+        {
+            t_max = min(t_max, t_min + maxDistance);
+        }
+    }
 
     if (t_min > t_max)
         return { false, int3(0), float3(0), 0, 0, 0.0f };
@@ -335,7 +371,13 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
                 {
                     uint gbIndex = childNode.dataIndex;
 
-                    HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex, nodeSize);
+                    // Legacy rays test the whole node. Only finite normal-offset
+                    // shadow rays clip the proxy segment at the light endpoint.
+                    float maxNodeTravel = -1.0f;
+                    if (preciseShadowSegment && maxDistance > 0.0f)
+                        maxNodeTravel = max(0.0f, (tv_max - t_min) * float(rootSize));
+                    HitResult hit = rayHitVoxel(hitCell, direction, cellInt, gbIndex,
+                                                nodeSize, maxNodeTravel);
                     if (hit.hit)
                     {
                         hit.lodLevel = log2(max(footprint, 1.0f));
@@ -418,7 +460,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
 {
-    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+    hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize), false);
     return hit.hit ? 0 : 1;
 }
 
@@ -428,7 +470,36 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
     if (distance >= 0 && distance <= ignoreDistance)
         return 1;
     float3 from = hit.cell + shadowBias * mainNormal;
-    hit = rayMarching(from, direction, distance - ignoreDistance, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+    if (shadowNormalOffsetVoxels > 0.0f)
+        from += shadowNormalOffsetVoxels * normalizeSafe(mainNormal);
+
+    uint ignoreNodeSize = hit.nodeSize;
+    if (shadowNormalOffsetVoxels > 0.0f)
+    {
+        // The normal offset may start in a neighboring node. In that case,
+        // do not let the pre-skip discard that neighbor's occluder.
+        int3 sourceBlock = int3(floor(hit.cell / float(hit.nodeSize)));
+        int3 startBlock = int3(floor(from / float(hit.nodeSize)));
+        if (any(startBlock != sourceBlock))
+            ignoreNodeSize = 0;
+    }
+
+    float3 traceDirection = direction;
+    float maxDistance = distance - ignoreDistance;
+    if (shadowNormalOffsetVoxels > 0.0f && distance >= 0.0f)
+    {
+        // Point/area-light samples are positions. Re-aim from the shifted
+        // origin so the shadow ray still passes through the sampled light.
+        float3 lightCell = hit.cell + direction * distance;
+        float3 toLight = lightCell - from;
+        float lightDistance = length(toLight);
+        if (lightDistance <= ignoreDistance)
+            return 1;
+        traceDirection = toLight / lightDistance;
+        maxDistance = lightDistance - ignoreDistance;
+    }
+    hit = rayMarching(from, traceDirection, maxDistance, ignoreNodeSize, cone, 0,
+                      (int)firstbithigh(hit.nodeSize), shadowNormalOffsetVoxels > 0.0f);
     return hit.hit ? 0 : 1;
 }
 
@@ -446,7 +517,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
             coverage = 1;
             break;
         }
-        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize));
+        hit = rayMarching(hit.cell, direction, -1, hit.nodeSize, cone, 0, (int)firstbithigh(hit.nodeSize), false);
         if (!hit.hit)
             break;
         offset = hit.gbIndex;
@@ -555,7 +626,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
         RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
 
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize));
+        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize), false);
         if (!hits[i + 1].hit)
         {
             leaveGrid = true;
@@ -688,7 +759,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     // Error: need world space distance
     float initialDistance = (inOut.x + 1e-6) * length(delta);
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
-    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1);
+    HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1, false);
 
     if (all(pixel == selectedPixel))
     {

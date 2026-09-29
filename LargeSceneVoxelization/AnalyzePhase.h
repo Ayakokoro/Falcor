@@ -19,6 +19,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <limits>
 
 namespace AnalyzePhase {
@@ -34,6 +35,223 @@ struct AnalyzeContext {
     const std::vector<Texture2D>& metallicTextures;
     const std::vector<Texture2D>& normalMapTextures;
 };
+
+// The visible-material pass already renders one 64x64 depth/owner map for
+// every valid lobe direction. Keep those maps transiently and reuse them to
+// fit one visibility-correlation scalar per voxel. A scratch instance is
+// reused by each worker so large scenes do not allocate these arrays per node.
+constexpr uint32_t CORRELATION_SAMPLE_COUNT = 256;
+constexpr float CORRELATION_ANGULAR_POWER = 4.0f;
+
+struct AnalyzeScratch {
+    static constexpr uint32_t PixelCount = PROJ_RES * PROJ_RES;
+
+    std::vector<float> depths;
+    std::vector<uint32_t> ids;
+    std::array<float3, LOBE_COUNT> directions;
+    std::array<Basis2, LOBE_COUNT> bases;
+    std::array<uint32_t, LOBE_COUNT> occupiedCounts{};
+    std::array<uint32_t, LOBE_COUNT> sampleCounts{};
+    std::array<bool, LOBE_COUNT> valid{};
+    std::array<std::array<uint32_t, CORRELATION_SAMPLE_COUNT>, LOBE_COUNT> samplePixels{};
+
+    AnalyzeScratch()
+        : depths(LOBE_COUNT * PixelCount),
+          ids(LOBE_COUNT * PixelCount) {
+        reset();
+    }
+
+    void reset() {
+        valid.fill(false);
+        occupiedCounts.fill(0);
+        sampleCounts.fill(0);
+    }
+
+    float* depthData(uint32_t k) { return depths.data() + k * PixelCount; }
+    uint32_t* idData(uint32_t k) { return ids.data() + k * PixelCount; }
+    const float* depthData(uint32_t k) const { return depths.data() + k * PixelCount; }
+    const uint32_t* idData(uint32_t k) const { return ids.data() + k * PixelCount; }
+
+    // Select pixels uniformly by rank among occupied pixels. This retains the
+    // projected-area measure while bounding pairwise reprojection work.
+    void buildSamples(uint32_t k, uint32_t occupiedCount) {
+        occupiedCounts[k] = occupiedCount;
+        uint32_t desired = std::min(occupiedCount, CORRELATION_SAMPLE_COUNT);
+        sampleCounts[k] = desired;
+        if (desired == 0)
+            return;
+
+        const uint32_t* mapIds = idData(k);
+        uint32_t occupiedRank = 0;
+        uint32_t sampleIndex = 0;
+        uint32_t targetRank = (uint32_t)(((uint64_t)occupiedCount) / (2u * desired));
+
+        for (uint32_t pixel = 0; pixel < PixelCount && sampleIndex < desired; ++pixel) {
+            if (mapIds[pixel] == std::numeric_limits<uint32_t>::max())
+                continue;
+
+            if (occupiedRank == targetRank) {
+                samplePixels[k][sampleIndex++] = pixel;
+                if (sampleIndex < desired) {
+                    targetRank = (uint32_t)(((uint64_t)(2u * sampleIndex + 1u) * occupiedCount) /
+                                            (2u * desired));
+                }
+            }
+            ++occupiedRank;
+        }
+        sampleCounts[k] = sampleIndex;
+    }
+};
+
+static inline float calcBakedLambda(const VoxelData& vd, const float3& direction) {
+    float vpa = vd.polygonsProjAreaFunc.eval(direction);
+    if (vpa <= 0.0f)
+        return 1e6f;
+    float tpa = vd.totalProjAreaFunc.eval(direction);
+    return std::max(0.0f, (tpa - vpa) / vpa);
+}
+
+static inline bool visibleInProjection(const AnalyzeScratch& scratch,
+                                       uint32_t targetIndex,
+                                       const float3& pointFromNodeCenter,
+                                       uint32_t sourcePolygon,
+                                       const float3& sourceNormal) {
+    const Basis2& basis = scratch.bases[targetIndex];
+    float px = dot(pointFromNodeCenter, basis.u);
+    float py = dot(pointFromNodeCenter, basis.w);
+    int ix = (int)std::floor((px + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE);
+    int iy = (int)std::floor((py + PROJ_HALF_SIZE) / PROJ_PIXEL_SIZE);
+    if (ix < 0 || iy < 0 || ix >= PROJ_RES || iy >= PROJ_RES)
+        return false;
+
+    uint32_t pixel = (uint32_t)iy * PROJ_RES + (uint32_t)ix;
+    const uint32_t* targetIds = scratch.idData(targetIndex);
+    uint32_t targetPolygon = targetIds[pixel];
+    if (targetPolygon == std::numeric_limits<uint32_t>::max())
+        return false;
+    if (targetPolygon == sourcePolygon)
+        return true;
+
+    const float3& targetDirection = scratch.directions[targetIndex];
+    float pointDepth = -dot(pointFromNodeCenter, targetDirection);
+    float targetDepth = scratch.depthData(targetIndex)[pixel];
+
+    // The queried point and the target depth texel are generally at different
+    // positions inside the same pixel. Allow the depth change expected from
+    // the source plane, but cap it so a real foreground layer is not accepted.
+    float3 n = safeNormalize(sourceNormal);
+    float nd = std::abs(dot(n, targetDirection));
+    float tangent = safeSqrt(1.0f - nd * nd) / std::max(nd, 0.05f);
+    float depthEpsilon = 1e-4f + 0.75f * PROJ_PIXEL_SIZE * tangent;
+    depthEpsilon = std::min(depthEpsilon, 0.05f);
+    return pointDepth <= targetDepth + depthEpsilon;
+}
+
+static inline bool estimateConditionalVisibility(const AnalyzeScratch& scratch,
+                                                 const std::vector<Polygon>& polygons,
+                                                 uint32_t incidentIndex,
+                                                 uint32_t outgoingIndex,
+                                                 float& conditionalVisibility,
+                                                 float& projectedMeasure) {
+    uint32_t sampleCount = scratch.sampleCounts[outgoingIndex];
+    if (sampleCount == 0)
+        return false;
+
+    const float3& wi = scratch.directions[incidentIndex];
+    const float3& wo = scratch.directions[outgoingIndex];
+    const Basis2& outgoingBasis = scratch.bases[outgoingIndex];
+    const float* outgoingDepth = scratch.depthData(outgoingIndex);
+    const uint32_t* outgoingIds = scratch.idData(outgoingIndex);
+
+    double denominator = 0.0;
+    double numerator = 0.0;
+    for (uint32_t s = 0; s < sampleCount; ++s) {
+        uint32_t pixel = scratch.samplePixels[outgoingIndex][s];
+        uint32_t polygonIndex = outgoingIds[pixel];
+        if (polygonIndex >= polygons.size())
+            continue;
+
+        const Polygon& polygon = polygons[polygonIndex];
+        float ci = std::abs(dot(polygon.normal, wi));
+        if (ci <= 1e-5f)
+            continue;
+
+        uint32_t ix = pixel % PROJ_RES;
+        uint32_t iy = pixel / PROJ_RES;
+        float x = -PROJ_HALF_SIZE + ((float)ix + 0.5f) * PROJ_PIXEL_SIZE;
+        float y = -PROJ_HALF_SIZE + ((float)iy + 0.5f) * PROJ_PIXEL_SIZE;
+        float3 pointFromNodeCenter = x * outgoingBasis.u + y * outgoingBasis.w
+                                   - outgoingDepth[pixel] * wo;
+
+        denominator += ci;
+        if (visibleInProjection(scratch, incidentIndex, pointFromNodeCenter,
+                                polygonIndex, polygon.normal)) {
+            numerator += ci;
+        }
+    }
+
+    if (denominator <= 1e-8)
+        return false;
+
+    conditionalVisibility = (float)std::clamp(numerator / denominator, 0.0, 1.0);
+    projectedMeasure = (float)(denominator *
+        ((double)scratch.occupiedCounts[outgoingIndex] / (double)sampleCount));
+    return projectedMeasure > 0.0f;
+}
+
+static inline float fitVisibilityCorrelation(const VoxelData& vd,
+                                             const std::vector<Polygon>& polygons,
+                                             const AnalyzeScratch& scratch) {
+    double fitNumerator = 0.0;
+    double fitDenominator = 0.0;
+
+    for (uint32_t o = 0; o < LOBE_COUNT; ++o) {
+        if (!scratch.valid[o])
+            continue;
+        for (uint32_t i = 0; i < LOBE_COUNT; ++i) {
+            if (i == o || !scratch.valid[i])
+                continue;
+
+            float q = 0.0f;
+            float projectedMeasure = 0.0f;
+            if (!estimateConditionalVisibility(scratch, polygons, i, o, q, projectedMeasure))
+                continue;
+
+            float Li = calcBakedLambda(vd, scratch.directions[i]);
+            float Lo = calcBakedLambda(vd, scratch.directions[o]);
+            float minLambda = std::min(Li, Lo);
+            if (!std::isfinite(Li) || !std::isfinite(Lo) ||
+                minLambda <= 1e-3f || Li > 1e3f || Lo > 1e3f)
+                continue;
+
+            // y = c_eff * min(Lambda_i, Lambda_o). Clamp to the range the
+            // c in [0,1] model can represent; out-of-family negative overlap
+            // therefore falls back to the Smith endpoint.
+            float y = 0.0f;
+            if (q > 1e-6f)
+                y = 1.0f + Li + Lo - (1.0f + Lo) / q;
+            y = std::clamp(y, 0.0f, minLambda);
+
+            float angular = std::clamp(0.5f *
+                (1.0f + dot(scratch.directions[i], scratch.directions[o])), 0.0f, 1.0f);
+            float g = std::pow(angular, CORRELATION_ANGULAR_POWER);
+
+            // c_eff = g + (1-g)c_voxel. Solve the single unknown with
+            // weighted least squares over every ordered direction pair.
+            double x = (double)minLambda * (1.0 - (double)g);
+            if (std::abs(x) <= 1e-8)
+                continue;
+            double target = (double)y - (double)minLambda * (double)g;
+            double weight = std::max((double)projectedMeasure, 1e-8);
+            fitNumerator += weight * x * target;
+            fitDenominator += weight * x * x;
+        }
+    }
+
+    if (fitDenominator <= 1e-12)
+        return 0.0f;
+    return (float)std::clamp(fitNumerator / fitDenominator, 0.0, 1.0);
+}
 
 // ---- Transform helpers (same as ClipPhase) ----
 
@@ -169,13 +387,15 @@ inline void analyzeNodeData(VoxelData& vd,
                             const int3& cellInt,
                             uint32_t level,
                             const std::vector<Polygon>& nodePolys,
-                            const AnalyzeContext& ctx) {
+                            const AnalyzeContext& ctx,
+                            AnalyzeScratch& scratch) {
     PolygonRange range;
     range.init(cellInt);
     range.nodeScale = (float)(1u << (ctx.maxDepth - level));
     range.count = (uint32_t)nodePolys.size();
 
     vd.init();
+    scratch.reset();
 
     float3 invVoxelSize(1.0f / ctx.grid.voxelSize.x,
                         1.0f / ctx.grid.voxelSize.y,
@@ -210,19 +430,25 @@ inline void analyzeNodeData(VoxelData& vd,
             continue;
 
         float3 direction = safeNormalize(mainNormalSum[k]);
-        float depth[PROJ_RES * PROJ_RES];
-        uint32_t ids[PROJ_RES * PROJ_RES];
-        std::fill(std::begin(depth), std::end(depth), std::numeric_limits<float>::max());
-        std::fill(std::begin(ids), std::end(ids), std::numeric_limits<uint32_t>::max());
+        float* depth = scratch.depthData(k);
+        uint32_t* ids = scratch.idData(k);
+        std::fill(depth, depth + AnalyzeScratch::PixelCount, std::numeric_limits<float>::max());
+        std::fill(ids, ids + AnalyzeScratch::PixelCount, std::numeric_limits<uint32_t>::max());
         range.rasterizeDepth(nodePolys, direction, depth, ids);
 
+        scratch.valid[k] = true;
+        scratch.directions[k] = direction;
+        scratch.bases[k] = orthonormal_basis(direction);
+
         float visibleProjectedArea = 0.0f;
+        uint32_t occupiedPixelCount = 0;
         for (uint32_t pixel = 0; pixel < PROJ_RES * PROJ_RES; ++pixel) {
             uint32_t polygonIndex = ids[pixel];
             if (polygonIndex == std::numeric_limits<uint32_t>::max())
                 continue;
 
             visibleProjectedArea += pixelArea;
+            ++occupiedPixelCount;
             uint32_t packed = lobePairs[polygonIndex];
             uint32_t k0 = packed & 0xFu;
             uint32_t k1 = (packed >> 4) & 0xFu;
@@ -237,6 +463,7 @@ inline void analyzeNodeData(VoxelData& vd,
             input.projArea = pixelArea;
             vd.ABSDF.accumulate(input);
         }
+        scratch.buildSamples(k, occupiedPixelCount);
         vd.ABSDF.lobes[k].normalizeSelf(visibleProjectedArea);
     }
 
@@ -254,6 +481,7 @@ inline void analyzeNodeData(VoxelData& vd,
     vd.polygonsProjAreaFunc = polygonFunc;
     vd.primitiveProjAreaFunc = primitiveFunc;
     vd.totalProjAreaFunc = totalFunc;
+    vd.visibilityCorrelation = fitVisibilityCorrelation(vd, nodePolys, scratch);
 }
 
 // Convenience overload for the in-memory pipeline.
@@ -261,8 +489,9 @@ inline void analyzeNode(PolygonGenerator& generator,
                         uint32_t bfsIndex,
                         const AnalyzeContext& ctx) {
     const auto& node = generator.mBFSOrder[bfsIndex];
+    AnalyzeScratch scratch;
     analyzeNodeData(generator.gBuffer[bfsIndex], node.cellInt, node.level,
-                    generator.polygonArrays[bfsIndex], ctx);
+                    generator.polygonArrays[bfsIndex], ctx, scratch);
 }
 
 // ---- Main entry point: stream through nodes.idx and analyze every node ----
@@ -308,6 +537,8 @@ inline void execute(const MergePhase::MergeResult& mergeResult,
             return;
         }
 
+        AnalyzeScratch scratch;
+
         uint64_t nextReport = 5000;
         for (uint64_t ni = start; ni < end; ++ni) {
             const auto& nodeIndex = nodeIndices[ni];
@@ -342,7 +573,7 @@ inline void execute(const MergePhase::MergeResult& mergeResult,
             uint32_t bfsIndex = bfsIt->second;
             const auto& node = octree.bfsOrder[bfsIndex];
             analyzeNodeData(octree.gBuffer[bfsIndex], node.cellInt, node.level,
-                            nodePolys, ctx);
+                            nodePolys, ctx, scratch);
 
             uint64_t p = processed.fetch_add(1, std::memory_order_relaxed) + 1;
             if (threadId == 0 && p >= nextReport) {

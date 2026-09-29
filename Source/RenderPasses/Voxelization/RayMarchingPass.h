@@ -47,6 +47,7 @@ private:
     uint mMaxBounce;
     uint selectedFile;
     float mShadowBias100;
+    float mShadowNormalOffsetVoxels = 0.0f;
     float mMinPdf100;
     float mTransmittanceThreshold100;
     bool mCheckEllipsoid;

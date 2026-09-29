@@ -167,6 +167,19 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
                       << " totalOOB=" << badIdx << std::endl;
         }
 
+        // The file stores raw VoxelData records without a version header.
+        // A correlation field was appended to each record; reject older files
+        // explicitly so their old stride cannot silently corrupt later nodes.
+        size_t expectedVoxelBytes = (size_t)gd.solidVoxelCount * sizeof(VoxelData);
+        if (offset > fileSize || fileSize - offset != expectedVoxelBytes)
+        {
+            std::cerr << "Voxel data layout mismatch in " << filePaths[selectedFile]
+                      << " (remaining bytes=" << (offset <= fileSize ? fileSize - offset : 0)
+                      << ", expected=" << expectedVoxelBytes
+                      << "). Re-bake this voxel file with the current version." << std::endl;
+            return;
+        }
+
         // Read VoxelData
         std::vector<VoxelData> voxelData(gd.solidVoxelCount);
         tryRead(f, offset, gd.solidVoxelCount * sizeof(VoxelData), voxelData.data(), fileSize);
@@ -435,6 +448,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["pixelCount"] = mOutputResolution;
         cb["invVP"] = math::inverse(pCamera->getViewProjMatrixNoJitter());
         cb["shadowBias"] = mShadowBias100 / 100 / gridData.voxelSize.x;
+        cb["shadowNormalOffsetVoxels"] = mShadowNormalOffsetVoxels;
         cb["drawMode"] = mDrawMode;
         cb["frameIndex"] = mFrameIndex;
         cb["minPdf"] = mMinPdf100 / 100;
@@ -599,6 +613,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             mOptionsChanged = true;
     }
     if (widget.slider("Shadow Bias(x100)", mShadowBias100, 0.0f, 0.2f))
+        mOptionsChanged = true;
+    if (widget.slider("Shadow Normal Offset (voxels)", mShadowNormalOffsetVoxels, 0.0f, 8.0f))
         mOptionsChanged = true;
     if (widget.slider("Min Pdf(x100)", mMinPdf100, 0.0f, 0.2f))
         mOptionsChanged = true;
