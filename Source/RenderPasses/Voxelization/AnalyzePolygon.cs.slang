@@ -19,7 +19,7 @@ RWStructuredBuffer<Ellipsoid> pBuffer;
 SamplerState sampler;
 
 // 每面片状态用全局 scratch 缓冲（batch 内全局面片号 localHead+s 索引），面片数无上限
-RWStructuredBuffer<uint> lobeOfBuffer;   // 每面片所属 lobe（Pass 1 写入，Pass 2 读取）
+RWStructuredBuffer<uint> lobeOfBuffer;   // low 8 bits: +/- lobe indices; high 24 bits: quantized normal
 
 // 深度光栅化投影平面分辨率（复用 Projection.slang 的 PROJ_RES）
 #define VIS_PROJ_RES PROJ_RES
@@ -222,7 +222,11 @@ void calc(uint offset)
         // 双面材质：面片同时向 ±n 两个 lobe 贡献（材质相同，法线相反）
         uint k0 = NormalIndex8(normal);
         uint k1 = NormalIndex8(-normal);
-        lobeOfBuffer[global] = k0 | (k1 << 4); // 打包两个 lobe 索引
+        // Signed 8-bit encoding with an exact zero, so a tangent direction
+        // does not acquire a spurious positive dot product after decoding.
+        uint3 normal8 = uint3(round(clamp(normal, -1.0f, 1.0f) * 127.0f + 128.0f));
+        lobeOfBuffer[global] = k0 | (k1 << 4) | (normal8.x << 8) |
+                              (normal8.y << 16) | (normal8.z << 24);
         float area = polygon.calcArea();
         n0Sum[k0] += area * normal;
         n0Area[k0] += area;
@@ -234,6 +238,15 @@ void calc(uint offset)
     for (uint k = 0; k < LOBE_COUNT; k++)
     {
         n0[k] = (n0Area[k] > 0) ? safeNormalize(n0Sum[k]) : float3(0);
+    }
+
+    // One cosine-model amplitude per lobe, fitted from the existing owner maps.
+    float fitNumerator[LOBE_COUNT];
+    float fitDenominator[LOBE_COUNT];
+    for (uint k = 0; k < LOBE_COUNT; k++)
+    {
+        fitNumerator[k] = 0.0f;
+        fitDenominator[k] = 0.0f;
     }
 
     // ---- Pass 2：逐 lobe 深度光栅化 + 遍历像素按投影面积聚合材质 ----
@@ -258,19 +271,24 @@ void calc(uint offset)
         range.rasterizeDepth(polygonBuffer, n0[k], depthArr, idArr);
 
         // 直接遍历像素：光栅化已给出每像素可见面片，无需再回到面片维度
-        // vpa_k = 沿 n0k 的总可见投影面积 VPA(n0k)（所有被覆盖像素，不管属于哪个 lobe）
-        float vpa_k = 0;
+        float visibleByLobe[LOBE_COUNT];
+        for (uint m = 0; m < LOBE_COUNT; m++)
+            visibleByLobe[m] = 0.0f;
         for (uint p = 0; p < pixelCount; p++)
         {
             uint global = idArr[p];
             if (global == 0xFFFFFFFFu)
                 continue;
-            vpa_k += pixelArea;
-
             // 解包 lobe 索引：面片同时归属正面 k0 与背面 k1（双面材质）
             uint packed = lobeOfBuffer[global];
             uint k0 = packed & 0xFu;
             uint k1 = (packed >> 4) & 0xFu;
+
+            float3 polygonNormal = (float3((packed >> 8) & 255u,
+                                           (packed >> 16) & 255u,
+                                           (packed >> 24) & 255u) - 128.0f) / 127.0f;
+            uint facingLobe = dot(polygonNormal, n0[k]) >= 0.0f ? k0 : k1;
+            visibleByLobe[facingLobe] += pixelArea;
 
             float sign;
             if (k == k0)
@@ -288,10 +306,24 @@ void calc(uint offset)
 
             data.ABSDF.accumulate(input); // NormalIndex8 归入 lobe（k==k0/k1 保证一致）
         }
-        // 每 lobe 独立归一化：w_k = VPA_k / VPA(n0k)，分母是「沿 n0k 的总可见投影面积」
-        data.ABSDF.lobes[k].normalizeSelf(vpa_k);
+        for (uint m = 0; m < LOBE_COUNT; m++)
+        {
+            if (n0Area[m] <= 0.0f)
+                continue;
+            float cosine = max(0.0f, dot(n0[m], n0[k]));
+            fitNumerator[m] += cosine * visibleByLobe[m];
+            fitDenominator[m] += cosine * cosine;
+        }
+        data.ABSDF.lobes[k].normalizeSelf();
     }
 
+    for (uint k = 0; k < LOBE_COUNT; k++)
+    {
+        if (!data.ABSDF.lobes[k].IsValid())
+            continue;
+        data.ABSDF.lobes[k].weight = fitDenominator[k] > 1e-8f
+            ? max(0.0f, fitNumerator[k] / fitDenominator[k]) : 0.0f;
+    }
     data.ABSDF.normalizeWeightsOnly();
 
     if (!data.IsSolid())

@@ -763,6 +763,8 @@ void VoxelizationPass::write(std::string fileName, void* pGBuffer)
             polygonGenerator.mOctreeNodes.size() * sizeof(OctreeNode));
 
     f.write(reinterpret_cast<const char*>(pGBuffer), polygonGenerator.gBuffer.size() * sizeof(VoxelData));
+    constexpr uint32_t kVoxelBakeFormatTag = 0x33575056u; // "VPW3": same-side visibility correlation
+    f.write(reinterpret_cast<const char*>(&kVoxelBakeFormatTag), sizeof(kVoxelBakeFormatTag));
 
     f.close();
     VoxelizationBase::FileUpdated = true;

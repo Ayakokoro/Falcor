@@ -37,27 +37,40 @@ struct AnalyzeContext {
 };
 
 // The visible-material pass already renders one 64x64 depth/owner map for
-// every valid lobe direction. Keep those maps transiently and reuse them to
-// fit one visibility-correlation scalar per voxel. A scratch instance is
-// reused by each worker so large scenes do not allocate these arrays per node.
+// every valid lobe direction. Add four same-hemisphere perturbations around
+// each lobe direction and use only direction pairs from the same lobe group to
+// fit one same-side visibility-correlation scalar per voxel. All maps remain
+// transient, and a scratch instance is reused by each worker.
 constexpr uint32_t CORRELATION_SAMPLE_COUNT = 256;
 constexpr float CORRELATION_ANGULAR_POWER = 4.0f;
+constexpr uint32_t CORRELATION_PERTURBATION_COUNT = 4;
+constexpr uint32_t CORRELATION_DIRECTIONS_PER_LOBE = 1 + CORRELATION_PERTURBATION_COUNT;
+constexpr uint32_t CORRELATION_PROJECTION_COUNT =
+    LOBE_COUNT * CORRELATION_DIRECTIONS_PER_LOBE;
+constexpr float CORRELATION_PERTURBATION_COS = 0.9063077870f; // cos(25 degrees)
+constexpr float CORRELATION_PERTURBATION_SIN = 0.4226182617f; // sin(25 degrees)
+
+static constexpr uint32_t correlationProjectionIndex(uint32_t lobe, uint32_t localDirection) {
+    return localDirection == 0
+        ? lobe
+        : LOBE_COUNT + lobe * CORRELATION_PERTURBATION_COUNT + (localDirection - 1);
+}
 
 struct AnalyzeScratch {
     static constexpr uint32_t PixelCount = PROJ_RES * PROJ_RES;
 
     std::vector<float> depths;
     std::vector<uint32_t> ids;
-    std::array<float3, LOBE_COUNT> directions;
-    std::array<Basis2, LOBE_COUNT> bases;
-    std::array<uint32_t, LOBE_COUNT> occupiedCounts{};
-    std::array<uint32_t, LOBE_COUNT> sampleCounts{};
-    std::array<bool, LOBE_COUNT> valid{};
-    std::array<std::array<uint32_t, CORRELATION_SAMPLE_COUNT>, LOBE_COUNT> samplePixels{};
+    std::array<float3, CORRELATION_PROJECTION_COUNT> directions;
+    std::array<Basis2, CORRELATION_PROJECTION_COUNT> bases;
+    std::array<uint32_t, CORRELATION_PROJECTION_COUNT> occupiedCounts{};
+    std::array<uint32_t, CORRELATION_PROJECTION_COUNT> sampleCounts{};
+    std::array<bool, CORRELATION_PROJECTION_COUNT> valid{};
+    std::array<std::array<uint32_t, CORRELATION_SAMPLE_COUNT>, CORRELATION_PROJECTION_COUNT> samplePixels{};
 
     AnalyzeScratch()
-        : depths(LOBE_COUNT * PixelCount),
-          ids(LOBE_COUNT * PixelCount) {
+        : depths(CORRELATION_PROJECTION_COUNT * PixelCount),
+          ids(CORRELATION_PROJECTION_COUNT * PixelCount) {
         reset();
     }
 
@@ -205,46 +218,53 @@ static inline float fitVisibilityCorrelation(const VoxelData& vd,
     double fitNumerator = 0.0;
     double fitDenominator = 0.0;
 
-    for (uint32_t o = 0; o < LOBE_COUNT; ++o) {
-        if (!scratch.valid[o])
-            continue;
-        for (uint32_t i = 0; i < LOBE_COUNT; ++i) {
-            if (i == o || !scratch.valid[i])
+    // c_voxel now describes correlation between distinct directions on the
+    // same side of one lobe. Opposing lobe pairs are deliberately excluded;
+    // runtime falls back to the Smith endpoint for opposite-side directions.
+    for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
+        for (uint32_t localO = 0; localO < CORRELATION_DIRECTIONS_PER_LOBE; ++localO) {
+            uint32_t o = correlationProjectionIndex(k, localO);
+            if (!scratch.valid[o])
                 continue;
+            for (uint32_t localI = 0; localI < CORRELATION_DIRECTIONS_PER_LOBE; ++localI) {
+                uint32_t i = correlationProjectionIndex(k, localI);
+                if (i == o || !scratch.valid[i])
+                    continue;
 
-            float q = 0.0f;
-            float projectedMeasure = 0.0f;
-            if (!estimateConditionalVisibility(scratch, polygons, i, o, q, projectedMeasure))
-                continue;
+                float q = 0.0f;
+                float projectedMeasure = 0.0f;
+                if (!estimateConditionalVisibility(scratch, polygons, i, o, q, projectedMeasure))
+                    continue;
 
-            float Li = calcBakedLambda(vd, scratch.directions[i]);
-            float Lo = calcBakedLambda(vd, scratch.directions[o]);
-            float minLambda = std::min(Li, Lo);
-            if (!std::isfinite(Li) || !std::isfinite(Lo) ||
-                minLambda <= 1e-3f || Li > 1e3f || Lo > 1e3f)
-                continue;
+                float Li = calcBakedLambda(vd, scratch.directions[i]);
+                float Lo = calcBakedLambda(vd, scratch.directions[o]);
+                float minLambda = std::min(Li, Lo);
+                if (!std::isfinite(Li) || !std::isfinite(Lo) ||
+                    minLambda <= 1e-3f || Li > 1e3f || Lo > 1e3f)
+                    continue;
 
-            // y = c_eff * min(Lambda_i, Lambda_o). Clamp to the range the
-            // c in [0,1] model can represent; out-of-family negative overlap
-            // therefore falls back to the Smith endpoint.
-            float y = 0.0f;
-            if (q > 1e-6f)
-                y = 1.0f + Li + Lo - (1.0f + Lo) / q;
-            y = std::clamp(y, 0.0f, minLambda);
+                // y = c_eff * min(Lambda_i, Lambda_o). Clamp to the range the
+                // c in [0,1] model can represent; out-of-family negative overlap
+                // therefore falls back to the Smith endpoint.
+                float y = 0.0f;
+                if (q > 1e-6f)
+                    y = 1.0f + Li + Lo - (1.0f + Lo) / q;
+                y = std::clamp(y, 0.0f, minLambda);
 
-            float angular = std::clamp(0.5f *
-                (1.0f + dot(scratch.directions[i], scratch.directions[o])), 0.0f, 1.0f);
-            float g = std::pow(angular, CORRELATION_ANGULAR_POWER);
+                float angular = std::clamp(0.5f *
+                    (1.0f + dot(scratch.directions[i], scratch.directions[o])), 0.0f, 1.0f);
+                float g = std::pow(angular, CORRELATION_ANGULAR_POWER);
 
-            // c_eff = g + (1-g)c_voxel. Solve the single unknown with
-            // weighted least squares over every ordered direction pair.
-            double x = (double)minLambda * (1.0 - (double)g);
-            if (std::abs(x) <= 1e-8)
-                continue;
-            double target = (double)y - (double)minLambda * (double)g;
-            double weight = std::max((double)projectedMeasure, 1e-8);
-            fitNumerator += weight * x * target;
-            fitDenominator += weight * x * x;
+                // c_eff = g + (1-g)c_voxel. Solve the single unknown with
+                // weighted least squares over every ordered same-side pair.
+                double x = (double)minLambda * (1.0 - (double)g);
+                if (std::abs(x) <= 1e-8)
+                    continue;
+                double target = (double)y - (double)minLambda * (double)g;
+                double weight = std::max((double)projectedMeasure, 1e-8);
+                fitNumerator += weight * x * target;
+                fitDenominator += weight * x * x;
+            }
         }
     }
 
@@ -424,12 +444,21 @@ inline void analyzeNodeData(VoxelData& vd,
         mainNormalArea[k1] += area;
     }
 
+    float3 mainDirections[LOBE_COUNT] = {};
+    for (uint32_t k = 0; k < LOBE_COUNT; ++k)
+        if (mainNormalArea[k] > 0.0f)
+            mainDirections[k] = safeNormalize(mainNormalSum[k]);
+
+    // Fit one visible-area amplitude per lobe from the depth/owner maps that
+    // the material bake already generates. No extra persistent voxel data.
+    float fitNumerator[LOBE_COUNT] = {};
+    float fitDenominator[LOBE_COUNT] = {};
     const float pixelArea = PROJ_PIXEL_SIZE * PROJ_PIXEL_SIZE;
     for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
         if (mainNormalArea[k] <= 0.0f)
             continue;
 
-        float3 direction = safeNormalize(mainNormalSum[k]);
+        float3 direction = mainDirections[k];
         float* depth = scratch.depthData(k);
         uint32_t* ids = scratch.idData(k);
         std::fill(depth, depth + AnalyzeScratch::PixelCount, std::numeric_limits<float>::max());
@@ -440,18 +469,19 @@ inline void analyzeNodeData(VoxelData& vd,
         scratch.directions[k] = direction;
         scratch.bases[k] = orthonormal_basis(direction);
 
-        float visibleProjectedArea = 0.0f;
+        float visibleByLobe[LOBE_COUNT] = {};
         uint32_t occupiedPixelCount = 0;
         for (uint32_t pixel = 0; pixel < PROJ_RES * PROJ_RES; ++pixel) {
             uint32_t polygonIndex = ids[pixel];
             if (polygonIndex == std::numeric_limits<uint32_t>::max())
                 continue;
 
-            visibleProjectedArea += pixelArea;
             ++occupiedPixelCount;
             uint32_t packed = lobePairs[polygonIndex];
             uint32_t k0 = packed & 0xFu;
             uint32_t k1 = (packed >> 4) & 0xFu;
+            uint32_t facingLobe = dot(materialSamples[polygonIndex].normal, direction) >= 0.0f ? k0 : k1;
+            visibleByLobe[facingLobe] += pixelArea;
             float sign = 0.0f;
             if (k == k0) sign = 1.0f;
             else if (k == k1) sign = -1.0f;
@@ -463,13 +493,62 @@ inline void analyzeNodeData(VoxelData& vd,
             input.projArea = pixelArea;
             vd.ABSDF.accumulate(input);
         }
+        for (uint32_t m = 0; m < LOBE_COUNT; ++m) {
+            if (mainNormalArea[m] <= 0.0f)
+                continue;
+            float cosine = std::max(0.0f, dot(mainDirections[m], direction));
+            fitNumerator[m] += cosine * visibleByLobe[m];
+            fitDenominator[m] += cosine * cosine;
+        }
         scratch.buildSamples(k, occupiedPixelCount);
-        vd.ABSDF.lobes[k].normalizeSelf(visibleProjectedArea);
+        vd.ABSDF.lobes[k].normalizeSelf();
     }
 
+    for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
+        if (!vd.ABSDF.lobes[k].isValid())
+            continue;
+        vd.ABSDF.lobes[k].weight = fitDenominator[k] > 1e-8f
+            ? std::max(0.0f, fitNumerator[k] / fitDenominator[k]) : 0.0f;
+    }
     vd.ABSDF.normalizeWeightsOnly();
     if (!vd.isSolid())
         return;
+
+    // Add four 25-degree directions around every valid lobe. These extra
+    // projections make same-side correlation observable even when a voxel
+    // contains only one pair of opposite, perfectly parallel lobes.
+    for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
+        if (!scratch.valid[k])
+            continue;
+
+        const float3 baseDirection = scratch.directions[k];
+        const Basis2 baseBasis = scratch.bases[k];
+        const float3 tangentDirections[CORRELATION_PERTURBATION_COUNT] = {
+            baseBasis.u, -baseBasis.u, baseBasis.w, -baseBasis.w
+        };
+
+        for (uint32_t p = 0; p < CORRELATION_PERTURBATION_COUNT; ++p) {
+            uint32_t projectionIndex = correlationProjectionIndex(k, p + 1);
+            float3 direction = safeNormalize(
+                CORRELATION_PERTURBATION_COS * baseDirection +
+                CORRELATION_PERTURBATION_SIN * tangentDirections[p]);
+
+            float* depth = scratch.depthData(projectionIndex);
+            uint32_t* ids = scratch.idData(projectionIndex);
+            std::fill(depth, depth + AnalyzeScratch::PixelCount, std::numeric_limits<float>::max());
+            std::fill(ids, ids + AnalyzeScratch::PixelCount, std::numeric_limits<uint32_t>::max());
+            range.rasterizeDepth(nodePolys, direction, depth, ids);
+
+            uint32_t occupiedPixelCount = 0;
+            for (uint32_t pixel = 0; pixel < AnalyzeScratch::PixelCount; ++pixel)
+                occupiedPixelCount += ids[pixel] != std::numeric_limits<uint32_t>::max() ? 1u : 0u;
+
+            scratch.valid[projectionIndex] = occupiedPixelCount > 0;
+            scratch.directions[projectionIndex] = direction;
+            scratch.bases[projectionIndex] = orthonormal_basis(direction);
+            scratch.buildSamples(projectionIndex, occupiedPixelCount);
+        }
+    }
 
     vd.ellipsoid.fit(nodePolys, range);
 

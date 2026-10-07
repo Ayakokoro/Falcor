@@ -11,8 +11,9 @@ struct VoxelData {
     SphericalFunc primitiveProjAreaFunc;
     SphericalFunc polygonsProjAreaFunc;
     SphericalFunc totalProjAreaFunc;
-    // Per-voxel base visibility correlation. Runtime lifts this scalar to a
-    // direction-pair value, preserving c(w, w) = 1.
+    // Per-voxel same-side visibility correlation. Runtime lifts this scalar
+    // to a direction-pair value, preserving c(w, w) = 1 and using the Smith
+    // endpoint for directions on opposite sides of the dominant lobe.
     float visibilityCorrelation = 0.0f;
 
     void init() {

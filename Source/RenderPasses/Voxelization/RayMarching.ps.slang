@@ -52,6 +52,8 @@ cbuffer CB
     uint gbSplit0;      // boundary between buffer [0] and [1]
     uint gbSplit1;      // boundary between buffer [1] and [2]
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
+    float coverageTolerance; // Relative near-full coverage tolerance; 0 disables the correction.
+    uint maxTransmission; // Maximum null transmissions over the whole path, independent of MAX_BOUNCE.
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -498,8 +500,19 @@ float calcLightVisibility(HitResult hit, float3 direction, float3 mainNormal, fl
         traceDirection = toLight / lightDistance;
         maxDistance = lightDistance - ignoreDistance;
     }
-    hit = rayMarching(from, traceDirection, maxDistance, ignoreNodeSize, cone, 0,
-                      (int)firstbithigh(hit.nodeSize), shadowNormalOffsetVoxels > 0.0f);
+    bool hasNormalOffset = shadowNormalOffsetVoxels > 0.0f;
+    bool finiteLightSegment = distance >= 0.0f;
+
+    hit = rayMarching(
+        from,
+        traceDirection,
+        maxDistance,
+        ignoreNodeSize,
+        cone,
+        0,
+        (int)firstbithigh(hit.nodeSize),
+        finiteLightSegment
+    );
     return hit.hit ? 0 : 1;
 }
 
@@ -511,7 +524,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     while (times > 0)
     {
         TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
-        coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend);
+        coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend, coverageTolerance);
         if (coverage >= 1 - transmittanceThreshold)
         {
             coverage = 1;
@@ -535,7 +548,7 @@ float3 debugShading(HitResult hit, float3 v)
     switch (drawMode)
     {
     case ABSDFDrawMode::Normal:
-        return bsdf.surface.getMainNormal(v) * 0.5 + 0.5;
+        return bsdf.surface.getMainNormal(v, v) * 0.5 + 0.5;
     case ABSDFDrawMode::Ellipsoid:
         float3 localPos = hit.cell - hit.cellInt;
         float3 d = localPos - e.center;
@@ -570,7 +583,7 @@ float3 debugShading(HitResult hit, float3 v)
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
     TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
-    BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend);
+    BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend, coverageTolerance);
     return lightColor * BSDF.eval(l, v, h);
 }
 
@@ -586,7 +599,7 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         return 0;
 
     ls.pdf = max(ls.pdf, minPdf);
-    float3 mainNormal = BSDF.surface.getMainNormal(ls.l);
+    float3 mainNormal = BSDF.surface.getMainNormal(ls.l, v);
     float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x, cone);
 
     if (visibility > 0)
@@ -596,81 +609,85 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
 
 float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
-    HitResult[MAX_BOUNCE + 1] hits;
-    float3[MAX_BOUNCE + 1] ls;
-    float3[MAX_BOUNCE + 1] hs;
-    float[MAX_BOUNCE + 1] pdfs;
-    uint bounce = MAX_BOUNCE;
-    uint shadingPointCount = bounce + 1;
-    hits[0] = hit;
-    bool leaveGrid = false;
+    float3 radiance = 0;
+    float3 throughput = 1;
+    uint reflectionCount = 0;
+    uint transmissionCount = 0;
 
-    for (int i = 0; i < bounce; i++)
+    [loop]
+    while (true)
     {
-        uint offset = hits[i].gbIndex;
+        uint offset = hit.gbIndex;
         TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
-        float3 currentV = i == 0 ? v : -ls[i - 1];
-        BSDF.updateCoverage(currentV, transmittanceThreshold, coverageBlend);
-        BSDF.sample(currentV, ls[i], hs[i], sg);
+        BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend, coverageTolerance);
 
-        pdfs[i] = BSDF.evalPdf(ls[i], currentV, hs[i]);
-        if (pdfs[i] <= 0)
+        // Expected direct surface contribution: shadingDirect already includes C(v).
+        radiance += throughput * shadingDirect(hit, v, sg, cone);
+
+        // Classify the coverage event explicitly. h == 0 can also mean an invalid
+        // surface sample, so it must not be used to identify null transmission.
+        bool passThrough = false;
+        if (BSDF.coverage < 1.0f)
+            passThrough = Next(sg) >= BSDF.coverage;
+
+        float3 l, h;
+        RayCone nextCone = cone;
+        if (passThrough)
         {
-            shadingPointCount = i + 1;
-            break;
-        }
-        pdfs[i] = max(pdfs[i], minPdf);
-
-        // Widen cone based on BSDF roughness before next bounce
-        float rough = maxRoughness(offset);
-        float spreadTan = tan(min(rough, 0.995f) * 1.57f); // rough→[0, ~86°], tan≈14 max
-        RayCone nextCone = { max(cone.tanHalfAngle, spreadTan), cone.bias };
-
-        hits[i + 1] = rayMarching(hits[i].cell, ls[i], -1, hits[i].nodeSize, nextCone, 0, (int)firstbithigh(hits[i].nodeSize), false);
-        if (!hits[i + 1].hit)
-        {
-            leaveGrid = true;
-            shadingPointCount = i + 1;
-            break;
-        }
-    }
-
-    float3 reflectLights[MAX_BOUNCE + 1];
-    for (int i = shadingPointCount - 1; i >= 0; i--)
-    {
-        reflectLights[i] = 0;
-        HitResult currentHit = hits[i];
-        uint currentOffset = currentHit.gbIndex;
-        float3 currentV = i == 0 ? v : -ls[i - 1];
-
-        reflectLights[i] += shadingDirect(currentHit, currentV, sg, cone);
-        if (i == shadingPointCount - 1)
-        {
-#if USE_ENV_MAP
-            if (leaveGrid && all(hs[i] == 0))
-            {
-                float3 incidentLight = gEnvMapSampler.eval(ls[i]);
-                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
-            }
-#endif
+            if (transmissionCount >= maxTransmission)
+                break;
+            transmissionCount++;
+            l = -v;
+            // The discrete event probability cancels its BSDF weight:
+            // (1-C)/(1-C) = 1. No PDF clamp, reflection bounce, or roughness spread.
         }
         else
         {
-            if (pdfs[i] <= 0)
-                continue;
-            HitResult nextHit = hits[i + 1];
-            if (nextHit.hit)
-            {
-                float3 incidentLight = reflectLights[i + 1];
-                // Clamp fireflies from low-pdf BSDF samples:
-                // a lit diffuse surface is ~0.25, so 10.0 catches spikes
-                // while leaving normal indirect paths untouched.
-                // incidentLight = min(incidentLight, 10.0);
-                reflectLights[i] += shading(currentOffset, ls[i], currentV, hs[i], incidentLight) / pdfs[i];
-            }
+            // Test the reflection budget only after selecting the event: even
+            // MAX_BOUNCE == 0 must allow null rays to reach the next surface.
+            if (reflectionCount >= MAX_BOUNCE)
+                break;
+
+            BSDF.surface.sample(v, l, h, sg);
+            float surfacePdf = BSDF.surface.evalPdf(l, v, h);
+            if (surfacePdf <= 0.0f)
+                break;
+
+            // C cancels between the surface BSDF and its event probability.
+            // Keep TEBSDF's current internal-visibility model without applying
+            // coverage a second time or clamping the conditional sampling PDF.
+            throughput *= BSDF.surface.eval(l, v, h) * BSDF.calcInternalVisibility(l) / surfacePdf;
+            if (all(throughput <= 0.0f))
+                break;
+            reflectionCount++;
+
+            float rough = maxRoughness(offset);
+            float spreadTan = tan(min(rough, 0.995f) * 1.57f);
+            nextCone.tanHalfAngle = max(cone.tanHalfAngle, spreadTan);
         }
+
+        HitResult nextHit = rayMarching(hit.cell, l, -1, hit.nodeSize, nextCone, 0,
+                                       (int)firstbithigh(hit.nodeSize), false);
+        if (!nextHit.hit)
+        {
+#if USE_ENV_MAP
+            // Reflected environment lighting is already estimated by direct
+            // light sampling. Only the camera's uninterrupted null chain adds
+            // an environment endpoint, to avoid counting reflected light twice.
+            if (passThrough && reflectionCount == 0)
+                radiance += throughput * gEnvMapSampler.eval(l);
+#endif
+            break;
+        }
+
+        // No scattering spread for a null event, but its footprint still grows
+        // with propagation distance. cone.bias is the radius at the current hit.
+        nextCone.bias += length(nextHit.cell - hit.cell) * nextCone.tanHalfAngle;
+        cone = nextCone;
+        hit = nextHit;
+        v = -l;
     }
-    return reflectLights[0];
+    return radiance;
 }
 
 float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
@@ -719,7 +736,7 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     if (!valid || ls.pdf <= 0)
         return ambient;
 
-    float3 N = BSDF.surface.getMainNormal(ls.l);
+    float3 N = BSDF.surface.getMainNormal(ls.l, v);
     float NdotL = saturate(dot(N, ls.l));
 
     float visibility = calcLightVisibility(hit, ls.l, N, ls.distance / voxelSize.x, cone);
@@ -765,8 +782,9 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     {
         if (hit.hit)
         {
+            TEBSDF selectedBSDF = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
             selectedVoxel[0] = float4(-direction, (float)hit.gbIndex);
-            selectedVoxel[1] = float4(float3(hit.cellInt), 0);
+            selectedVoxel[1] = float4(float3(hit.cellInt), selectedBSDF.visibilityCorrelation);
         }
         else
         {
@@ -791,7 +809,11 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             }
         }
 #endif
-            color = shadingGlobal(hit, -direction, sg, primaryCone);
+        {
+            RayCone shadingCone = primaryCone;
+            shadingCone.bias += length(hit.cell - from) * shadingCone.tanHalfAngle;
+            color = shadingGlobal(hit, -direction, sg, shadingCone);
+        }
             break;
         case ABSDFDrawMode::Coverage:
             color = coverageTest(hit, direction, primaryCone);

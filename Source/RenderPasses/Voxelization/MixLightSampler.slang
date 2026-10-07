@@ -159,7 +159,7 @@ bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF B
 bool inline sampleEnvMap<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
 {
     SurfaceBRDF BRDF = BSDF.surface; // 采样光源时不考虑delta lobe
-    float bsdfWeight = BRDF.calcBRDFWeight();
+    float bsdfWeight = BRDF.calcBRDFWeight(v);
     ls.pdf = 0;
 
     if (Next(sg) <= bsdfWeight)

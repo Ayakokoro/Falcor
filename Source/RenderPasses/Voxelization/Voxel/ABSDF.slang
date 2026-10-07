@@ -103,8 +103,9 @@ struct ABSDFLobe
     }
 
     MUTATING
-    // visibleProjectedAreaSum：该 lobe 所有可见面片沿主视角的可见投影面积和（= VPA_k）
-    void normalizeSelf(float visibleProjectedAreaSum)
+    // Normalize material parameters only; the caller later stores a fitted
+    // visible-area amplitude in weight.
+    void normalizeSelf()
     {
         if (weight > 0)
         {
@@ -112,8 +113,6 @@ struct ABSDFLobe
             diffuse /= weight;
             specular /= weight;
             rough /= weight;
-            // 波瓣权重 = VPA_k / 总可见投影面积，由调用方在 accumulate 前按分母归一
-            weight /= visibleProjectedAreaSum;
         }
     }
 
@@ -150,15 +149,9 @@ struct ABSDF
     {
         if (area == 0)
             return;
-        // 分母用总可见投影面积（= Σ_k VPA_k），使 Σ_k w_k == 1
-        float totalVisibleProjArea = 0;
         for (int i = 0; i < LOBE_COUNT; i++)
-            totalVisibleProjArea += lobes[i].weight;
-
-        for (int i = 0; i < LOBE_COUNT; i++)
-        {
-            lobes[i].normalizeSelf(totalVisibleProjArea);
-        }
+            lobes[i].normalizeSelf();
+        normalizeWeightsOnly();
     }
 
     MUTATING
@@ -171,7 +164,9 @@ struct ABSDF
 
         if (totalWeight > 0.0f)
         {
-            const float targetWeightSum = 2.0f; // 双面 ±n
+            // Storage-range convention only; view-facing weights are
+            // normalized to one by SurfaceBRDF at runtime.
+            const float targetWeightSum = 2.0f;
             float scale = targetWeightSum / totalWeight;
 
             for (uint i = 0; i < LOBE_COUNT; ++i)

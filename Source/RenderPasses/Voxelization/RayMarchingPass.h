@@ -36,6 +36,7 @@ private:
     ref<Buffer> mpSelectedVoxelStaging;
     int3 mSelectedCellInt = int3(-1);
     uint mSelectedGbOffset = 0xFFFFFFFF;
+    float mSelectedVisibilityCorrelation = -1.0f;
     bool mSelectedHit = false;
     ref<Fbo> mpFbo;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
@@ -45,6 +46,7 @@ private:
 
     uint mDrawMode;
     uint mMaxBounce;
+    uint mMaxTransmission = 4096;
     uint selectedFile;
     float mShadowBias100;
     float mShadowNormalOffsetVoxels = 0.0f;
@@ -60,6 +62,7 @@ private:
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     int mMaxLODLevel = -1; // -1=no cap, N=never LOD-stop above this level (leaf=0)
     float mCoverageBlend = 0.0f; // 0=raw coverage, 1=fill all empty cavity
+    float mCoverageTolerance = 0.0f; // 0=disabled; smooth near-full coverage toward 1.
     float3 mClearColor;
 
     bool mDisplayNDF;

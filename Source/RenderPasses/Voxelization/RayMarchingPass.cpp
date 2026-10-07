@@ -167,15 +167,16 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
                       << " totalOOB=" << badIdx << std::endl;
         }
 
-        // The file stores raw VoxelData records without a version header.
-        // A correlation field was appended to each record; reject older files
-        // explicitly so their old stride cannot silently corrupt later nodes.
+        // VoxelData is raw and its stride did not change when lobe.weight became
+        // a visible-area amplitude. A trailing tag rejects old, same-size bakes.
+        constexpr uint32_t kVoxelBakeFormatTag = 0x33575056u; // "VPW3": same-side visibility correlation
         size_t expectedVoxelBytes = (size_t)gd.solidVoxelCount * sizeof(VoxelData);
-        if (offset > fileSize || fileSize - offset != expectedVoxelBytes)
+        size_t expectedRemainingBytes = expectedVoxelBytes + sizeof(kVoxelBakeFormatTag);
+        if (offset > fileSize || fileSize - offset != expectedRemainingBytes)
         {
             std::cerr << "Voxel data layout mismatch in " << filePaths[selectedFile]
                       << " (remaining bytes=" << (offset <= fileSize ? fileSize - offset : 0)
-                      << ", expected=" << expectedVoxelBytes
+                      << ", expected=" << expectedRemainingBytes
                       << "). Re-bake this voxel file with the current version." << std::endl;
             return;
         }
@@ -183,6 +184,14 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // Read VoxelData
         std::vector<VoxelData> voxelData(gd.solidVoxelCount);
         tryRead(f, offset, gd.solidVoxelCount * sizeof(VoxelData), voxelData.data(), fileSize);
+        uint32_t fileTag = 0;
+        tryRead(f, offset, sizeof(fileTag), &fileTag, fileSize);
+        if (fileTag != kVoxelBakeFormatTag)
+        {
+            std::cerr << "Unsupported voxel bake format in " << filePaths[selectedFile]
+                      << ". Re-bake this voxel file." << std::endl;
+            return;
+        }
 
         float maxArea = 0, minArea = FLT_MAX;
         uint zeroAreaCount = 0;
@@ -462,6 +471,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["gbSplit0"] = mGBufferSplit0;
         cb["gbSplit1"] = mGBufferSplit1;
         cb["coverageBlend"] = mCoverageBlend;
+        cb["coverageTolerance"] = mCoverageTolerance;
+        cb["maxTransmission"] = mMaxTransmission;
         mFrameIndex++;
 
         mpFbo->attachColorTarget(pOutputColor, 0);
@@ -508,12 +519,14 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mSelectedHit = true;
             mSelectedGbOffset = (uint)v0.w;
             mSelectedCellInt = int3((int)v1.x, (int)v1.y, (int)v1.z);
+            mSelectedVisibilityCorrelation = v1.w;
         }
         else
         {
             mSelectedHit = false;
             mSelectedGbOffset = 0xFFFFFFFF;
             mSelectedCellInt = int3(-1);
+            mSelectedVisibilityCorrelation = -1.0f;
         }
     }
 }
@@ -609,6 +622,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (mCheckCoverage)
     {
+        if (widget.slider("Coverage Tolerance", mCoverageTolerance, 0.0f, 0.49f))
+            mOptionsChanged = true;
         if (widget.slider("Coverage Blend", mCoverageBlend, 0.0f, 1.0f))
             mOptionsChanged = true;
     }
@@ -623,6 +638,8 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     if (widget.dropdown("Draw Mode", reinterpret_cast<ABSDFDrawMode&>(mDrawMode)))
         mOptionsChanged = true;
     if (widget.slider("Max Bounce", mMaxBounce, 0u, 4u))
+        mOptionsChanged = true;
+    if (widget.var("Max Transmission", mMaxTransmission, 0u, 16384u))
         mOptionsChanged = true;
     if (widget.checkbox("Display NDF", mDisplayNDF))
         mOptionsChanged = true;
@@ -656,6 +673,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     {
         widget.text("Selected Voxel cellInt: " + ToString(mSelectedCellInt));
         widget.text("Selected Voxel gbOffset: " + std::to_string(mSelectedGbOffset));
+        widget.text("Selected Voxel c_sameSide: " + std::to_string(mSelectedVisibilityCorrelation));
     }
     else
     {

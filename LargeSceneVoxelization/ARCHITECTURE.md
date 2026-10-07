@@ -81,8 +81,11 @@ The CPU analysis is a port of `AnalyzePolygon.cs.slang`:
 4. Rasterize a 64x64 projected depth buffer for each lobe direction. The
    nearest polygon at each pixel contributes projected pixel area to ABSDF
    material accumulation.
-5. Normalize lobe weights to the two-sided target sum, fit the ellipsoid, and
-   estimate projected-area spherical harmonics.
+5. Reuse those depth/owner maps to fit one visible projected-area amplitude per
+   lobe, then scale the amplitudes to the two-sided storage range. At render
+   time, project them onto the view direction and normalize the view-facing
+   mixture to one. Fit the ellipsoid and estimate projected-area spherical
+   harmonics independently.
 
 There is no child-to-parent material, ellipsoid, or SH aggregation.
 

@@ -111,7 +111,7 @@ public:
             return false;
         }
 
-        mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
+        setScenePath(filePath);
 
         // Phase 1: Collect materials
         loadMaterials(ai, scene.materials);
@@ -185,7 +185,7 @@ public:
             mError = importer.GetErrorString();
             return false;
         }
-        mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
+        setScenePath(filePath);
 
         // Phase 1: Load materials
         loadMaterials(ai, outScene.materials);
@@ -271,6 +271,15 @@ public:
 private:
     std::string mError;
     std::string mSceneDir;
+    bool mForceMetalRough = false;
+
+    void setScenePath(const std::string& filePath) {
+        mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
+        std::string extension = std::filesystem::path(filePath).extension().string();
+        for (char& c : extension)
+            c = (char)std::tolower((unsigned char)c);
+        mForceMetalRough = extension == ".fbx";
+    }
 
     // Cache of extracted embedded textures (Assimp *N paths → temp file paths)
     std::unordered_map<int, std::string> mEmbeddedTempFiles;
@@ -353,19 +362,21 @@ private:
             }
             mat.specular.g = roughness;
 
-            // Metallic: PBR metallic factor, or detect SpecGloss from Phong specular color
+            // FBX materials use the MetalRough path. Assimp also exposes a
+            // legacy Phong specular color for many FBX materials, but that is
+            // not sufficient evidence that the texture uses SpecGloss packing.
+            // In particular, Falcor's Arcade *_Specular textures store
+            // roughness in G and metallic in B.
             float metallic = 0;
-            bool hasPbrMetallic = (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS);
-            if (hasPbrMetallic) {
+            if (aimat->Get(AI_MATKEY_METALLIC_FACTOR, metallic) == AI_SUCCESS) {
                 mat.specular.b = metallic;
-            } else {
-                // No PBR metallic → check for SpecGloss (Phong) model
+            } else if (!mForceMetalRough) {
                 aiColor4D specColor;
                 if (aimat->Get(AI_MATKEY_COLOR_SPECULAR, specColor) == AI_SUCCESS) {
                     mat.isSpecGloss = true;
                     float specLum = specColor.r * 0.2126f + specColor.g * 0.7152f + specColor.b * 0.0722f;
-                    mat.specular.x = std::max(0.04f, specLum);      // F0 override
-                    mat.specular.b = std::min(specLum * 2.0f, 1.0f); // metallic hint from spec intensity
+                    mat.specular.x = std::max(0.04f, specLum);
+                    mat.specular.b = std::min(specLum * 2.0f, 1.0f);
                 }
             }
 
@@ -450,7 +461,7 @@ private:
             if (!mat.texSpecular.empty()) std::cout << " roughness=" << mat.texSpecular;
             if (!mat.texMetallic.empty()) std::cout << " metallic=" << mat.texMetallic;
             if (!mat.texNormalMap.empty()) std::cout << " normal=" << mat.texNormalMap;
-            if (mat.isSpecGloss) std::cout << " [SpecGloss]";
+            std::cout << (mat.isSpecGloss ? " [SpecGloss]" : " [MetalRough]");
             if (mat.texBaseColor.empty() && mat.texSpecular.empty() && mat.texMetallic.empty() && mat.texNormalMap.empty())
                 std::cout << " (none)";
             std::cout << std::endl;

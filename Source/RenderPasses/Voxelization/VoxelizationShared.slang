@@ -15,8 +15,8 @@ struct VoxelData
     SphericalFunc primitiveProjAreaFunc;
     SphericalFunc polygonsProjAreaFunc; // 所有多边形的可见投影面积
     SphericalFunc totalProjAreaFunc;    // 所有多边形的总投影面积
-    // Per-voxel base visibility correlation. The runtime reconstructs the
-    // direction-pair correlation while enforcing c(w, w) = 1.
+    // Per-voxel same-side visibility correlation. The runtime reconstructs
+    // the direction-pair value and uses the Smith endpoint across sides.
     float visibilityCorrelation;
 
     MUTATING

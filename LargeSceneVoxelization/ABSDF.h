@@ -52,13 +52,12 @@ struct ABSDFLobe {
         weight   += w;
     }
 
-    void normalizeSelf(float visibleProjectedAreaSum) {
+    void normalizeSelf() {
         if (weight > 0) {
             normal = safeNormalize(normal);
             diffuse /= weight;
             specular /= weight;
             rough /= weight;
-            weight /= visibleProjectedAreaSum;
         }
     }
 
@@ -80,11 +79,9 @@ struct ABSDF {
 
     void normalizeSelf() {
         if (area == 0) return;
-        float totalVisibleProjectedArea = 0.0f;
         for (int i = 0; i < LOBE_COUNT; i++)
-            totalVisibleProjectedArea += lobes[i].weight;
-        for (int i = 0; i < LOBE_COUNT; i++)
-            lobes[i].normalizeSelf(totalVisibleProjectedArea);
+            lobes[i].normalizeSelf();
+        normalizeWeightsOnly();
     }
 
     void normalizeWeightsOnly() {
@@ -93,7 +90,9 @@ struct ABSDF {
             totalWeight += lobes[i].weight;
         if (totalWeight <= 0.0f) return;
 
-        float scale = 2.0f / totalWeight; // two-sided material: +n and -n
+        // Only keeps stored amplitudes in a convenient range. Runtime
+        // normalizes the view-facing projected areas to one.
+        float scale = 2.0f / totalWeight;
         for (uint i = 0; i < LOBE_COUNT; ++i)
             lobes[i].weight *= scale;
     }

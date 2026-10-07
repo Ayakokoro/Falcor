@@ -360,6 +360,8 @@ private:
         f.write((const char*)nodeCounts.data(), (mMaxDepth + 1) * sizeof(uint32_t));
         f.write((const char*)gen.mOctreeNodes.data(), totalNodes * sizeof(OctreeNode));
         f.write((const char*)gen.gBuffer.data(), totalNodes * sizeof(VoxelData));
+        constexpr uint32_t kVoxelBakeFormatTag = 0x33575056u; // "VPW3": same-side visibility correlation
+        f.write((const char*)&kVoxelBakeFormatTag, sizeof(kVoxelBakeFormatTag));
 
         f.close();
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
@@ -426,6 +428,8 @@ private:
         f.write((const char*)octree.levelNodeCounts.data(), (mMaxDepth + 1) * sizeof(uint32_t));
         f.write((const char*)octree.octreeNodes.data(), totalNodes * sizeof(OctreeNode));
         f.write((const char*)octree.gBuffer.data(), totalNodes * sizeof(VoxelData));
+        constexpr uint32_t kVoxelBakeFormatTag = 0x33575056u; // "VPW3": same-side visibility correlation
+        f.write((const char*)&kVoxelBakeFormatTag, sizeof(kVoxelBakeFormatTag));
 
         f.close();
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;

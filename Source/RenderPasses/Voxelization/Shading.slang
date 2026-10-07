@@ -259,15 +259,19 @@ struct SurfaceBRDF
         }
     }
 
-    // 当前视线 v 下所有前向 lobe（dot(n,v)>0）的权重和
+    // Stored weights are visible-area amplitudes, not view-conditional
+    // mixture weights. Project them and normalize only over the visible view.
+    float projectedWeight(uint i, float3 v)
+    {
+        return weights[i] * max(0.0f, dot(lobes[i].n, v));
+    }
+
+    // Sum of projected areas of all view-facing lobes.
     float frontWeightSum(float3 v)
     {
         float sum = 0;
         for (uint i = 0; i < lobeCount; i++)
-        {
-            if (dot(lobes[i].n, v) > 0)
-                sum += weights[i];
-        }
+            sum += projectedWeight(i, v);
         return sum;
     }
 
@@ -276,28 +280,32 @@ struct SurfaceBRDF
     {
         for (uint i = 0; i < lobeCount; i++)
         {
-            if (dot(lobes[i].n, v) > 0)
+            float projected = projectedWeight(i, v);
+            if (projected > 0)
             {
-                uLobe -= weights[i] / frontSum;
+                uLobe -= projected / frontSum;
                 if (uLobe <= 0)
                     return i;
             }
         }
         // fallback：无命中时返回第一个前向 lobe
         for (uint i = 0; i < lobeCount; i++)
-            if (dot(lobes[i].n, v) > 0)
+            if (projectedWeight(i, v) > 0)
                 return i;
         return 0;
     }
 
-    float calcBRDFWeight()
+    float calcBRDFWeight(float3 v)
     {
+        float frontSum = frontWeightSum(v);
+        if (frontSum <= 0.0f)
+            return 0.0f;
         float sum = 0;
         for (uint i = 0; i < lobeCount; i++)
         {
-            sum += weights[i] * lobes[i].evalBRDFWeight();
+            sum += (projectedWeight(i, v) / frontSum) * lobes[i].evalBRDFWeight();
         }
-        return sum;
+        return saturate(sum);
     }
 
     // 可视化法线分布时，要渲染的点在球面上的方向充当h即可（单面：仅自身半球贡献）
@@ -315,13 +323,17 @@ struct SurfaceBRDF
         return sum;
     }
 
-    // 物理 BRDF：sum_k w_k f_k，背向 lobe 底层 v.z<=0 自归零（权重不重归一）
+    // Conditional material average over the surface visible from v. Do not
+    // renormalize by light-facing lobes: unlit visible faces contribute zero.
     float3 eval(float3 l, float3 v, float3 h)
     {
+        float frontSum = frontWeightSum(v);
+        if (frontSum <= 0.0f)
+            return 0.0f;
         float3 sum = 0;
         for (uint i = 0; i < lobeCount; i++)
         {
-            sum += weights[i] * lobes[i].eval(l, v, h);
+            sum += (projectedWeight(i, v) / frontSum) * lobes[i].eval(l, v, h);
         }
         return sum;
     }
@@ -350,37 +362,52 @@ struct SurfaceBRDF
         float pdf = 0;
         for (uint i = 0; i < lobeCount; i++)
         {
-            if (dot(lobes[i].n, v) > 0)
-                pdf += (weights[i] / frontSum) * lobes[i].evalPdf(l, v, h);
+            float projected = projectedWeight(i, v);
+            if (projected > 0.0f)
+                pdf += (projected / frontSum) * lobes[i].evalPdf(l, v, h);
         }
         return pdf;
     }
 
-    // 返回朝向给定方向（n·dir>0）且权重最大的法线；若无前向 lobe，退回最高权重 lobe 并翻转朝向
-    float3 getMainNormal(float3 direction)
+    // Choose the dominant lobe that is both visible from v and light-facing.
+    // This normal also controls the shadow-ray origin bias.
+    float3 getMainNormal(float3 direction, float3 v)
     {
         float3 best = 0;
         float maxWeight = 0;
-        bool found = false;
         for (int i = 0; i < lobeCount; i++)
         {
-            if (dot(lobes[i].n, direction) > 0 && weights[i] > maxWeight)
+            float score = projectedWeight(i, v) * max(0.0f, dot(lobes[i].n, direction));
+            if (score > maxWeight)
             {
                 best = lobes[i].n;
-                maxWeight = weights[i];
-                found = true;
+                maxWeight = score;
             }
         }
-        if (found)
+        if (maxWeight > 0.0f)
             return best;
 
+        // No lobe is lit. Prefer one visible from the current view, then
+        // retain the old direction-facing fallback for degenerate data.
         maxWeight = 0;
         for (int i = 0; i < lobeCount; i++)
         {
-            if (weights[i] > maxWeight)
+            float score = projectedWeight(i, v);
+            if (score > maxWeight)
             {
                 best = lobes[i].n;
-                maxWeight = weights[i];
+                maxWeight = score;
+            }
+        }
+        if (maxWeight == 0.0f)
+        {
+            for (int i = 0; i < lobeCount; i++)
+            {
+                if (weights[i] > maxWeight)
+                {
+                    best = lobes[i].n;
+                    maxWeight = weights[i];
+                }
             }
         }
         if (dot(best, direction) < 0)
@@ -437,7 +464,7 @@ struct TEBSDF
         }
     }
 
-    float calcCoverage(float3 direction, float coverageBlend)
+    float calcCoverage(float3 direction, float coverageBlend, float coverageTolerance)
     {
 #if !CHECK_COVERAGE
         return 1;
@@ -446,20 +473,26 @@ struct TEBSDF
         if (primitiveProjArea <= 0)
             return 1;
         float polygonsProjArea = polygonsProjAreaFunc.calc(direction);
-        float rawCoverage = polygonsProjArea / primitiveProjArea;
-        float emptyRatio = (primitiveProjArea - polygonsProjArea) / max(primitiveProjArea, 1e-8f);
-        float coverage = rawCoverage + coverageBlend * emptyRatio;
-        return saturate(coverage);
+        float rawCoverage = saturate(polygonsProjArea / primitiveProjArea);
+        float tolerance = clamp(coverageTolerance, 0.0f, 0.49f);
+        if (tolerance > 0.0f)
+        {
+            // Keep smaller coverages unchanged; fill the near-full interval
+            // [1 - 2*tolerance, 1 - tolerance] smoothly, then reach exactly 1.
+            float weight = smoothstep(1.0f - 2.0f * tolerance, 1.0f - tolerance, rawCoverage);
+            rawCoverage = lerp(rawCoverage, 1.0f, weight);
+        }
+        return lerp(rawCoverage, 1.0f, saturate(coverageBlend));
     }
     // 采样前必须调用此函数
     [mutating]
-    void updateCoverage(float3 direction, float threshould, float coverageBlend)
+    void updateCoverage(float3 direction, float threshould, float coverageBlend, float coverageTolerance)
     {
 #if !CHECK_COVERAGE
         coverage = 1;
         return;
 #endif
-        coverage = calcCoverage(direction, coverageBlend);
+        coverage = calcCoverage(direction, coverageBlend, coverageTolerance);
         if (1 - coverage < threshould)
             coverage = 1;
     }
@@ -485,14 +518,22 @@ struct TEBSDF
         float Li = calcLambda(l);
         float Lo = calcLambda(v);
 
-        // A single stored scalar represents the correlation floor for widely
-        // separated directions. The fixed angular lift restores the exact
-        // identity V_i == V_o when l == v, for which c must be one.
+        // The stored scalar is fitted from distinct directions on the same
+        // side of a lobe. The angular lift restores V_i == V_o when l == v.
         float angular = saturate(0.5f * (1.0f + dot(l, v)));
         float angular2 = angular * angular;
         float angularCorrelation = angular2 * angular2;
-        float c = lerp(saturate(visibilityCorrelation), 1.0f, angularCorrelation);
-        c = 1;
+        float sameSideC = visibilityCorrelation;
+
+        // Use the dominant view-facing lobe as an unoriented local layer axis.
+        // Same-side directions use the fitted correlation; opposite-side
+        // directions return smoothly to c=0 (the Smith endpoint). The narrow
+        // transition avoids a discontinuity for directions grazing the layer.
+        float3 layerAxis = surface.getMainNormal(v, v);
+        float sideProduct = dot(layerAxis, l) * dot(layerAxis, v);
+        const float sideEpsilon = 0.01f;
+        float sameSideWeight = smoothstep(-sideEpsilon, sideEpsilon, sideProduct);
+        float c = sameSideWeight * sameSideC;
 
         float denominator = 1.0f + Li + Lo - c * min(Li, Lo);
         return saturate((1.0f + Lo) / max(denominator, 1e-6f));
@@ -527,7 +568,8 @@ struct TEBSDF
     {
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
-        return coverage * surface.eval(l, v, h) * calcCorrelationVisibility(l, v);
+        // return coverage * surface.eval(l, v, h) * calcCorrelationVisibility(l, v);
+        return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
     }
 
     float evalPdf(float3 l, float3 v, float3 h)
