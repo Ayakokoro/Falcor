@@ -8,6 +8,7 @@
 #include <fstream>
 #include <filesystem>
 #include <assimp/scene.h>
+#include <assimp/material.h>
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 
@@ -272,6 +273,7 @@ private:
     std::string mError;
     std::string mSceneDir;
     bool mForceMetalRough = false;
+    bool mIsGltf = false;
 
     void setScenePath(const std::string& filePath) {
         mSceneDir = filePath.substr(0, filePath.find_last_of("/\\"));
@@ -279,6 +281,7 @@ private:
         for (char& c : extension)
             c = (char)std::tolower((unsigned char)c);
         mForceMetalRough = extension == ".fbx";
+        mIsGltf = extension == ".glb" || extension == ".gltf";
     }
 
     // Cache of extracted embedded textures (Assimp *N paths → temp file paths)
@@ -348,8 +351,16 @@ private:
             mat.materialID = i;
 
             aiColor4D col;
-            if (aimat->Get(AI_MATKEY_COLOR_DIFFUSE, col) == AI_SUCCESS)
+            if (mIsGltf) {
+                // glTF baseColorFactor is already linear. Prefer its PBR key;
+                // Assimp's diffuse-color alias is a linear fallback as well.
+                // Only base-color texture texels need sRGB decoding.
+                if (aimat->Get(AI_MATKEY_BASE_COLOR, col) == AI_SUCCESS ||
+                    aimat->Get(AI_MATKEY_COLOR_DIFFUSE, col) == AI_SUCCESS)
+                    mat.baseColor = float3(col.r, col.g, col.b);
+            } else if (aimat->Get(AI_MATKEY_COLOR_DIFFUSE, col) == AI_SUCCESS) {
                 mat.baseColor = srgbToLinear(float3(col.r, col.g, col.b));
+            }
 
             // PBR roughness: prefer explicit roughness factor, fall back to shininess
             float roughness = 1.0f;
