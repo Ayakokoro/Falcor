@@ -13,17 +13,34 @@ import Utils.Sampling.UniformSampleGenerator;
 #define MAX_OCTREE_DEPTH 12
 #endif
 
+// RayMarchingPass supplies the same build option to the host and shader.
+#ifndef VOXELIZATION_ENABLE_PIXEL_INSPECTION
+#define VOXELIZATION_ENABLE_PIXEL_INSPECTION 0
+#endif
+
 #define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
 StructuredBuffer<TEBSDF> gBuffer0;
 StructuredBuffer<TEBSDF> gBuffer1;
 StructuredBuffer<TEBSDF> gBuffer2;
+StructuredBuffer<TEBSDF> gBuffer3;
+StructuredBuffer<TEBSDF> gBuffer4;
 StructuredBuffer<Ellipsoid> pBuffer0;
 StructuredBuffer<Ellipsoid> pBuffer1;
 StructuredBuffer<Ellipsoid> pBuffer2;
+StructuredBuffer<Ellipsoid> pBuffer3;
+StructuredBuffer<Ellipsoid> pBuffer4;
+// VBM1 records are 17 uints: 16 direction words followed by metadata.
+StructuredBuffer<uint> visibilityBuffer0;
+StructuredBuffer<uint> visibilityBuffer1;
+StructuredBuffer<uint> visibilityBuffer2;
+StructuredBuffer<uint> visibilityBuffer3;
+StructuredBuffer<uint> visibilityBuffer4;
 StructuredBuffer<OctreeNode> octreeBuffer;
 
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
 RWStructuredBuffer<float4> selectedVoxel;
+#endif
 
 cbuffer GridData
 {
@@ -45,15 +62,23 @@ cbuffer CB
     float transmittanceThreshold;
     bool renderBackGround;
     float4 clearColor;
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     uint2 selectedPixel;
+#endif
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
     uint gbSplit0;      // boundary between buffer [0] and [1]
     uint gbSplit1;      // boundary between buffer [1] and [2]
+    uint gbSplit2;      // boundary between buffer [2] and [3]
+    uint gbSplit3;      // boundary between buffer [3] and [4]
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
     float coverageTolerance; // Relative near-full coverage tolerance; 0 disables the correction.
     uint maxTransmission; // Maximum null transmissions over the whole path, independent of MAX_BOUNCE.
+    uint internalVisibilityMode;
+    bool visibilityMasksAvailable;
+    float3 visibilityDebugIncident; // World-space direction from the surface toward the light.
+    uint visibilityDebugLobe;       // Compact material lobe index, for Q/No diagnostics.
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -84,24 +109,87 @@ bool outsideGrid(int3 cellInt)
     return any(cellInt < int3(0)) || any(cellInt >= (int3)voxelCount);
 }
 
-TEBSDF loadGBuffer(uint globalIdx, uint split0, uint split1)
+TEBSDF loadGBuffer(uint globalIdx)
 {
-    if (globalIdx < split0) return gBuffer0[globalIdx];
-    else if (globalIdx < split1) return gBuffer1[globalIdx - split0];
-    else return gBuffer2[globalIdx - split1];
+    if (globalIdx < gbSplit0) return gBuffer0[globalIdx];
+    else if (globalIdx < gbSplit1) return gBuffer1[globalIdx - gbSplit0];
+    else if (globalIdx < gbSplit2) return gBuffer2[globalIdx - gbSplit1];
+    else if (globalIdx < gbSplit3) return gBuffer3[globalIdx - gbSplit2];
+    else return gBuffer4[globalIdx - gbSplit3];
 }
 
-Ellipsoid loadPBuffer(uint globalIdx, uint split0, uint split1)
+Ellipsoid loadPBuffer(uint globalIdx)
 {
-    if (globalIdx < split0) return pBuffer0[globalIdx];
-    else if (globalIdx < split1) return pBuffer1[globalIdx - split0];
-    else return pBuffer2[globalIdx - split1];
+    if (globalIdx < gbSplit0) return pBuffer0[globalIdx];
+    else if (globalIdx < gbSplit1) return pBuffer1[globalIdx - gbSplit0];
+    else if (globalIdx < gbSplit2) return pBuffer2[globalIdx - gbSplit1];
+    else if (globalIdx < gbSplit3) return pBuffer3[globalIdx - gbSplit2];
+    else return pBuffer4[globalIdx - gbSplit3];
+}
+
+VisibilityMaskPair loadVisibilityMaskPair(uint globalIdx, float3 l, float3 v)
+{
+    VisibilityMaskPair pair = { 0, 0, 0 };
+    // Never read a missing companion or an invalid direction. Metadata=0
+    // gives Q=1, supported=false without invoking the legacy attenuation.
+    if (!visibilityMasksAvailable)
+        return pair;
+    uint incident = visibilityMaskDirectionIndex(l);
+    uint outgoing = visibilityMaskDirectionIndex(v);
+    if (incident >= kVisibilityMaskDirectionCount || outgoing >= kVisibilityMaskDirectionCount)
+        return pair;
+    if (globalIdx < gbSplit0)
+    {
+        uint base = globalIdx * kVisibilityMaskWordsPerRecord;
+        pair.incident = visibilityBuffer0[base + incident];
+        pair.outgoing = visibilityBuffer0[base + outgoing];
+        pair.metadata = visibilityBuffer0[base + kVisibilityMaskDirectionCount];
+    }
+    else if (globalIdx < gbSplit1)
+    {
+        uint base = (globalIdx - gbSplit0) * kVisibilityMaskWordsPerRecord;
+        pair.incident = visibilityBuffer1[base + incident];
+        pair.outgoing = visibilityBuffer1[base + outgoing];
+        pair.metadata = visibilityBuffer1[base + kVisibilityMaskDirectionCount];
+    }
+    else if (globalIdx < gbSplit2)
+    {
+        uint base = (globalIdx - gbSplit1) * kVisibilityMaskWordsPerRecord;
+        pair.incident = visibilityBuffer2[base + incident];
+        pair.outgoing = visibilityBuffer2[base + outgoing];
+        pair.metadata = visibilityBuffer2[base + kVisibilityMaskDirectionCount];
+    }
+    else if (globalIdx < gbSplit3)
+    {
+        uint base = (globalIdx - gbSplit2) * kVisibilityMaskWordsPerRecord;
+        pair.incident = visibilityBuffer3[base + incident];
+        pair.outgoing = visibilityBuffer3[base + outgoing];
+        pair.metadata = visibilityBuffer3[base + kVisibilityMaskDirectionCount];
+    }
+    else
+    {
+        uint base = (globalIdx - gbSplit3) * kVisibilityMaskWordsPerRecord;
+        pair.incident = visibilityBuffer4[base + incident];
+        pair.outgoing = visibilityBuffer4[base + outgoing];
+        pair.metadata = visibilityBuffer4[base + kVisibilityMaskDirectionCount];
+    }
+    return pair;
+}
+
+// Surface contribution only. The caller handles coverage/event probabilities.
+float3 evalVisibleSurface(TEBSDF bsdf, uint nodeIndex, float3 l, float3 v, float3 h)
+{
+    if (internalVisibilityMode == uint(InternalVisibilityMode::Legacy))
+        return bsdf.surface.eval(l, v, h) * bsdf.calcInternalVisibility(l);
+    if (internalVisibilityMode == uint(InternalVisibilityMode::Bitmask) && visibilityMasksAvailable)
+        return bsdf.surface.evalVisible(l, v, h, loadVisibilityMaskPair(nodeIndex, l, v));
+    return bsdf.surface.eval(l, v, h);
 }
 
 // Extract max roughness across all lobes of a TEBSDF at gbIndex
 float maxRoughness(uint gbIndex)
 {
-    TEBSDF bsdf = loadGBuffer(gbIndex, gbSplit0, gbSplit1);
+    TEBSDF bsdf = loadGBuffer(gbIndex);
     float r = 0;
     for (uint i = 0; i < bsdf.surface.lobeCount; i++)
         r = max(r, bsdf.surface.lobes[i].frostBite.rough);
@@ -153,7 +241,7 @@ HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex,
 #if !CHECK_ELLIPSOID
     return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
 #else
-    Ellipsoid ellipsoid = loadPBuffer(gbIndex, gbSplit0, gbSplit1);
+    Ellipsoid ellipsoid = loadPBuffer(gbIndex);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize, maxTravelDistance);
     if (hit.hit)
         return hit;
@@ -523,7 +611,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     float times = MAX_BOUNCE;
     while (times > 0)
     {
-        TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
+        TEBSDF bsdf = loadGBuffer(offset);
         coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend, coverageTolerance);
         if (coverage >= 1 - transmittanceThreshold)
         {
@@ -542,8 +630,8 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
-    TEBSDF bsdf = loadGBuffer(offset, gbSplit0, gbSplit1);
-    Ellipsoid e = loadPBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF bsdf = loadGBuffer(offset);
+    Ellipsoid e = loadPBuffer(offset);
     float result = 0;
     switch (drawMode)
     {
@@ -569,8 +657,16 @@ float3 debugShading(HitResult hit, float3 v)
         result = bsdf.primitiveProjAreaFunc.calc(v);
         break;
     case ABSDFDrawMode::InternalVisibility:
-        result = bsdf.calcInternalVisibility(v);
-        break;
+    {
+        if (internalVisibilityMode == uint(InternalVisibilityMode::Off))
+            return float3(1);
+        if (internalVisibilityMode == uint(InternalVisibilityMode::Legacy))
+            return valueToColor(bsdf.calcInternalVisibility(safeNormalize(visibilityDebugIncident)));
+        VisibilityMaskQuery visibility = queryVisibilityMask(
+            loadVisibilityMaskPair(offset, visibilityDebugIncident, v), visibilityDebugLobe, bsdf.surface.lobeCount);
+        // Magenta distinguishes unsupported Q=1 from a measured value of 1.
+        return visibility.supported ? float3(visibility.value) : float3(1, 0, 1);
+    }
     case ABSDFDrawMode::TotalArea:
         result = bsdf.area;
         break;
@@ -582,15 +678,15 @@ float3 debugShading(HitResult hit, float3 v)
 
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
-    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(offset);
     BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend, coverageTolerance);
-    return lightColor * BSDF.eval(l, v, h);
+    return lightColor * BSDF.coverage * evalVisibleSurface(BSDF, offset, l, v, h);
 }
 
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
-    TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(offset);
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -618,7 +714,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     while (true)
     {
         uint offset = hit.gbIndex;
-        TEBSDF BSDF = loadGBuffer(offset, gbSplit0, gbSplit1);
+        TEBSDF BSDF = loadGBuffer(offset);
         BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend, coverageTolerance);
 
         // Expected direct surface contribution: shadingDirect already includes C(v).
@@ -654,9 +750,9 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
                 break;
 
             // C cancels between the surface BSDF and its event probability.
-            // Keep TEBSDF's current internal-visibility model without applying
-            // coverage a second time or clamping the conditional sampling PDF.
-            throughput *= BSDF.surface.eval(l, v, h) * BSDF.calcInternalVisibility(l) / surfacePdf;
+            // The same surface evaluator serves direct light and reflection.
+            // Do not apply coverage twice or clamp the conditional PDF.
+            throughput *= evalVisibleSurface(BSDF, offset, l, v, h) / surfacePdf;
             if (all(throughput <= 0.0f))
                 break;
             reflectionCount++;
@@ -724,7 +820,7 @@ float4 renderBackground(float3 direction)
 // LOD heatmap hue modulated by N·L and shadow.
 float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
 {
-    TEBSDF BSDF = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+    TEBSDF BSDF = loadGBuffer(hit.gbIndex);
     float3 posW = gridMin + hit.cell * voxelSize;
 
     LightSample ls = {};
@@ -778,20 +874,29 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
     HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1, false);
 
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     if (all(pixel == selectedPixel))
     {
         if (hit.hit)
         {
-            TEBSDF selectedBSDF = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+            TEBSDF selectedBSDF = loadGBuffer(hit.gbIndex);
             selectedVoxel[0] = float4(-direction, (float)hit.gbIndex);
-            selectedVoxel[1] = float4(float3(hit.cellInt), selectedBSDF.visibilityCorrelation);
+            selectedVoxel[1] = float4(float3(hit.cellInt),
+                selectedBSDF.calcInternalVisibility(safeNormalize(visibilityDebugIncident)));
+            VisibilityMaskQuery visibility = queryVisibilityMask(
+                loadVisibilityMaskPair(hit.gbIndex, visibilityDebugIncident, -direction),
+                visibilityDebugLobe, selectedBSDF.surface.lobeCount);
+            selectedVoxel[2] = float4(visibility.value, float(visibility.outgoingSamples),
+                visibility.supported ? 1.0f : 0.0f, float(selectedBSDF.surface.lobeCount));
         }
         else
         {
             selectedVoxel[0] = float4(-1);
             selectedVoxel[1] = float4(-1);
+            selectedVoxel[2] = float4(-1);
         }
     }
+#endif
 
     if (hit.hit)
     {
@@ -820,8 +925,8 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
             break;
         case ABSDFDrawMode::LODHeatmap:
         {
-            Ellipsoid e = loadPBuffer(hit.gbIndex, gbSplit0, gbSplit1);
-            TEBSDF bsdf = loadGBuffer(hit.gbIndex, gbSplit0, gbSplit1);
+            Ellipsoid e = loadPBuffer(hit.gbIndex);
+            TEBSDF bsdf = loadGBuffer(hit.gbIndex);
 
             float bSum = abs(e.B[0][0]) + abs(e.B[0][1]) + abs(e.B[0][2])
                        + abs(e.B[1][0]) + abs(e.B[1][1]) + abs(e.B[1][2])

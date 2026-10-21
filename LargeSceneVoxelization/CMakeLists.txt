@@ -153,3 +153,18 @@ if(WIN32 AND LSV_ASSIMP_TYPE STREQUAL "SHARED_LIBRARY")
         )
     endif()
 endif()
+
+# Standalone CPU tests, opt-in so normal bakes do not build test executables.
+option(LSV_BUILD_TESTS "Build CPU visibility-mask tests" OFF)
+if(LSV_BUILD_TESTS)
+    enable_testing()
+    add_executable(VisibilityMaskTests tests/VisibilityMaskTests.cpp)
+    target_include_directories(VisibilityMaskTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${GLM_INCLUDE_DIR})
+    add_test(NAME VisibilityMaskTests COMMAND VisibilityMaskTests "${CMAKE_CURRENT_BINARY_DIR}/visibility-mask-tests")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_test(NAME VisibilityMaskPipeline
+            COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_visibility_pipeline.py"
+                $<TARGET_FILE:LargeSceneVoxelization> "${CMAKE_CURRENT_BINARY_DIR}/visibility-mask-tests")
+    endif()
+endif()

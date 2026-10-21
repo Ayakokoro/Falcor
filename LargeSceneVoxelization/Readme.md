@@ -8,6 +8,29 @@ cmake --build . --config Release
 
 .\build\Release\LargeSceneVoxelization.exe "..\Scene\Metropolis\Metropolis.fbx" -o "..\resource\Metropolis_1.bin" -r 256 -s 1024
 
+## CPU visibility bitmask bake
+
+Add `--visibility-bitmask` to either bake pipeline to write `<output>.vbm`
+(VBM1: 4x4 direction words, 32 shared surface samples, 68 bytes per node).
+This replaces the legacy scalar-correlation bake; the VPW3 main file retains
+its layout and its scalar correlation field is zero in this mode.
+`RayMarchingPass` automatically loads and validates the companion when reading
+the `.bin`. Set `Draw Mode` to `Default`, then choose `Internal Visibility`:
+`Legacy one-way (VPA/TPA)` (default), `Bitmask`, or `Off`.
+Missing or rejected companions use Q=1 in Bitmask mode and report their status in
+the UI.
+
+The renderer supports up to five shared buffer segments, each below 2 GiB.
+The node capacity is `5 * floor((2^31 - 1) / largest record stride)`; with the
+current 696-byte `TEBSDF`, this is 15,427,325 nodes across all octree levels.
+Available GPU memory can impose a lower limit.
+The five-segment update passes the Release plugin build and standalone compilation
+of the preparation, ray-marching and NDF shaders. Full-scene rendering has not
+been validated as part of this update.
+
+See the [implementation document](../docs/development/voxel-visibility-bitmask.md)
+for sampling, binary layout, GPU evaluation, diagnostics and validation scope.
+
 ## Directional material validation
 
 Run from `LargeSceneVoxelization/`, using the unchanged source model, an existing

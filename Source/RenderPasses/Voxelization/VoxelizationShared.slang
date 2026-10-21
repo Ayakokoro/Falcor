@@ -1,5 +1,6 @@
 #pragma once
 #include "HostDeviceShared.slang"
+#include "VisibilityMask.slang"
 #include "Voxel/ABSDF.slang"
 #include "Math/Ellipsoid.slang"
 #include "Math/Triangle.slang"

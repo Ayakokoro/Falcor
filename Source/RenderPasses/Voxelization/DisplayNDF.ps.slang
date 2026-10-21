@@ -6,6 +6,8 @@
 StructuredBuffer<TEBSDF> gBuffer0;
 StructuredBuffer<TEBSDF> gBuffer1;
 StructuredBuffer<TEBSDF> gBuffer2;
+StructuredBuffer<TEBSDF> gBuffer3;
+StructuredBuffer<TEBSDF> gBuffer4;
 StructuredBuffer<float4> selectedVoxel; // 前三个分量表示相机指向体素的方向
 
 cbuffer CB
@@ -13,13 +15,17 @@ cbuffer CB
     float4 clearColor;
     uint gbSplit0;
     uint gbSplit1;
+    uint gbSplit2;
+    uint gbSplit3;
 }
 
-TEBSDF loadGBuffer(uint globalIdx, uint split0, uint split1)
+TEBSDF loadGBuffer(uint globalIdx)
 {
-    if (globalIdx < split0) return gBuffer0[globalIdx];
-    else if (globalIdx < split1) return gBuffer1[globalIdx - split0];
-    else return gBuffer2[globalIdx - split1];
+    if (globalIdx < gbSplit0) return gBuffer0[globalIdx];
+    else if (globalIdx < gbSplit1) return gBuffer1[globalIdx - gbSplit0];
+    else if (globalIdx < gbSplit2) return gBuffer2[globalIdx - gbSplit1];
+    else if (globalIdx < gbSplit3) return gBuffer3[globalIdx - gbSplit2];
+    else return gBuffer4[globalIdx - gbSplit3];
 }
 
 struct PsOut
@@ -27,9 +33,9 @@ struct PsOut
     float4 color : SV_Target0;
 };
 
-float3 calcColor(float2 localCoord, int offset, float3 v, uint gbSplit0, uint gbSplit1)
+float3 calcColor(float2 localCoord, int offset, float3 v)
 {
-    SurfaceBRDF BRDF = loadGBuffer(offset, gbSplit0, gbSplit1).surface;
+    SurfaceBRDF BRDF = loadGBuffer(offset).surface;
     float3 t, b;
     buildTBN(t, b, v);
 
@@ -53,7 +59,7 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         localCoord = localCoord * 2 - 1;                                                      // 映射到[-1,1]
         if (length(localCoord) <= 1)
         {
-            psOut.color = float4(calcColor(localCoord, (int)vo.w, vo.xyz, gbSplit0, gbSplit1), 1);
+            psOut.color = float4(calcColor(localCoord, (int)vo.w, vo.xyz), 1);
         }
     }
     return psOut;

@@ -2,6 +2,7 @@
 #include "VoxelizationBase.h"
 #include <Rendering/Lights/EnvMapSampler.h>
 #include <Core/Pass/FullScreenPass.h>
+#include <array>
 #include <fstream>
 #include <filesystem>
 
@@ -36,7 +37,8 @@ private:
     ref<Buffer> mpSelectedVoxelStaging;
     int3 mSelectedCellInt = int3(-1);
     uint mSelectedGbOffset = 0xFFFFFFFF;
-    float mSelectedVisibilityCorrelation = -1.0f;
+    float mSelectedLegacyVisibility = -1.0f;
+    float4 mSelectedVisibilityQuery = float4(-1.0f); // Q, No, supported, material lobe count.
     bool mSelectedHit = false;
     ref<Fbo> mpFbo;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
@@ -53,7 +55,9 @@ private:
     float mMinPdf100;
     float mTransmittanceThreshold100;
     bool mCheckEllipsoid;
-    bool mCheckVisibility;
+    InternalVisibilityMode mInternalVisibilityMode = InternalVisibilityMode::Legacy;
+    float3 mVisibilityDebugIncident = float3(0, 0, 1);
+    uint mVisibilityDebugLobe = 0;
     bool mCheckCoverage;
     bool mUseEmissiveLight;
     bool mDebug;
@@ -70,15 +74,15 @@ private:
     uint2 mSelectedPixel;
     uint mSelectedResolution;
 
-    // Triple buffer to avoid i32 overflow (>2³¹ bytes per buffer with 388-byte stride)
-    ref<Buffer> mGBuffer0;
-    ref<Buffer> mGBuffer1;
-    ref<Buffer> mGBuffer2;
-    ref<Buffer> mPBuffer0;
-    ref<Buffer> mPBuffer1;
-    ref<Buffer> mPBuffer2;
-    uint32_t mGBufferSplit0 = 0;
-    uint32_t mGBufferSplit1 = 0;
+    // Shared node splits keep every structured buffer below 2^31 bytes.
+    static constexpr uint32_t kMaxVoxelBufferCount = 5;
+    std::array<ref<Buffer>, kMaxVoxelBufferCount> mGBuffers{};
+    std::array<ref<Buffer>, kMaxVoxelBufferCount> mPBuffers{};
+    std::array<ref<Buffer>, kMaxVoxelBufferCount> mVisibilityBuffers{};
+    ref<Buffer> mEmptyVisibilityBuffer;
+    std::string mVoxelLoadStatus = "No voxel data loaded.";
+    std::string mVisibilityMaskStatus = "No visibility companion loaded.";
+    std::array<uint32_t, kMaxVoxelBufferCount - 1> mGBufferSplits{};
     ref<Buffer> mOctreeBuffer;
     uint32_t mOctreeMaxDepth = 0;
     std::vector<uint32_t> mOctreeNodeCounts;

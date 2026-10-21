@@ -13,6 +13,7 @@
 #include "MergePhase.h"
 #include "AnalyzePhase.h"
 #include "OctreeBuilder.h"
+#include "VisibilityMaskFile.h"
 #include <vector>
 #include <memory>
 #include <fstream>
@@ -22,6 +23,7 @@
 struct VoxelizationConfig {
     uint baseResolution = 512;     // N = 2^D
     uint sampleFrequency = 1024;   // rays per Lebedev direction
+    bool visibilityBitmask = false; // CPU-only VBM1 companion, replaces scalar correlation bake
 };
 
 // CPU scene voxelization: instanced loading, single hierarchical clip pass,
@@ -123,14 +125,20 @@ public:
             mBaseColorTextures, mSpecularTextures,
             mMetallicTextures, mNormalMapTextures
         };
+        std::vector<VisibilityMask::Data> visibilityMasks;
+        if (mConfig.visibilityBitmask) visibilityMasks.resize(gen.gBuffer.size());
+        AnalyzePhase::AnalyzeScratch scratch(mConfig.visibilityBitmask);
+        VisibilityMaskBake::Stats visibilityStats;
         for (uint32_t nodeIdx = 0;
              nodeIdx < (uint32_t)gen.gBuffer.size(); ++nodeIdx) {
-            AnalyzePhase::analyzeNode(gen, nodeIdx, actx);
+            AnalyzePhase::analyzeNode(gen, nodeIdx, actx, scratch,
+                mConfig.visibilityBitmask ? &visibilityMasks[nodeIdx] : nullptr, &visibilityStats);
         }
+        if (mConfig.visibilityBitmask) AnalyzePhase::printVisibilityStats(visibilityStats);
 
         // ---- Phase 3: Write output ----
         std::cout << "Writing output: " << outputPath << std::endl;
-        writeOutput(outputPath, gen);
+        if (!writeOutput(outputPath, gen, mConfig.visibilityBitmask ? &visibilityMasks : nullptr)) return false;
 
         gen.polygonArrays.clear();
         gen.polygonArrays.shrink_to_fit();
@@ -292,11 +300,38 @@ private:
 
     // ---- Output writer ----
 
-    void writeOutput(const std::string& outputPath, const PolygonGenerator& gen) {
+    bool writeVisibilityOutput(const std::string& outputPath, const GridData& grid,
+                               const std::vector<uint32_t>& counts, const std::vector<OctreeNode>& nodes,
+                               const std::vector<VoxelData>& voxels,
+                               const std::vector<VisibilityMask::Data>* masks) const {
+        if (!masks) return true;
+        try {
+            if (masks->size() != voxels.size()) throw std::runtime_error("Visibility-mask node count mismatch.");
+            VisibilityMaskFile::Fingerprint fingerprint;
+            fingerprint.append(&grid, sizeof(grid));
+            fingerprint.append(&mMaxDepth, sizeof(mMaxDepth));
+            fingerprint.append(counts.data(), counts.size() * sizeof(counts[0]));
+            fingerprint.append(nodes.data(), nodes.size() * sizeof(nodes[0]));
+            fingerprint.append(voxels.data(), voxels.size() * sizeof(voxels[0]));
+            constexpr uint32_t tag = 0x33575056u;
+            fingerprint.append(&tag, sizeof(tag));
+            const std::string path = VisibilityMaskFile::companionPath(outputPath);
+            VisibilityMaskFile::write(path, *masks, fingerprint);
+            std::cout << "Wrote visibility masks: " << path << " (" << masks->size()
+                      << " nodes, " << sizeof(VisibilityMask::Data) << " bytes/node)." << std::endl;
+            return true;
+        } catch (const std::exception& error) {
+            std::cerr << "  [VisibilityMask] ERROR: " << error.what() << std::endl;
+            return false;
+        }
+    }
+
+    bool writeOutput(const std::string& outputPath, const PolygonGenerator& gen,
+                     const std::vector<VisibilityMask::Data>* masks) {
         std::ofstream f(outputPath, std::ios::binary);
         if (!f) {
             std::cerr << "Cannot open output: " << outputPath << std::endl;
-            return;
+            return false;
         }
 
         uint totalNodes = (uint)gen.gBuffer.size();
@@ -364,18 +399,24 @@ private:
         f.write((const char*)&kVoxelBakeFormatTag, sizeof(kVoxelBakeFormatTag));
 
         f.close();
+        if (!f) {
+            std::cerr << "Cannot complete output: " << outputPath << std::endl;
+            return false;
+        }
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
+        return writeVisibilityOutput(outputPath, outGrid, nodeCounts, gen.mOctreeNodes, gen.gBuffer, masks);
     }
 
     // ---- Disk-backed output writer (works with OctreeResult) ----
-    void writeOutputDisk(const std::string& outputPath,
+    bool writeOutputDisk(const std::string& outputPath,
                          const OctreeBuilder::OctreeResult& octree,
                          uint64_t totalPolygons,
-                         uint32_t maxPolyPerNode) {
+                         uint32_t maxPolyPerNode,
+                         const std::vector<VisibilityMask::Data>* masks) {
         std::ofstream f(outputPath, std::ios::binary);
         if (!f) {
             std::cerr << "Cannot open output: " << outputPath << std::endl;
-            return;
+            return false;
         }
 
         uint32_t totalNodes = octree.totalNodes();
@@ -432,7 +473,12 @@ private:
         f.write((const char*)&kVoxelBakeFormatTag, sizeof(kVoxelBakeFormatTag));
 
         f.close();
+        if (!f) {
+            std::cerr << "Cannot complete output: " << outputPath << std::endl;
+            return false;
+        }
         std::cout << "Wrote " << totalNodes << " nodes." << std::endl;
+        return writeVisibilityOutput(outputPath, outGrid, octree.levelNodeCounts, octree.octreeNodes, octree.gBuffer, masks);
     }
 
 };
@@ -495,7 +541,9 @@ inline bool SceneVoxelization::processDisk(
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
         mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
     };
-    AnalyzePhase::execute(mergeResult, actx, mNumThreads);
+    std::vector<VisibilityMask::Data> visibilityMasks;
+    if (!AnalyzePhase::execute(mergeResult, actx, mNumThreads,
+            mConfig.visibilityBitmask ? &visibilityMasks : nullptr)) return false;
 
     // ---- Phase 4: Write output ----
     std::cout << "\n=== Phase 4: Write Output ===" << std::endl;
@@ -513,7 +561,8 @@ inline bool SceneVoxelization::processDisk(
                 maxPolyPerNode = std::max(maxPolyPerNode, ni.polyCount);
         }
     }
-    writeOutputDisk(outputPath, octree, mergeResult.totalPolygons, maxPolyPerNode);
+    if (!writeOutputDisk(outputPath, octree, mergeResult.totalPolygons, maxPolyPerNode,
+            mConfig.visibilityBitmask ? &visibilityMasks : nullptr)) return false;
 
     // Clip shards already cleaned by MergePhase; merge data always kept.
     std::cout << "Merge data kept in: " << mTmpDir << "/merge" << std::endl;

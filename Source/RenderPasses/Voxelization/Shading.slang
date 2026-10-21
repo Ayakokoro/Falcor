@@ -338,6 +338,25 @@ struct SurfaceBRDF
         return sum;
     }
 
+    // Preserve the same view-conditioned material mixture as eval()/evalPdf().
+    // Visibility belongs inside the lobe sum; it must not renormalize weights.
+    float3 evalVisible(float3 l, float3 v, float3 h, VisibilityMaskPair pair)
+    {
+        float frontSum = frontWeightSum(v);
+        if (frontSum <= 0.0f)
+            return 0.0f;
+        float3 sum = 0;
+        for (uint i = 0; i < lobeCount; i++)
+        {
+            float projected = projectedWeight(i, v);
+            if (projected <= 0.0f || dot(lobes[i].n, l) <= 0.0f)
+                continue;
+            VisibilityMaskQuery visibility = queryVisibilityMask(pair, i, lobeCount);
+            sum += (projected / frontSum) * lobes[i].eval(l, v, h) * visibility.value;
+        }
+        return sum;
+    }
+
     void sample<T : ISampleGenerator>(float3 v, out float3 l, out float3 h, inout T sg)
     {
         float frontSum = frontWeightSum(v);
@@ -568,7 +587,8 @@ struct TEBSDF
     {
         if (coverage < 1 && all(h == 0))
             return (1 - coverage) * delta.eval(l, v, h);
-        // return coverage * surface.eval(l, v, h) * calcCorrelationVisibility(l, v);
+        // Legacy convenience evaluator. RayMarching uses evalVisibleSurface()
+        // with the node index to select Legacy / Bitmask / Off for both paths.
         return coverage * surface.eval(l, v, h) * calcInternalVisibility(l);
     }
 

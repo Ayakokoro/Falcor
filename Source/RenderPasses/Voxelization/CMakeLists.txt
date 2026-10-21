@@ -1,5 +1,10 @@
 add_plugin(Voxelization)
 
+option(VOXELIZATION_ENABLE_PIXEL_INSPECTION "Enable voxel picking, NDF inspection, and synchronous GPU readback" OFF)
+target_compile_definitions(Voxelization PRIVATE
+    VOXELIZATION_ENABLE_PIXEL_INSPECTION=$<BOOL:${VOXELIZATION_ENABLE_PIXEL_INSPECTION}>
+)
+
 target_sources(Voxelization PRIVATE
     HostDeviceShared.slang
 
@@ -23,6 +28,7 @@ target_sources(Voxelization PRIVATE
     VoxelizationBase.cpp
 
     VoxelizationShared.slang
+    VisibilityMask.slang
     Shading.slang
     MixLightSampler.slang
 

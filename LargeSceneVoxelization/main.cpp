@@ -14,6 +14,7 @@ int main(int argc, char* argv[]) {
     std::string tmpDir = "./tmp";
     bool keepTemp = true;              // default: preserve temp files
     bool useInMemory = false;
+    bool visibilityBitmask = false;
     MaterialValidation::Options validation;
     bool hasCell = false, hasView = false, validationOptionsUsed = false;
     bool showHelp = false;
@@ -81,6 +82,8 @@ int main(int argc, char* argv[]) {
                 keepTemp = false;
             } else if (arg == "--in-memory") {
                 useInMemory = true;
+            } else if (arg == "--visibility-bitmask") {
+                visibilityBitmask = true;
             } else if (arg == "--help" || arg == "-h") {
                 showHelp = true;
             } else if (!arg.empty() && arg[0] != '-') {
@@ -105,7 +108,8 @@ int main(int argc, char* argv[]) {
                   << "  --tmp-dir <path>  Temp directory for intermediate files (default: ./tmp/)\n"
                   << "  --keep-temp       Keep temp files after completion (default)\n"
                   << "  --clean           Delete temp files after completion\n"
-                  << "  --in-memory       Use original in-memory pipeline (default: disk-backed)\n\n"
+                  << "  --in-memory       Use original in-memory pipeline (default: disk-backed)\n"
+                  << "  --visibility-bitmask  Bake <output>.vbm for the renderer's Bitmask visibility mode\n\n"
                   << "Read-only directional material validation (no voxelization):\n"
                   << "  --validate-material <bin>  Read an existing VPW3 voxel bake\n"
                   << "  --tmp-dir <path>          Matching cache directory containing merge/\n"
@@ -117,8 +121,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (!validation.voxelPath.empty()) {
-        if (!hasCell || !hasView || useInMemory || !outputPath.empty()) {
-            std::cerr << "Validation requires --cell and --view; use --report, not -o, and omit --in-memory.\n";
+        if (!hasCell || !hasView || useInMemory || visibilityBitmask || !outputPath.empty()) {
+            std::cerr << "Validation requires --cell and --view; use --report, not -o, and omit --in-memory/--visibility-bitmask.\n";
             return 1;
         }
         validation.tmpDir = tmpDir;
@@ -140,6 +144,7 @@ int main(int argc, char* argv[]) {
     VoxelizationConfig config;
     config.baseResolution = resolution;
     config.sampleFrequency = sampleFrequency;
+    config.visibilityBitmask = visibilityBitmask;
 
     std::cout << "=== LargeSceneVoxelization ===" << std::endl;
     std::cout << "  Input:       " << inputPath << std::endl;
@@ -154,6 +159,8 @@ int main(int argc, char* argv[]) {
     }
 
     auto start = std::chrono::high_resolution_clock::now();
+    if (visibilityBitmask)
+        std::cout << "  Visibility:  4x4 / 32-sample companion for the renderer's Bitmask mode" << std::endl;
 
     SceneVoxelization voxelizer(config);
     voxelizer.setTmpDir(tmpDir);

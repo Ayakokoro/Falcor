@@ -3,15 +3,23 @@
 #include "Math/SphericalHarmonics.slang"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/FalcorMath.h"
+#include "../../../LargeSceneVoxelization/VisibilityMaskFile.h"
 #include <fstream>
 #include <filesystem>
 
 namespace
 {
 const std::string kShaderFile = "RenderPasses/Voxelization/RayMarching.ps.slang";
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
 const std::string kDisplayShaderFile = "RenderPasses/Voxelization/DisplayNDF.ps.slang";
+#endif
 const std::string kPrepareProgramFile = "RenderPasses/Voxelization/PrepareShadingData.cs.slang";
 const std::string kOutputColor = "color";
+static_assert(kVisibilityMaskResolution == VisibilityMask::Resolution);
+static_assert(kVisibilityMaskDirectionCount == VisibilityMask::DirectionCount);
+static_assert(kVisibilityMaskSampleCount == VisibilityMask::SampleCount);
+static_assert(kVisibilityMaskMaxLobes == VisibilityMask::MaxLobes && LOBE_COUNT == VisibilityMask::MaxLobes);
+static_assert(kVisibilityMaskWordsPerRecord == VisibilityMask::WordsPerRecord);
 } // namespace
 
 RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
@@ -25,7 +33,6 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mUseEmissiveLight = false;
     mDebug = false;
     mCheckEllipsoid = true;
-    mCheckVisibility = true;
     mCheckCoverage = true;
     mDrawMode = 9;
     mMaxBounce = 0;
@@ -73,11 +80,21 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         auto flags = dict.getValue(kRenderPassRefreshFlags, RenderPassRefreshFlags::None);
         dict[Falcor::kRenderPassRefreshFlags] = flags | Falcor::RenderPassRefreshFlags::RenderOptionsChanged;
         mOptionsChanged = false;
+        mFrameIndex = 0;
     }
 
     // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
     if (!mComplete)
     {
+        // Consume this load request once. Commit all buffers and GridData only
+        // after success, so a failed file switch cannot mix old/new node data.
+        mComplete = true;
+        if (selectedFile >= filePaths.size())
+        {
+            mVoxelLoadStatus = "Voxel load failed: no file selected.";
+            return;
+        }
+        mVoxelLoadStatus = "Voxel load failed: " + filePaths[selectedFile].filename().string();
         if (!mPreparePass)
         {
             ProgramDesc desc;
@@ -90,7 +107,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mPreparePass = ComputePass::create(mpDevice, desc, defines, true);
         }
 
-        GridData& gd = VoxelizationBase::GlobalGridData;
+        GridData gd{};
 
         std::ifstream f;
         f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
@@ -100,26 +117,51 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         std::cout << "Reading voxel data from: " << filePaths[selectedFile] << std::endl;
         size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
         size_t offset = 0;
+        const std::string maskPath = VisibilityMaskFile::companionPath(filePaths[selectedFile].string());
+        std::error_code maskError;
+        const bool hasMaskFile = std::filesystem::exists(maskPath, maskError);
+        VisibilityMaskFile::Fingerprint fingerprint;
+        auto readVoxelBytes = [&](size_t bytes, void* dst)
+        {
+            if (!tryRead(f, offset, bytes, dst, fileSize)) return false;
+            if (hasMaskFile) fingerprint.append(dst, bytes);
+            return true;
+        };
 
         // Read GridData header
-        tryRead(f, offset, sizeof(GridData), &gd, fileSize);
+        if (!readVoxelBytes(sizeof(GridData), &gd)) return;
 
         // Read octree header
         uint32_t maxDepth = 0;
-        tryRead(f, offset, sizeof(uint32_t), &maxDepth, fileSize);
+        if (!readVoxelBytes(sizeof(uint32_t), &maxDepth)) return;
+        // The traversal uses 23 mantissa bits (S_MAX in RayMarching.ps.slang).
+        if (maxDepth > 23 || size_t(maxDepth + 1) * sizeof(uint32_t) > fileSize - offset)
+            return;
 
         std::vector<uint32_t> nodeCounts(maxDepth + 1);
-        tryRead(f, offset, (maxDepth + 1) * sizeof(uint32_t), nodeCounts.data(), fileSize);
+        if (!readVoxelBytes(nodeCounts.size() * sizeof(uint32_t), nodeCounts.data())) return;
 
-        uint32_t totalNodes = 0;
-        for (uint32_t i = 0; i <= maxDepth; i++)
-            totalNodes += nodeCounts[i];
+        uint64_t totalNodes64 = 0;
+        for (auto count : nodeCounts) totalNodes64 += count;
+        if (totalNodes64 == 0 || totalNodes64 > UINT32_MAX || gd.solidVoxelCount == 0 || gd.solidVoxelCount > UINT32_MAX ||
+            totalNodes64 * sizeof(OctreeNode) > fileSize - offset)
+            return;
+        const uint32_t totalNodes = uint32_t(totalNodes64);
 
         std::cout << "Octree: maxDepth=" << maxDepth << ", totalNodes=" << totalNodes;
 
         // Read all octree nodes
         std::vector<OctreeNode> octreeNodes(totalNodes);
-        tryRead(f, offset, totalNodes * sizeof(OctreeNode), octreeNodes.data(), fileSize);
+        if (!readVoxelBytes(size_t(totalNodes) * sizeof(OctreeNode), octreeNodes.data())) return;
+        // Internal LOD nodes also carry material and visibility records.
+        for (const auto& node : octreeNodes)
+        {
+            if (node.dataIndex >= gd.solidVoxelCount)
+            {
+                std::cerr << "Voxel dataIndex out of range: " << node.dataIndex << std::endl;
+                return;
+            }
+        }
 
         // Debug: verify octree dataIndex bounds
         {
@@ -183,9 +225,9 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         // Read VoxelData
         std::vector<VoxelData> voxelData(gd.solidVoxelCount);
-        tryRead(f, offset, gd.solidVoxelCount * sizeof(VoxelData), voxelData.data(), fileSize);
+        if (!readVoxelBytes(expectedVoxelBytes, voxelData.data())) return;
         uint32_t fileTag = 0;
-        tryRead(f, offset, sizeof(fileTag), &fileTag, fileSize);
+        if (!readVoxelBytes(sizeof(fileTag), &fileTag)) return;
         if (fileTag != kVoxelBakeFormatTag)
         {
             std::cerr << "Unsupported voxel bake format in " << filePaths[selectedFile]
@@ -207,9 +249,54 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         f.close();
 
+        std::vector<VisibilityMask::Data> visibilityMasks;
+        std::string maskStatus = maskError ? "Cannot inspect companion: " + maskError.message()
+                                          : "No companion; Bitmask uses Q=1 (unsupported).";
+        if (hasMaskFile)
+        {
+            try
+            {
+                visibilityMasks = VisibilityMaskFile::read(maskPath, uint32_t(gd.solidVoxelCount), fingerprint);
+                for (size_t i = 0; i < voxelData.size(); ++i)
+                {
+                    uint32_t sourceLobes = 0;
+                    for (uint32_t k = 0; k < LOBE_COUNT; ++k)
+                        if (voxelData[i].ABSDF.lobes[k].IsValid()) sourceLobes |= 1u << k;
+                    if (visibilityMasks[i].sourceLobes() != sourceLobes)
+                        throw std::runtime_error("Visibility-mask material lobe order mismatch at node " + std::to_string(i));
+                }
+                maskStatus = "VBM1 loaded: " + std::to_string(visibilityMasks.size()) + " nodes, 68 bytes/node.";
+            }
+            catch (const std::exception& error)
+            {
+                visibilityMasks.clear();
+                maskStatus = std::string("Companion rejected; Bitmask uses Q=1 (unsupported): ") + error.what();
+                std::cerr << maskStatus << std::endl;
+            }
+        }
+
         std::cout << ", solidVoxels=" << gd.solidVoxelCount << std::endl;
         for (uint32_t i = 0; i <= maxDepth; i++)
             std::cout << "  Level " << i << ": " << nodeCounts[i] << " nodes" << std::endl;
+
+        // The same node boundaries serve VoxelData, TEBSDF, ellipsoids and
+        // 17-word mask records. Bound the largest stride, including upload data.
+        const uint32_t totalVoxels = uint32_t(gd.solidVoxelCount);
+        constexpr uint32_t kMaxSafeBytes = 0x7FFFFFFFu;
+        const size_t maxStride = std::max({sizeof(VoxelData), sizeof(TEBSDF), sizeof(Ellipsoid), sizeof(VisibilityMask::Data)});
+        const uint32_t maxElemsPerBuffer = uint32_t(kMaxSafeBytes / maxStride);
+        const uint32_t numSplits = uint32_t((uint64_t(totalVoxels) + maxElemsPerBuffer - 1) / maxElemsPerBuffer);
+        if (numSplits > kMaxVoxelBufferCount)
+        {
+            mVoxelLoadStatus = "Voxel load failed: requires " + std::to_string(numSplits) +
+                " buffer segments; the renderer supports at most " + std::to_string(kMaxVoxelBufferCount) + ".";
+            return;
+        }
+        if (uint64_t(totalNodes) * sizeof(OctreeNode) > kMaxSafeBytes)
+        {
+            mVoxelLoadStatus = "Voxel load failed: octree buffer exceeds 2 GiB.";
+            return;
+        }
 
         // Create GPU buffer for octree nodes
         auto pOctreeBuffer = mpDevice->createStructuredBuffer(
@@ -219,138 +306,62 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         // Split data across buffers to avoid D3D12 i32 offset overflow:
         // structured buffer byte offset = elementIndex * stride.
-        // For 388-byte TEBSDF, max safe index per buffer = (2^31-1)/388 ≈ 5,534,751.
-        uint32_t totalVoxels = gd.solidVoxelCount;
-        const uint32_t kMaxSafeBytes = 0x7FFFFFFFu;  // 2^31 - 1
-        uint32_t maxElemsPerBuffer = kMaxSafeBytes / sizeof(TEBSDF);  // ~5.5M
-        uint32_t numSplits = (totalVoxels + maxElemsPerBuffer - 1) / maxElemsPerBuffer;
-
-        uint32_t count0 = min(maxElemsPerBuffer, totalVoxels);
-        uint32_t count1 = (totalVoxels > maxElemsPerBuffer) ? min(maxElemsPerBuffer, totalVoxels - maxElemsPerBuffer) : 0;
-        uint32_t count2 = (totalVoxels > maxElemsPerBuffer * 2) ? (totalVoxels - maxElemsPerBuffer * 2) : 0;
-        uint32_t gbSplit0 = count0;
-        uint32_t gbSplit1 = count0 + count1;
+        std::array<uint32_t, kMaxVoxelBufferCount + 1> boundaries{};
+        std::array<ref<Buffer>, kMaxVoxelBufferCount> pVoxelDataBuffers{};
+        std::array<ref<Buffer>, kMaxVoxelBufferCount> pGBuffers{};
+        std::array<ref<Buffer>, kMaxVoxelBufferCount> pPBuffers{};
+        std::array<ref<Buffer>, kMaxVoxelBufferCount> pVisibilityBuffers{};
 
         // Debug: print struct sizes
         std::cout << "sizeof(VoxelData)=" << sizeof(VoxelData)
                   << " sizeof(TEBSDF)=" << sizeof(TEBSDF)
                   << " sizeof(Ellipsoid)=" << sizeof(Ellipsoid) << std::endl;
         std::cout << "MaxElemsPerBuffer=" << maxElemsPerBuffer << " splits=" << numSplits << std::endl;
-        std::cout << "count0=" << count0 << " ("
-                  << (count0 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer0)"
-                  << std::endl;
-        if (count1 > 0)
-            std::cout << "count1=" << count1 << " ("
-                      << (count1 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer1)"
-                      << std::endl;
-        if (count2 > 0)
-            std::cout << "count2=" << count2 << " ("
-                      << (count2 * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer2)"
-                      << std::endl;
-
-        auto pVoxelDataBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(VoxelData), count0, ResourceBindFlags::ShaderResource
-        );
-        std::cout << "voxelDataBuffer0: " << (pVoxelDataBuffer0 ? "OK" : "NULL!") << std::endl;
-        if (pVoxelDataBuffer0)
-            pVoxelDataBuffer0->setBlob(voxelData.data(), 0, count0 * sizeof(VoxelData));
-
-        ref<Buffer> pVoxelDataBuffer1 = nullptr, pVoxelDataBuffer2 = nullptr;
-        if (count1 > 0)
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount; ++i)
         {
-            pVoxelDataBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(VoxelData), count1, ResourceBindFlags::ShaderResource
+            const uint32_t firstNode = boundaries[i];
+            const uint32_t count = min(maxElemsPerBuffer, totalVoxels - firstNode);
+            boundaries[i + 1] = firstNode + count;
+            if (count == 0) continue;
+
+            std::cout << "count" << i << "=" << count << " ("
+                      << (count * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB gBuffer" << i << ")" << std::endl;
+
+            pVoxelDataBuffers[i] = mpDevice->createStructuredBuffer(
+                sizeof(VoxelData), count, ResourceBindFlags::ShaderResource,
+                MemoryType::DeviceLocal, voxelData.data() + firstNode
             );
-            std::cout << "voxelDataBuffer1: " << (pVoxelDataBuffer1 ? "OK" : "NULL!") << std::endl;
-            if (pVoxelDataBuffer1)
-                pVoxelDataBuffer1->setBlob(voxelData.data() + count0, 0, count1 * sizeof(VoxelData));
-        }
-        if (count2 > 0)
-        {
-            pVoxelDataBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(VoxelData), count2, ResourceBindFlags::ShaderResource
-            );
-            std::cout << "voxelDataBuffer2: " << (pVoxelDataBuffer2 ? "OK" : "NULL!") << std::endl;
-            if (pVoxelDataBuffer2)
-                pVoxelDataBuffer2->setBlob(voxelData.data() + count0 + count1, 0, count2 * sizeof(VoxelData));
-        }
-
-        auto pGBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(TEBSDF), count0,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-            MemoryType::DeviceLocal
-        );
-        std::cout << "gBuffer0: " << (pGBuffer0 ? "OK" : "NULL!") << std::endl;
-
-        ref<Buffer> pGBuffer1 = nullptr, pGBuffer2 = nullptr;
-        if (count1 > 0)
-        {
-            pGBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), count1,
+            pGBuffers[i] = mpDevice->createStructuredBuffer(
+                sizeof(TEBSDF), count,
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
                 MemoryType::DeviceLocal
             );
-            std::cout << "gBuffer1: " << (pGBuffer1 ? "OK" : "NULL!") << std::endl;
-        }
-        if (count2 > 0)
-        {
-            pGBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), count2,
+            pPBuffers[i] = mpDevice->createStructuredBuffer(
+                sizeof(Ellipsoid), count,
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
                 MemoryType::DeviceLocal
             );
-            std::cout << "gBuffer2: " << (pGBuffer2 ? "OK" : "NULL!") << std::endl;
-        }
-
-        auto pPBuffer0 = mpDevice->createStructuredBuffer(
-            sizeof(Ellipsoid), count0,
-            ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-            MemoryType::DeviceLocal
-        );
-        std::cout << "pBuffer0: " << (pPBuffer0 ? "OK" : "NULL!") << std::endl;
-
-        ref<Buffer> pPBuffer1 = nullptr, pPBuffer2 = nullptr;
-        if (count1 > 0)
-        {
-            pPBuffer1 = mpDevice->createStructuredBuffer(
-                sizeof(Ellipsoid), count1,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "pBuffer1: " << (pPBuffer1 ? "OK" : "NULL!") << std::endl;
-        }
-        if (count2 > 0)
-        {
-            pPBuffer2 = mpDevice->createStructuredBuffer(
-                sizeof(Ellipsoid), count2,
-                ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
-                MemoryType::DeviceLocal
-            );
-            std::cout << "pBuffer2: " << (pPBuffer2 ? "OK" : "NULL!") << std::endl;
+            if (!visibilityMasks.empty())
+                pVisibilityBuffers[i] = mpDevice->createStructuredBuffer(
+                    sizeof(uint32_t), count * VisibilityMask::WordsPerRecord, ResourceBindFlags::ShaderResource,
+                    MemoryType::DeviceLocal, visibilityMasks.data() + firstNode
+                );
         }
 
         // Prepare pass: bind buffers and dispatch
         ShaderVar var = mPreparePass->getRootVar();
-        var["voxelDataBuffer0"] = pVoxelDataBuffer0;
-        if (count1 > 0)
-            var["voxelDataBuffer1"] = pVoxelDataBuffer1;
-        if (count2 > 0)
-            var["voxelDataBuffer2"] = pVoxelDataBuffer2;
-        var["gBuffer0"] = pGBuffer0;
-        if (count1 > 0)
-            var["gBuffer1"] = pGBuffer1;
-        if (count2 > 0)
-            var["gBuffer2"] = pGBuffer2;
-        var["pBuffer0"] = pPBuffer0;
-        if (count1 > 0)
-            var["pBuffer1"] = pPBuffer1;
-        if (count2 > 0)
-            var["pBuffer2"] = pPBuffer2;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount; ++i)
+        {
+            const std::string suffix = std::to_string(i);
+            var["voxelDataBuffer" + suffix] = pVoxelDataBuffers[i];
+            var["gBuffer" + suffix] = pGBuffers[i];
+            var["pBuffer" + suffix] = pPBuffers[i];
+        }
 
         auto cb = var["CB"];
         cb["voxelCount"] = totalVoxels;
-        cb["gbSplit0"] = gbSplit0;
-        cb["gbSplit1"] = gbSplit1;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount - 1; ++i)
+            cb["gbSplit" + std::to_string(i)] = boundaries[i + 1];
 
         const uint32_t kMaxThreads = 65535u * 256u;
         for (uint32_t base = 0; base < totalVoxels; base += kMaxThreads)
@@ -363,36 +374,51 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         pRenderContext->submit(true);
 
         // Store as member variables
-        mGBuffer0 = pGBuffer0;
-        mGBuffer1 = pGBuffer1;
-        mGBuffer2 = pGBuffer2;
-        mPBuffer0 = pPBuffer0;
-        mPBuffer1 = pPBuffer1;
-        mPBuffer2 = pPBuffer2;
-        mGBufferSplit0 = gbSplit0;
-        mGBufferSplit1 = gbSplit1;
+        mGBuffers = std::move(pGBuffers);
+        mPBuffers = std::move(pPBuffers);
+        mVisibilityBuffers = std::move(pVisibilityBuffers);
+        mVisibilityMaskStatus = std::move(maskStatus);
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount - 1; ++i)
+            mGBufferSplits[i] = boundaries[i + 1];
         mOctreeBuffer = pOctreeBuffer;
         mOctreeMaxDepth = maxDepth;
         mOctreeNodeCounts = std::move(nodeCounts);
+        gridData = gd;
+        mVoxelLoadStatus = "Loaded: " + filePaths[selectedFile].filename().string();
+        mSelectedHit = false;
 
-        mComplete = true;
+    }
+
+    if (!mGBuffers[0])
+    {
+        pRenderContext->clearRtv(renderData.getTexture(kOutputColor)->getRTV().get(), float4(0));
+        return;
     }
 
     // ---- Step 2: Ray marching ----
     FALCOR_PROFILE(pRenderContext, "RayMarching");
     ref<Camera> pCamera = mpScene->getCamera();
     ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
-            mpDevice->createStructuredBuffer(sizeof(float4), 2, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+            mpDevice->createStructuredBuffer(sizeof(float4), 3, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+    }
+    mSelectedPixel = uint2(mSelectedUV.x * pOutputColor->getWidth(), mSelectedUV.y * pOutputColor->getHeight());
+#endif
+    if (!mEmptyVisibilityBuffer)
+    {
+        const uint32_t zero = 0;
+        mEmptyVisibilityBuffer = mpDevice->createStructuredBuffer(
+            sizeof(uint32_t), 1, ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, &zero);
     }
 
     pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0));
 
-    mSelectedPixel = uint2(mSelectedUV.x * pOutputColor->getWidth(), mSelectedUV.y * pOutputColor->getHeight());
-
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     if (!mDisplayNDF)
+#endif
     {
         if (!mpFullScreenPass)
         {
@@ -402,10 +428,15 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             desc.addTypeConformances(mpScene->getTypeConformances());
             mpFullScreenPass = FullScreenPass::create(mpDevice, desc, mpScene->getSceneDefines());
         }
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
         pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), float4(-1));
+#endif
 
+        mpFullScreenPass->addDefine("VOXELIZATION_ENABLE_PIXEL_INSPECTION", std::to_string(VOXELIZATION_ENABLE_PIXEL_INSPECTION));
         mpFullScreenPass->addDefine("CHECK_ELLIPSOID", mCheckEllipsoid ? "1" : "0");
-        mpFullScreenPass->addDefine("CHECK_VISIBILITY", mCheckVisibility ? "1" : "0");
+        // Mode selection is uniform shader data; the legacy function itself
+        // stays enabled for Legacy and its diagnostic. Bitmask/Off bypass it.
+        mpFullScreenPass->addDefine("CHECK_VISIBILITY", "1");
         mpFullScreenPass->addDefine("CHECK_COVERAGE", mCheckCoverage ? "1" : "0");
         mpFullScreenPass->addDefine("DEBUG", mDebug ? "1" : "0");
         mpFullScreenPass->addDefine("MAX_BOUNCE", std::to_string(mMaxBounce));
@@ -438,14 +469,17 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         if (pEnvMap)
             mpEnvMapSampler->bindShaderData(var["gEnvMapSampler"]);
 
-        var["gBuffer0"] = mGBuffer0;
-        var["gBuffer1"] = mGBuffer1;
-        var["gBuffer2"] = mGBuffer2;
-        var["pBuffer0"] = mPBuffer0;
-        var["pBuffer1"] = mPBuffer1;
-        var["pBuffer2"] = mPBuffer2;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount; ++i)
+        {
+            const std::string suffix = std::to_string(i);
+            var["gBuffer" + suffix] = mGBuffers[i];
+            var["pBuffer" + suffix] = mPBuffers[i];
+            var["visibilityBuffer" + suffix] = mVisibilityBuffers[i] ? mVisibilityBuffers[i] : mEmptyVisibilityBuffer;
+        }
         var["octreeBuffer"] = mOctreeBuffer;
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
         var["selectedVoxel"] = mSelectedVoxel;
+#endif
 
         auto cb_GridData = var["GridData"];
         cb_GridData["gridMin"] = gridData.gridMin;
@@ -462,22 +496,29 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["frameIndex"] = mFrameIndex;
         cb["minPdf"] = mMinPdf100 / 100;
         cb["transmittanceThreshold"] = mTransmittanceThreshold100 / 100;
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
         cb["selectedPixel"] = mSelectedPixel;
+#endif
         cb["renderBackGround"] = mRenderBackGround;
         cb["clearColor"] = float4(mClearColor, 0);
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
-        cb["gbSplit0"] = mGBufferSplit0;
-        cb["gbSplit1"] = mGBufferSplit1;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount - 1; ++i)
+            cb["gbSplit" + std::to_string(i)] = mGBufferSplits[i];
         cb["coverageBlend"] = mCoverageBlend;
         cb["coverageTolerance"] = mCoverageTolerance;
         cb["maxTransmission"] = mMaxTransmission;
+        cb["internalVisibilityMode"] = uint32_t(mInternalVisibilityMode);
+        cb["visibilityMasksAvailable"] = mVisibilityBuffers[0] != nullptr;
+        cb["visibilityDebugIncident"] = mVisibilityDebugIncident;
+        cb["visibilityDebugLobe"] = mVisibilityDebugLobe;
         mFrameIndex++;
 
         mpFbo->attachColorTarget(pOutputColor, 0);
         mpFullScreenPass->execute(pRenderContext, mpFbo);
     }
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     else
     {
         if (!mpDisplayNDFPass)
@@ -488,21 +529,20 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mpDisplayNDFPass = FullScreenPass::create(mpDevice, desc);
         }
         auto var = mpDisplayNDFPass->getRootVar();
-        var["gBuffer0"] = mGBuffer0;
-        var["gBuffer1"] = mGBuffer1;
-        var["gBuffer2"] = mGBuffer2;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount; ++i)
+            var["gBuffer" + std::to_string(i)] = mGBuffers[i];
         var["selectedVoxel"] = mSelectedVoxel;
 
         auto cb = var["CB"];
         cb["clearColor"] = float4(mClearColor, 0);
-        cb["gbSplit0"] = mGBufferSplit0;
-        cb["gbSplit1"] = mGBufferSplit1;
+        for (uint32_t i = 0; i < kMaxVoxelBufferCount - 1; ++i)
+            cb["gbSplit" + std::to_string(i)] = mGBufferSplits[i];
 
         mpFbo->attachColorTarget(pOutputColor, 0);
         mpDisplayNDFPass->execute(pRenderContext, mpFbo);
     }
 
-    // Readback selected voxel info for UI display
+    // Diagnostic builds only: this readback waits for the GPU every frame.
     if (mSelectedVoxel)
     {
         if (!mpSelectedVoxelStaging)
@@ -512,6 +552,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         float4* pData = reinterpret_cast<float4*>(mpSelectedVoxelStaging->map());
         float4 v0 = pData[0];
         float4 v1 = pData[1];
+        float4 visibility = pData[2];
         mpSelectedVoxelStaging->unmap();
 
         if (v0.x != -1.0f || v0.y != -1.0f || v0.z != -1.0f || v0.w != -1.0f)
@@ -519,16 +560,19 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mSelectedHit = true;
             mSelectedGbOffset = (uint)v0.w;
             mSelectedCellInt = int3((int)v1.x, (int)v1.y, (int)v1.z);
-            mSelectedVisibilityCorrelation = v1.w;
+            mSelectedLegacyVisibility = v1.w;
+            mSelectedVisibilityQuery = visibility;
         }
         else
         {
             mSelectedHit = false;
             mSelectedGbOffset = 0xFFFFFFFF;
             mSelectedCellInt = int3(-1);
-            mSelectedVisibilityCorrelation = -1.0f;
+            mSelectedLegacyVisibility = -1.0f;
+            mSelectedVisibilityQuery = float4(-1.0f);
         }
     }
+#endif
 }
 
 void RayMarchingPass::compile(RenderContext* pRenderContext, const CompileData& compileData)
@@ -545,12 +589,13 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         filePaths.clear();
         for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
         {
-            if (std::filesystem::is_regular_file(entry))
+            if (std::filesystem::is_regular_file(entry) && entry.path().extension() == ".bin")
             {
                 filePaths.push_back(entry.path());
             }
         }
         VoxelizationBase::FileUpdated = false;
+        if (selectedFile >= filePaths.size()) selectedFile = 0;
     }
     Gui::DropdownList list;
     for (uint i = 0; i < filePaths.size(); i++)
@@ -559,22 +604,13 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     }
     widget.dropdown("File", list, selectedFile);
 
-    if (mpScene && widget.button("Read"))
+    if (mpScene && selectedFile < filePaths.size() && widget.button("Read"))
     {
-        std::ifstream f;
-        f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
-        if (f.is_open())
-        {
-            size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
-            size_t offset = 0;
-            tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
-            f.close();
-
-            requestRecompile();
-            mComplete = false;
-            mOptionsChanged = true;
-        }
+        mComplete = false;
+        mDisplayNDF = false; // Refresh the selected node before inspecting a new file.
+        mOptionsChanged = true;
     }
+    widget.text(mVoxelLoadStatus);
 
     widget.text("Voxel Size: " + ToString(gridData.voxelSize));
     widget.text("Voxel Count: " + ToString((int3)gridData.voxelCount));
@@ -616,8 +652,11 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.checkbox("Check Ellipsoid", mCheckEllipsoid))
         mOptionsChanged = true;
-    if (widget.checkbox("Check Visibility", mCheckVisibility))
+    if (widget.dropdown("Internal Visibility", mInternalVisibilityMode))
         mOptionsChanged = true;
+    widget.text(mVisibilityMaskStatus);
+    if (mInternalVisibilityMode == InternalVisibilityMode::Bitmask && !mVisibilityBuffers[0])
+        widget.text("Bitmask unavailable: Q=1 fallback. Legacy attenuation is not applied.");
     if (widget.checkbox("Check Coverage", mCheckCoverage))
         mOptionsChanged = true;
     if (mCheckCoverage)
@@ -637,12 +676,31 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.dropdown("Draw Mode", reinterpret_cast<ABSDFDrawMode&>(mDrawMode)))
         mOptionsChanged = true;
+    if (mInternalVisibilityMode == InternalVisibilityMode::Bitmask || mDrawMode == uint(ABSDFDrawMode::InternalVisibility))
+    {
+        if (widget.var("Visibility Incident (world)", mVisibilityDebugIncident, -1.0f, 1.0f, 0.01f))
+        {
+            mDisplayNDF = false;
+            mOptionsChanged = true;
+        }
+        if (mInternalVisibilityMode == InternalVisibilityMode::Bitmask)
+        {
+            if (widget.slider("Visibility Lobe (compact)", mVisibilityDebugLobe, 0u, kVisibilityMaskMaxLobes - 1))
+            {
+                mDisplayNDF = false;
+                mOptionsChanged = true;
+            }
+            widget.text("Visibility debug: grayscale=Q, magenta=unsupported. Incident must be nonzero.");
+        }
+    }
     if (widget.slider("Max Bounce", mMaxBounce, 0u, 4u))
         mOptionsChanged = true;
     if (widget.var("Max Transmission", mMaxTransmission, 0u, 16384u))
         mOptionsChanged = true;
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     if (widget.checkbox("Display NDF", mDisplayNDF))
         mOptionsChanged = true;
+#endif
     if (widget.rgbColor("Clear Color", mClearColor))
         mOptionsChanged = true;
     if (widget.checkbox("Render Background", mRenderBackGround))
@@ -668,17 +726,29 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         }
     }
 
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     widget.text("Selected Pixel: " + ToString(mSelectedPixel));
     if (mSelectedHit)
     {
         widget.text("Selected Voxel cellInt: " + ToString(mSelectedCellInt));
         widget.text("Selected Voxel gbOffset: " + std::to_string(mSelectedGbOffset));
-        widget.text("Selected Voxel c_sameSide: " + std::to_string(mSelectedVisibilityCorrelation));
+        if (mInternalVisibilityMode == InternalVisibilityMode::Bitmask)
+        {
+            widget.text("Selected Q[" + std::to_string(mVisibilityDebugLobe) + "]: " + std::to_string(mSelectedVisibilityQuery.x));
+            widget.text("Outgoing samples: " + std::to_string(uint(mSelectedVisibilityQuery.y)) +
+                        ", material lobes: " + std::to_string(uint(mSelectedVisibilityQuery.w)));
+            widget.text(mSelectedVisibilityQuery.z > 0.0f ? "Visibility supported" : "Visibility unsupported (Q=1 fallback)");
+        }
+        else if (mInternalVisibilityMode == InternalVisibilityMode::Legacy)
+            widget.text("Selected legacy VPA/TPA(incident): " + std::to_string(mSelectedLegacyVisibility));
+        else
+            widget.text("Internal visibility: Off (factor 1)");
     }
     else
     {
         widget.text("Selected Voxel: none (no hit)");
     }
+#endif
 }
 
 void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
@@ -693,22 +763,25 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
 
 bool RayMarchingPass::onMouseEvent(const MouseEvent& mouseEvent)
 {
+#if VOXELIZATION_ENABLE_PIXEL_INSPECTION
     if (mouseEvent.type == MouseEvent::Type::ButtonDown && mouseEvent.button == Input::MouseButton::Left)
     {
         mSelectedUV = mouseEvent.pos;
         return true;
     }
+#endif
     return false;
 }
 
 bool RayMarchingPass::tryRead(std::ifstream& f, size_t& offset, size_t bytes, void* dst, size_t fileSize)
 {
-    if (offset + bytes > fileSize)
+    if (offset > fileSize || bytes > fileSize - offset)
         return false;
     if (dst)
     {
         f.seekg(offset, std::ios::beg);
         f.read(reinterpret_cast<char*>(dst), bytes);
+        if (!f) return false;
     }
     offset += bytes;
     return true;

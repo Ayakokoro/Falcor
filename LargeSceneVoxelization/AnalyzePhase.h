@@ -12,6 +12,7 @@
 #include "PolygonGenerator.h"
 #include "OctreeBuilder.h"
 #include "MergePhase.h"
+#include "VisibilityMaskBake.h"
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -56,21 +57,14 @@ static constexpr uint32_t correlationProjectionIndex(uint32_t lobe, uint32_t loc
         : LOBE_COUNT + lobe * CORRELATION_PERTURBATION_COUNT + (localDirection - 1);
 }
 
-struct AnalyzeScratch {
-    static constexpr uint32_t PixelCount = PROJ_RES * PROJ_RES;
-
-    std::vector<float> depths;
-    std::vector<uint32_t> ids;
-    std::array<float3, CORRELATION_PROJECTION_COUNT> directions;
-    std::array<Basis2, CORRELATION_PROJECTION_COUNT> bases;
+struct AnalyzeScratch : VisibilityMaskBake::ProjectionMaps {
     std::array<uint32_t, CORRELATION_PROJECTION_COUNT> occupiedCounts{};
     std::array<uint32_t, CORRELATION_PROJECTION_COUNT> sampleCounts{};
     std::array<bool, CORRELATION_PROJECTION_COUNT> valid{};
     std::array<std::array<uint32_t, CORRELATION_SAMPLE_COUNT>, CORRELATION_PROJECTION_COUNT> samplePixels{};
 
-    AnalyzeScratch()
-        : depths(CORRELATION_PROJECTION_COUNT * PixelCount),
-          ids(CORRELATION_PROJECTION_COUNT * PixelCount) {
+    explicit AnalyzeScratch(bool visibilityBitmask = false)
+        : ProjectionMaps(visibilityBitmask ? VisibilityMask::DirectionCount : CORRELATION_PROJECTION_COUNT) {
         reset();
     }
 
@@ -79,11 +73,6 @@ struct AnalyzeScratch {
         occupiedCounts.fill(0);
         sampleCounts.fill(0);
     }
-
-    float* depthData(uint32_t k) { return depths.data() + k * PixelCount; }
-    uint32_t* idData(uint32_t k) { return ids.data() + k * PixelCount; }
-    const float* depthData(uint32_t k) const { return depths.data() + k * PixelCount; }
-    const uint32_t* idData(uint32_t k) const { return ids.data() + k * PixelCount; }
 
     // Select pixels uniformly by rank among occupied pixels. This retains the
     // projected-area measure while bounding pairwise reprojection work.
@@ -408,13 +397,16 @@ inline void analyzeNodeData(VoxelData& vd,
                             uint32_t level,
                             const std::vector<Polygon>& nodePolys,
                             const AnalyzeContext& ctx,
-                            AnalyzeScratch& scratch) {
+                            AnalyzeScratch& scratch,
+                            VisibilityMask::Data* visibilityMask = nullptr,
+                            VisibilityMaskBake::Stats* visibilityStats = nullptr) {
     PolygonRange range;
     range.init(cellInt);
     range.nodeScale = (float)(1u << (ctx.maxDepth - level));
     range.count = (uint32_t)nodePolys.size();
 
     vd.init();
+    if (visibilityMask) *visibilityMask = {};
     scratch.reset();
 
     float3 invVoxelSize(1.0f / ctx.grid.voxelSize.x,
@@ -500,7 +492,7 @@ inline void analyzeNodeData(VoxelData& vd,
             fitNumerator[m] += cosine * visibleByLobe[m];
             fitDenominator[m] += cosine * cosine;
         }
-        scratch.buildSamples(k, occupiedPixelCount);
+        if (!visibilityMask) scratch.buildSamples(k, occupiedPixelCount);
         vd.ABSDF.lobes[k].normalizeSelf();
     }
 
@@ -514,39 +506,49 @@ inline void analyzeNodeData(VoxelData& vd,
     if (!vd.isSolid())
         return;
 
-    // Add four 25-degree directions around every valid lobe. These extra
-    // projections make same-side correlation observable even when a voxel
-    // contains only one pair of opposite, perfectly parallel lobes.
-    for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
-        if (!scratch.valid[k])
-            continue;
+    if (visibilityMask) {
+        // Finish material fitting before reusing its maps. Every octree level
+        // samples its own clipped polygons; child bit identities cannot merge.
+        const uint32_t seed = uint32_t(cellInt.x) * 0x8da6b343u ^ uint32_t(cellInt.y) * 0xd8163841u ^
+                              uint32_t(cellInt.z) * 0xcb1ab31fu ^ level * 0x9e3779b9u;
+        VisibilityMaskBake::Stats stats;
+        *visibilityMask = VisibilityMaskBake::bake(vd.ABSDF, range, nodePolys, lobePairs, scratch, seed, stats);
+        if (visibilityStats) *visibilityStats += stats;
+    } else {
+        // Add four 25-degree directions around every valid lobe. These extra
+        // projections make same-side correlation observable even when a voxel
+        // contains only one pair of opposite, perfectly parallel lobes.
+        for (uint32_t k = 0; k < LOBE_COUNT; ++k) {
+            if (!scratch.valid[k])
+                continue;
 
-        const float3 baseDirection = scratch.directions[k];
-        const Basis2 baseBasis = scratch.bases[k];
-        const float3 tangentDirections[CORRELATION_PERTURBATION_COUNT] = {
-            baseBasis.u, -baseBasis.u, baseBasis.w, -baseBasis.w
-        };
+            const float3 baseDirection = scratch.directions[k];
+            const Basis2 baseBasis = scratch.bases[k];
+            const float3 tangentDirections[CORRELATION_PERTURBATION_COUNT] = {
+                baseBasis.u, -baseBasis.u, baseBasis.w, -baseBasis.w
+            };
 
-        for (uint32_t p = 0; p < CORRELATION_PERTURBATION_COUNT; ++p) {
-            uint32_t projectionIndex = correlationProjectionIndex(k, p + 1);
-            float3 direction = safeNormalize(
-                CORRELATION_PERTURBATION_COS * baseDirection +
-                CORRELATION_PERTURBATION_SIN * tangentDirections[p]);
+            for (uint32_t p = 0; p < CORRELATION_PERTURBATION_COUNT; ++p) {
+                uint32_t projectionIndex = correlationProjectionIndex(k, p + 1);
+                float3 direction = safeNormalize(
+                    CORRELATION_PERTURBATION_COS * baseDirection +
+                    CORRELATION_PERTURBATION_SIN * tangentDirections[p]);
 
-            float* depth = scratch.depthData(projectionIndex);
-            uint32_t* ids = scratch.idData(projectionIndex);
-            std::fill(depth, depth + AnalyzeScratch::PixelCount, std::numeric_limits<float>::max());
-            std::fill(ids, ids + AnalyzeScratch::PixelCount, std::numeric_limits<uint32_t>::max());
-            range.rasterizeDepth(nodePolys, direction, depth, ids);
+                float* depth = scratch.depthData(projectionIndex);
+                uint32_t* ids = scratch.idData(projectionIndex);
+                std::fill(depth, depth + AnalyzeScratch::PixelCount, std::numeric_limits<float>::max());
+                std::fill(ids, ids + AnalyzeScratch::PixelCount, std::numeric_limits<uint32_t>::max());
+                range.rasterizeDepth(nodePolys, direction, depth, ids);
 
-            uint32_t occupiedPixelCount = 0;
-            for (uint32_t pixel = 0; pixel < AnalyzeScratch::PixelCount; ++pixel)
-                occupiedPixelCount += ids[pixel] != std::numeric_limits<uint32_t>::max() ? 1u : 0u;
+                uint32_t occupiedPixelCount = 0;
+                for (uint32_t pixel = 0; pixel < AnalyzeScratch::PixelCount; ++pixel)
+                    occupiedPixelCount += ids[pixel] != std::numeric_limits<uint32_t>::max() ? 1u : 0u;
 
-            scratch.valid[projectionIndex] = occupiedPixelCount > 0;
-            scratch.directions[projectionIndex] = direction;
-            scratch.bases[projectionIndex] = orthonormal_basis(direction);
-            scratch.buildSamples(projectionIndex, occupiedPixelCount);
+                scratch.valid[projectionIndex] = occupiedPixelCount > 0;
+                scratch.directions[projectionIndex] = direction;
+                scratch.bases[projectionIndex] = orthonormal_basis(direction);
+                scratch.buildSamples(projectionIndex, occupiedPixelCount);
+            }
         }
     }
 
@@ -560,63 +562,88 @@ inline void analyzeNodeData(VoxelData& vd,
     vd.polygonsProjAreaFunc = polygonFunc;
     vd.primitiveProjAreaFunc = primitiveFunc;
     vd.totalProjAreaFunc = totalFunc;
-    vd.visibilityCorrelation = fitVisibilityCorrelation(vd, nodePolys, scratch);
+    // Bitmask mode intentionally skips the old scalar fit. Keep its legacy
+    // field at zero so the VPW3 layout remains readable by existing tools.
+    if (!visibilityMask) vd.visibilityCorrelation = fitVisibilityCorrelation(vd, nodePolys, scratch);
 }
 
 // Convenience overload for the in-memory pipeline.
 inline void analyzeNode(PolygonGenerator& generator,
                         uint32_t bfsIndex,
-                        const AnalyzeContext& ctx) {
+                        const AnalyzeContext& ctx,
+                        AnalyzeScratch& scratch,
+                        VisibilityMask::Data* visibilityMask = nullptr,
+                        VisibilityMaskBake::Stats* visibilityStats = nullptr) {
     const auto& node = generator.mBFSOrder[bfsIndex];
-    AnalyzeScratch scratch;
     analyzeNodeData(generator.gBuffer[bfsIndex], node.cellInt, node.level,
-                    generator.polygonArrays[bfsIndex], ctx, scratch);
+                    generator.polygonArrays[bfsIndex], ctx, scratch, visibilityMask, visibilityStats);
+}
+
+inline void printVisibilityStats(const VisibilityMaskBake::Stats& stats) {
+    std::cout << "  [VisibilityMask] candidates=" << stats.candidates
+              << " samples=" << stats.acceptedSamples
+              << " invalidLobes=" << stats.invalidLobes << "/" << stats.activeLobes
+              << " unsupportedFrontDirections=" << stats.unsupportedFrontDirections
+              << "/" << stats.frontDirections << std::endl;
 }
 
 // ---- Main entry point: stream through nodes.idx and analyze every node ----
 // Each worker opens its own read-only handle on polygons.dat.  Since every BFS
 // index is unique, gBuffer writes are disjoint.
-inline void execute(const MergePhase::MergeResult& mergeResult,
+inline bool execute(MergePhase::MergeResult& mergeResult,
                     const AnalyzeContext& ctx,
-                    uint32_t numThreads = 0) {
+                    uint32_t numThreads = 0,
+                    std::vector<VisibilityMask::Data>* visibilityMasks = nullptr) {
     std::ifstream idxIn(mergeResult.nodesIdxPath, std::ios::binary);
     if (!idxIn) {
         std::cerr << "  [Analyze] ERROR: cannot open " << mergeResult.nodesIdxPath << std::endl;
-        return;
+        return false;
     }
 
     PolygonSerializer::NodesIdxHeader idxHdr;
     if (!PolygonSerializer::readNodesIdxHeader(idxIn, idxHdr)) {
         std::cerr << "  [Analyze] ERROR: invalid nodes.idx header" << std::endl;
-        return;
+        return false;
+    }
+    if (idxHdr.nodeCount != mergeResult.octree.totalNodes() || idxHdr.maxDepth != ctx.maxDepth) {
+        std::cerr << "  [Analyze] ERROR: node index does not match the octree" << std::endl;
+        return false;
     }
 
     std::vector<PolygonSerializer::NodeIndex> nodeIndices;
     PolygonSerializer::readNodeIndices(idxIn, nodeIndices, idxHdr.nodeCount);
+    if (!idxIn) {
+        std::cerr << "  [Analyze] ERROR: truncated node index" << std::endl;
+        return false;
+    }
     idxIn.close();
 
     uint64_t totalNodes = nodeIndices.size();
     std::cout << "  [Analyze] " << totalNodes << " nodes to process" << std::endl;
     if (totalNodes == 0)
-        return;
+        return false;
 
     if (numThreads == 0)
         numThreads = std::max(1u, std::thread::hardware_concurrency());
     numThreads = std::min(numThreads, (uint32_t)totalNodes);
 
-    auto& octree = const_cast<OctreeBuilder::OctreeResult&>(mergeResult.octree);
+    auto& octree = mergeResult.octree;
+    if (visibilityMasks) visibilityMasks->assign(octree.totalNodes(), {});
     std::atomic<uint64_t> processed{0};
     std::atomic<uint64_t> skipped{0};
+    std::atomic<bool> failed{false};
+    std::vector<VisibilityMaskBake::Stats> visibilityStats(numThreads);
 
     auto worker = [&](uint64_t start, uint64_t end, uint32_t threadId) {
         std::ifstream polyIn(mergeResult.polygonsDatPath, std::ios::binary);
         if (!polyIn) {
             std::cerr << "  [Analyze] ERROR: thread " << threadId
                       << " cannot open " << mergeResult.polygonsDatPath << std::endl;
+            failed.store(true, std::memory_order_relaxed);
             return;
         }
 
-        AnalyzeScratch scratch;
+        AnalyzeScratch scratch(visibilityMasks != nullptr);
 
         uint64_t nextReport = 5000;
         for (uint64_t ni = start; ni < end; ++ni) {
@@ -652,7 +679,9 @@ inline void execute(const MergePhase::MergeResult& mergeResult,
             uint32_t bfsIndex = bfsIt->second;
             const auto& node = octree.bfsOrder[bfsIndex];
             analyzeNodeData(octree.gBuffer[bfsIndex], node.cellInt, node.level,
-                            nodePolys, ctx, scratch);
+                            nodePolys, ctx, scratch,
+                            visibilityMasks ? &(*visibilityMasks)[bfsIndex] : nullptr,
+                            &visibilityStats[threadId]);
 
             uint64_t p = processed.fetch_add(1, std::memory_order_relaxed) + 1;
             if (threadId == 0 && p >= nextReport) {
@@ -679,6 +708,12 @@ inline void execute(const MergePhase::MergeResult& mergeResult,
     if (skipped.load() > 0)
         std::cout << "  skipped=" << skipped.load();
     std::cout << std::endl;
+    if (visibilityMasks) {
+        VisibilityMaskBake::Stats stats;
+        for (const auto& workerStats : visibilityStats) stats += workerStats;
+        printVisibilityStats(stats);
+    }
+    return !failed.load() && skipped.load() == 0 && processed.load() == totalNodes;
 }
 
 } // namespace AnalyzePhase
