@@ -31,6 +31,8 @@ struct AnalyzeContext
     const std::vector<Texture2D>& specularTextures;
     const std::vector<Texture2D>& metallicTextures;
     const std::vector<Texture2D>& normalMapTextures;
+    std::vector<VisibleMaterialFile::Data>* visibleMaterials = nullptr;
+    std::vector<VisibilityMask::Data>* visibilityMasks = nullptr;
 };
 
 inline void analyzeNode(
@@ -58,16 +60,21 @@ inline void analyzeNode(
         ctx.scene, ctx.grid, ctx.maxDepth, textures};
     VoxelizationCore::AnalysisOptions options;
     options.sampleFrequency = ctx.sampleFrequency;
+    options.visibleMaterial = ctx.visibleMaterials != nullptr;
+    options.visibilityBitmask = ctx.visibilityMasks != nullptr;
 
     const auto result = VoxelizationCore::analyzeNode(
         node, analysisContext, options);
     if (!result.success)
     {
+        if (ctx.visibleMaterials) throw std::runtime_error(result.error);
         std::cerr << "  [Analyze] ERROR: " << result.error << std::endl;
         octree.gBuffer[bfsIndex].init();
         return;
     }
     octree.gBuffer[bfsIndex] = result.voxelData;
+    if (ctx.visibleMaterials) (*ctx.visibleMaterials)[bfsIndex] = result.visibleMaterial;
+    if (ctx.visibilityMasks) (*ctx.visibilityMasks)[bfsIndex] = result.visibilityMask;
 }
 
 // Analyze a generic node-index file. The leaf path and every exact LOD path
@@ -84,6 +91,7 @@ inline void executeNodes(
     std::ifstream idxIn(indexPath, std::ios::binary);
     if (!idxIn)
     {
+        if (ctx.visibleMaterials) throw std::runtime_error("Cannot open extension node index.");
         std::cerr << "  [Analyze] ERROR: cannot open " << indexPath << std::endl;
         return;
     }
@@ -91,6 +99,7 @@ inline void executeNodes(
     PolygonSerializer::NodesIdxHeader idxHdr;
     if (!PolygonSerializer::readNodesIdxHeader(idxIn, idxHdr))
     {
+        if (ctx.visibleMaterials) throw std::runtime_error("Invalid extension node index.");
         std::cerr << "  [Analyze] ERROR: invalid node index " << indexPath << std::endl;
         return;
     }
@@ -111,11 +120,13 @@ inline void executeNodes(
 
     std::atomic<uint64_t> processed{0};
     std::atomic<uint64_t> skipped{0};
+    std::atomic<bool> failed{false};
 
     auto worker = [&](uint64_t start, uint64_t end, uint32_t threadId) {
         std::ifstream polyIn(polygonsDatPath, std::ios::binary);
         if (!polyIn)
         {
+            failed = true;
             std::cerr << "  [Analyze] ERROR: thread " << threadId
                       << " cannot open " << polygonsDatPath << std::endl;
             return;
@@ -160,7 +171,13 @@ inline void executeNodes(
                 continue;
             }
 
-            analyzeNode(octree, bfsIt->second, nodePolys, ctx);
+            try {
+                if (!polyIn) throw std::runtime_error("Truncated node polygon data.");
+                analyzeNode(octree, bfsIt->second, nodePolys, ctx);
+            } catch (const std::exception& error) {
+                failed = true;
+                std::cerr << "  [Analyze] " << error.what() << std::endl;
+            }
 
             const uint64_t progress =
                 processed.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -187,6 +204,8 @@ inline void executeNodes(
     }
     for (auto& thread : threads)
         thread.join();
+    if (ctx.visibleMaterials && (failed || skipped > 0))
+        throw std::runtime_error("Visible-material analysis did not complete all nodes.");
 
     std::cout << "\r  [Analyze] " << label << ": " << processed.load()
               << "/" << totalNodes << " nodes (100%)";

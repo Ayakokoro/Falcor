@@ -64,6 +64,8 @@ void printUsage()
         << "  --block-size <N>          Outgoing octahedral grid per side\n"
         << "  --ndf-resolution <N>      NDF disk map resolution\n"
         << "  --threads <N>             Map worker threads; 0 = auto\n"
+        << "  --visible-material       Use visible 8-lobe material in diagnostics\n"
+        << "  --visibility-bitmask     Also dump directional masks to summary.txt\n"
         << "  --dump-polygons           Write every clipped polygon to polygons.txt\n"
         << "  --out <path>              Output directory (default ./voxel_debug)\n"
         << "  --help                    Show this help\n";
@@ -169,6 +171,12 @@ Arguments parseArguments(int argc, char* argv[])
         else if (option == "--threads")
             args.analysis.threadCount = parseUint(
                 nextValue(i, argc, argv, "--threads"), "--threads");
+        else if (option == "--visible-material")
+            args.analysis.visibleMaterial = true;
+        else if (option == "--visibility-bitmask") {
+            args.analysis.visibleMaterial = true;
+            args.analysis.visibilityBitmask = true;
+        }
         else if (option == "--dump-polygons")
             args.dumpPolygons = true;
         else
@@ -359,6 +367,20 @@ void writeSummary(const fs::path& outputDir,
     out << "area=" << result.voxelData.ABSDF.area << '\n';
     out << "sampleFrequency=" << options.sampleFrequency << '\n';
     out << "samplesPerPolygon=" << options.samplesPerPolygon << '\n';
+    out << "materialModel=" << (options.visibleMaterial ? "visible8" : "legacy4") << '\n';
+    if (options.visibleMaterial) {
+        for (uint32_t i = 0; i < 8; ++i) {
+            const auto& l = result.visibleMaterial.lobes[i];
+            out << "visibleLobe[" << i << "].weight=" << l.weight << '\n';
+            out << "visibleLobe[" << i << "].normal=" << l.normal[0] << ',' << l.normal[1] << ',' << l.normal[2] << '\n';
+            out << "visibleLobe[" << i << "].diffuse=" << l.diffuse[0] << ',' << l.diffuse[1] << ',' << l.diffuse[2] << '\n';
+        }
+        if (options.visibilityBitmask) {
+            out << "mask.metadata=" << result.visibilityMask.metadata << '\n';
+            for (uint32_t d = 0; d < 16; ++d)
+                out << "mask[" << d << "]=" << result.visibilityMask.masks[d] << '\n';
+        }
+    }
     for (uint32_t i = 0; i < LOBE_COUNT; ++i)
     {
         const ABSDFLobe& lobe = result.voxelData.ABSDF.lobes[i];

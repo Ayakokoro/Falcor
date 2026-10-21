@@ -6,6 +6,7 @@
 #include "SceneLoader.h"
 #include "TextureSampler.h"
 #include "VoxelData.h"
+#include "VisibleMaterialFile.h"
 
 #include <array>
 #include <cstdint>
@@ -59,6 +60,8 @@ enum class ProjectionAreaFunctionType : uint32_t
 
 struct AnalysisOptions
 {
+    bool visibleMaterial = false;
+    bool visibilityBitmask = false;
     uint32_t sampleFrequency = 1024;
     uint32_t samplesPerPolygon = 4;
     uint32_t sphericalResolution = 256;
@@ -107,6 +110,8 @@ struct AnalysisResult
     std::string error;
 
     VoxelData voxelData;
+    VisibleMaterialFile::Data visibleMaterial;
+    VisibilityMask::Data visibilityMask;
     std::vector<ProjectionValidation> projectionValidation;
     std::array<FunctionMap, 3> projectionMaps;
     Float4Map splittingError;

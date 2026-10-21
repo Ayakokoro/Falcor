@@ -25,6 +25,9 @@ target_sources(Voxelization PRIVATE
 
     VoxelizationShared.slang
     Shading.slang
+    VisibleShading.slang
+    RayMarchingMaterial.slang
+    VisibilityMask.slang
     MixLightSampler.slang
 
     VoxelizationPass.cpp

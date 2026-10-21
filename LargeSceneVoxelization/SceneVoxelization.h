@@ -26,6 +26,8 @@ enum class LODBuildMode {
 };
 
 struct VoxelizationConfig {
+    bool visibleMaterial = false;
+    bool visibilityBitmask = false;
     uint baseResolution = 512;     // N = 2^D
     uint sampleFrequency = 1024;   // rays per octahedral direction
 
@@ -147,6 +149,7 @@ public:
         }
 
         gen.finalizeBFS(mMaxDepth, 0, int3(0, 0, 0));
+        initExtensions(gen.gBuffer.size());
 
         // ---- Phase 2: Per-node analysis (reverse BFS: leaves first) ----
         for (int nodeIdx = (int)gen.gBuffer.size() - 1; nodeIdx >= 0; nodeIdx--) {
@@ -173,9 +176,16 @@ public:
                     scene, mGrid, mMaxDepth, debugTextures};
                 VoxelizationCore::AnalysisOptions debugOptions;
                 debugOptions.sampleFrequency = mConfig.sampleFrequency;
+                debugOptions.visibleMaterial = mConfig.visibleMaterial || mConfig.visibilityBitmask;
+                debugOptions.visibilityBitmask = mConfig.visibilityBitmask;
 
                 const auto debugResult = VoxelizationCore::analyzeNode(
                     debugNode, debugContext, debugOptions);
+                if (debugOptions.visibleMaterial) {
+                    if (!debugResult.success) throw std::runtime_error(debugResult.error);
+                    mVisibleMaterials[nodeIdx] = debugResult.visibleMaterial;
+                    if (mConfig.visibilityBitmask) mVisibilityMasks[nodeIdx] = debugResult.visibilityMask;
+                }
                 if (debugResult.success)
                     gen.gBuffer[nodeIdx] = debugResult.voxelData;
                 else {
@@ -425,6 +435,7 @@ public:
         // ---- Phase 3: Write output ----
         std::cout << "Writing output: " << outputPath << std::endl;
         writeOutput(outputPath, gen);
+        if (!writeExtensions(outputPath)) return false;
 
         // Free polygon data
         gen.polygonArrays.clear();
@@ -443,6 +454,42 @@ private:
     GridData mGrid;
     uint mMaxDepth = 0;
     uint mGeneratedLodLevels = 0;
+    std::vector<VisibleMaterialFile::Data> mVisibleMaterials;
+    std::vector<VisibilityMask::Data> mVisibilityMasks;
+
+    void initExtensions(size_t nodes) {
+        mVisibleMaterials.clear(); mVisibilityMasks.clear();
+        if (mConfig.visibleMaterial || mConfig.visibilityBitmask) mVisibleMaterials.resize(nodes);
+        if (mConfig.visibilityBitmask) mVisibilityMasks.resize(nodes);
+    }
+
+    bool writeExtensions(const std::string& path) {
+        try {
+            if (!(mConfig.visibleMaterial || mConfig.visibilityBitmask)) {
+                // Replacing a main bake also invalidates its optional extensions.
+                for (const char* suffix : {".vmat", ".vbm"})
+                    if (std::filesystem::is_regular_file(path + suffix)) std::filesystem::remove(path + suffix);
+                return true;
+            }
+            const auto voxel = VisibleMaterialFile::fingerprint(path);
+            VisibleMaterialFile::Fingerprint masks;
+            if (mConfig.visibilityBitmask) {
+                VisibilityMaskFile::write(path + ".vbm", mVisibilityMasks, voxel);
+                masks = VisibleMaterialFile::fingerprint(path + ".vbm");
+            }
+            // Approximate parents keep their original material; only leaves have
+            // extensions. Exact parents were independently analyzed above.
+            const uint32_t levels = mConfig.lodMode == LODBuildMode::BruteForce ? mGeneratedLodLevels : 0;
+            VisibleMaterialFile::write(path + ".vmat", mVisibleMaterials, mMaxDepth, levels,
+                voxel, mConfig.visibilityBitmask ? &masks : nullptr);
+            std::cout << "Visible material: " << mVisibleMaterials.size() << " records, "
+                      << levels << " coarse LODs; masks=" << mConfig.visibilityBitmask << std::endl;
+            return true;
+        } catch (const std::exception& error) {
+            std::cerr << "Extension output failed: " << error.what() << std::endl;
+            return false;
+        }
+    }
 
     // Loaded textures: materialID -> texture
     std::vector<Texture2D> mBaseColorTextures;
@@ -931,10 +978,13 @@ inline bool SceneVoxelization::processDisk(
     }
 
     // ---- Phase 3: Stream-based leaf analysis ----
+    initExtensions(mergeResult.octree->gBuffer.size());
     std::cout << "\n=== Phase 3: Analyze ===" << std::endl;
     AnalyzePhase::AnalyzeContext actx{
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
-        mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures
+        mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures,
+        mVisibleMaterials.empty() ? nullptr : &mVisibleMaterials,
+        mVisibilityMasks.empty() ? nullptr : &mVisibilityMasks
     };
     AnalyzePhase::execute(mergeResult, actx, mNumThreads);
 
@@ -998,6 +1048,7 @@ inline bool SceneVoxelization::processDisk(
     std::cout << "\n=== Phase 5: Write Output ===" << std::endl;
     writeOutputDisk(outputPath, octree, mergeResult.totalPolygons,
                     mergeResult.maxPolyPerNode);
+    if (!writeExtensions(outputPath)) return false;
 
     // Clip shards are cleaned by MergePhase. Merge data is kept by default
     // for inspection and removed when --clean is selected.

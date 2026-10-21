@@ -137,6 +137,19 @@ endif()
 # ---------------------------------------------------------------------------
 install(TARGETS LargeSceneVoxelization VoxelizationInspector RUNTIME DESTINATION bin)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(VisibilityMaskTests tests/VisibilityMaskTests.cpp)
+    target_link_libraries(VisibilityMaskTests PRIVATE VoxelizationCore)
+    add_test(NAME VisibilityMaskUnit COMMAND VisibilityMaskTests ${CMAKE_CURRENT_BINARY_DIR}/visibility-unit)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME VisibilityPipeline
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_visibility_pipeline.py
+                $<TARGET_FILE:LargeSceneVoxelization> ${CMAKE_CURRENT_BINARY_DIR}/visibility-pipeline)
+    endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Post-build: copy assimp DLL to output directory
 # ---------------------------------------------------------------------------

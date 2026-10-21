@@ -1,4 +1,5 @@
 #include "VoxelizationCore.h"
+#include "VisibleMaterialBake.h"
 
 #include "Estimate.h"
 #include "PolygonGenerator.h"
@@ -536,8 +537,9 @@ struct SurfaceLobe
 
 struct SurfaceBRDF
 {
-    std::array<SurfaceLobe, LOBE_COUNT> lobes{};
+    std::array<SurfaceLobe, VISIBLE_LOBE_COUNT> lobes{};
     uint32_t count = 0;
+    bool visibleModel = false;
 
     void init(const ABSDF& absdf)
     {
@@ -572,6 +574,25 @@ struct SurfaceBRDF
         }
     }
 
+    void init(const VisibleMaterialFile::Data& material)
+    {
+        count = 0;
+        visibleModel = true;
+        for (uint32_t i = 0; i < VISIBLE_LOBE_COUNT; ++i) {
+            if (!(material.sourceLobes() & (1u << i))) continue;
+            const auto& in = material.lobes[i];
+            auto& out = lobes[count++];
+            out.weight = in.weight;
+            out.normal = float3(in.normal[0], in.normal[1], in.normal[2]);
+            out.tangent = buildTangent(out.normal);
+            out.bitangent = cross(out.normal, out.tangent);
+            out.diffuse = float3(in.diffuse[0], in.diffuse[1], in.diffuse[2]);
+            out.specular = float3(in.specular[0], in.specular[1], in.specular[2]);
+            out.roughness = std::max(in.rough, 0.01f);
+            out.alpha = out.roughness * out.roughness;
+        }
+    }
+
     float3 evalLobe(const SurfaceLobe& lobe, const float3& wi,
                    const float3& wo, const float3& h) const
     {
@@ -582,7 +603,7 @@ struct SurfaceBRDF
             dot(wo, lobe.tangent), dot(wo, lobe.bitangent), dot(wo, lobe.normal));
         float3 halfLocal(
             dot(h, lobe.tangent), dot(h, lobe.bitangent), dot(h, lobe.normal));
-        if (negative)
+        if (negative && !visibleModel)
         {
             lightLocal = -lightLocal;
             viewLocal = -viewLocal;
@@ -616,8 +637,18 @@ struct SurfaceBRDF
     float3 eval(const float3& wi, const float3& wo, const float3& h) const
     {
         float3 value(0);
+        float frontSum = 0;
+        if (visibleModel) {
+            for (uint32_t i = 0; i < count; ++i)
+                frontSum += lobes[i].weight * std::max(0.0f, dot(lobes[i].normal, wo));
+            if (frontSum <= 0) return value;
+        }
         for (uint32_t i = 0; i < count; ++i)
-            value += lobes[i].weight * evalLobe(lobes[i], wi, wo, h);
+        {
+            const float weight = visibleModel ?
+                lobes[i].weight * std::max(0.0f, dot(lobes[i].normal, wo)) / frontSum : lobes[i].weight;
+            value += weight * evalLobe(lobes[i], wi, wo, h);
+        }
         return value;
     }
 
@@ -627,6 +658,7 @@ struct SurfaceBRDF
         for (uint32_t i = 0; i < count; ++i)
         {
             float nDotH = dot(lobes[i].normal, h);
+            if (visibleModel && nDotH <= 0) continue;
             if (nDotH < 0)
                 nDotH = -nDotH;
             result += lobes[i].weight * ggx(nDotH, lobes[i].alpha);
@@ -739,7 +771,8 @@ void computeProjectionMap(FunctionMap& output, ProjectionAreaFunctionType type,
 void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
                          const std::vector<PreparedPolygon>& polygons,
                          const AnalysisContext& context,
-                         float nodeScale, const AnalysisOptions& options)
+                         float nodeScale, const AnalysisOptions& options,
+                   const VisibleMaterialFile::Data* visibleMaterial)
 {
     if (options.splittingBlockCount == 0 || options.splittingBlockSize == 0)
         return;
@@ -755,7 +788,8 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
 
     const SurfaceBRDF surface = [&]() {
         SurfaceBRDF value;
-        value.init(voxelData.ABSDF);
+        if (visibleMaterial) value.init(*visibleMaterial);
+        else value.init(voxelData.ABSDF);
         return value;
     }();
 
@@ -876,7 +910,8 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
 void computeNdfMap(Float4Map& output, const VoxelData& voxelData,
                    const std::vector<PreparedPolygon>& polygons,
                    const AnalysisContext& context,
-                   float nodeScale, const AnalysisOptions& options)
+                   float nodeScale, const AnalysisOptions& options,
+                   const VisibleMaterialFile::Data* visibleMaterial)
 {
     const uint32_t resolution = options.ndfResolution;
     if (resolution == 0)
@@ -888,7 +923,8 @@ void computeNdfMap(Float4Map& output, const VoxelData& voxelData,
 
     const SurfaceBRDF surface = [&]() {
         SurfaceBRDF value;
-        value.init(voxelData.ABSDF);
+        if (visibleMaterial) value.init(*visibleMaterial);
+        else value.init(voxelData.ABSDF);
         return value;
     }();
     const uint32_t samplesPerPolygon = std::max(1u, options.samplesPerPolygon);
@@ -1284,12 +1320,25 @@ AnalysisResult analyzeNode(const NodeData& node,
         preparedPolygons.push_back(prepared);
     }
 
+    std::vector<VisibleABSDFInput> visibleInputs;
+    if (options.visibleMaterial || options.visibilityBitmask)
+        visibleInputs.reserve(preparedPolygons.size());
     for (const PreparedPolygon& prepared : preparedPolygons)
     {
         const ABSDFInput input = makeAggregateInput(prepared, context, nodeScale);
         result.voxelData.ABSDF.accumulate(input);
+        if (options.visibleMaterial || options.visibilityBitmask)
+            visibleInputs.push_back({input.baseColor, input.specular, input.normal, input.area, 0.0f});
     }
     result.voxelData.ABSDF.normalizeSelf();
+
+    if (options.visibleMaterial || options.visibilityBitmask)
+    {
+        // One reusable arena per analysis worker, allocated only in the opt-in path.
+        thread_local VisibilityMaskBake::ProjectionMaps scratch;
+        result.visibleMaterial = bakeVisibleMaterial(visibleInputs, node.polygons, range,
+            node.request.level, scratch, options.visibilityBitmask ? &result.visibilityMask : nullptr);
+    }
 
     if (result.voxelData.isSolid())
     {
@@ -1343,14 +1392,16 @@ AnalysisResult analyzeNode(const NodeData& node,
     {
         computeSplittingMap(
             result.splittingError, result.voxelData, preparedPolygons,
-            context, nodeScale, options);
+            context, nodeScale, options,
+            (options.visibleMaterial || options.visibilityBitmask) ? &result.visibleMaterial : nullptr);
     }
 
     if (options.computeNdf)
     {
         computeNdfMap(
             result.ndf, result.voxelData, preparedPolygons,
-            context, nodeScale, options);
+            context, nodeScale, options,
+            (options.visibleMaterial || options.visibilityBitmask) ? &result.visibleMaterial : nullptr);
     }
 
     return result;

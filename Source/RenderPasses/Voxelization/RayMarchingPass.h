@@ -81,6 +81,16 @@ private:
     std::string mVoxelLodMode;
     std::string mVoxelProducer;
     bool mHasVoxelMetadata = false;
+    bool mUseVisibleMaterial = false; // Opt-in; existing files/rendering stay on four lobes.
+    bool mVisibleMaterialActive = false;
+    bool mVisibilityMasksAvailable = false;
+    uint32_t mVisibleLODLevels = 0;
+    uint32_t mInternalVisibilityMode = 1; // Legacy=0, Bitmask=1, Off=2 (visible mode only).
+    uint32_t mMaxTransmission = 128;
+    float3 mMaskIncidentDirection = float3(0, 1, 0);
+    uint32_t mMaskLobe = 0;
+    std::vector<ref<Buffer>> mVisibilityMaskBuffers;
+    std::string mExtensionStatus;
 
     bool mOptionsChanged;
     uint mFrameIndex;

@@ -19,7 +19,10 @@ import Utils.Sampling.UniformSampleGenerator;
 
 #define RAY_BIAS 1e-4f // cell-space t-offset to avoid self-intersection
 
-StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
+StructuredBuffer<RayMarchingBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
+#if USE_VISIBLE_MATERIAL
+StructuredBuffer<uint> visibilityMaskBuffer[RAY_MARCHING_BUFFER_COUNT];
+#endif
 StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
 
@@ -51,6 +54,13 @@ cbuffer CB
     uint availableLODLevels; // generated parent levels; 0 means leaf data only
     uint gbSplits[RAY_MARCHING_BUFFER_COUNT]; // exclusive global end index per buffer
     float coverageBlend; // 0=raw coverage, 1=fill all empty cavity
+#if USE_VISIBLE_MATERIAL
+    uint internalVisibilityMode;
+    bool visibilityMasksAvailable;
+    uint maxTransmission;
+    float3 maskIncidentDirection;
+    uint maskLobe;
+#endif
 }
 
 // Ray cone: represents the angular footprint of a ray
@@ -97,7 +107,7 @@ uint getBufferOffset(uint globalIdx, uint bufferIndex)
     return globalIdx - (bufferIndex == 0 ? 0 : gbSplits[bufferIndex - 1]);
 }
 
-TEBSDF loadGBuffer(uint globalIdx)
+RayMarchingBSDF loadGBuffer(uint globalIdx)
 {
     uint bufferIndex = getBufferIndex(globalIdx);
     return gBuffer[bufferIndex][getBufferOffset(globalIdx, bufferIndex)];
@@ -109,10 +119,37 @@ Ellipsoid loadPBuffer(uint globalIdx)
     return pBuffer[bufferIndex][getBufferOffset(globalIdx, bufferIndex)];
 }
 
-// Extract max roughness across all lobes of a TEBSDF at gbIndex
+#if USE_VISIBLE_MATERIAL
+VisibilityMaskPair loadVisibilityMaskPair(uint index, float3 l, float3 v)
+{
+    VisibilityMaskPair pair = {0, 0, 0};
+    if (!visibilityMasksAvailable) return pair;
+    uint li = visibilityMaskDirectionIndex(l), vi = visibilityMaskDirectionIndex(v);
+    if (li >= kVisibilityMaskDirectionCount || vi >= kVisibilityMaskDirectionCount) return pair;
+    uint buffer = getBufferIndex(index);
+    uint first = getBufferOffset(index, buffer) * kVisibilityMaskWordsPerRecord;
+    pair.incident = visibilityMaskBuffer[buffer][first + li];
+    pair.outgoing = visibilityMaskBuffer[buffer][first + vi];
+    pair.metadata = visibilityMaskBuffer[buffer][first + kVisibilityMaskDirectionCount];
+    return pair;
+}
+
+float3 evalVisibleSurface(RayMarchingBSDF bsdf, uint index, float3 l, float3 v, float3 h)
+{
+#if CHECK_VISIBILITY
+    if (internalVisibilityMode == 0)
+        return bsdf.surface.eval(l, v, h) * bsdf.calcInternalVisibility(l);
+    if (internalVisibilityMode == 1 && visibilityMasksAvailable)
+        return bsdf.surface.evalVisible(l, v, h, loadVisibilityMaskPair(index, l, v));
+#endif
+    return bsdf.surface.eval(l, v, h);
+}
+#endif
+
+// Extract max roughness across all lobes of a RayMarchingBSDF at gbIndex
 float maxRoughness(uint gbIndex)
 {
-    TEBSDF bsdf = loadGBuffer(gbIndex);
+    RayMarchingBSDF bsdf = loadGBuffer(gbIndex);
     float r = 0;
     for (uint i = 0; i < bsdf.surface.lobeCount; i++)
         r = max(r, bsdf.surface.lobes[i].frostBite.rough);
@@ -315,7 +352,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
             // voxelizer was asked to generate leaves only. Never stop at
             // such a node. The area check also protects the CHECK_ELLIPSOID=0
             // path, where rayHitVoxel would otherwise accept an empty node.
-            TEBSDF nodeData = loadGBuffer(childNode.dataIndex);
+            RayMarchingBSDF nodeData = loadGBuffer(childNode.dataIndex);
             bool nodeHasData = (nodeLOD <= availableLODLevels) && (nodeData.area > 0.0f);
 
             bool forcedStop  = nodeHasData &&
@@ -462,7 +499,7 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
     float times = MAX_BOUNCE;
     while (times > 0)
     {
-        TEBSDF bsdf = loadGBuffer(offset);
+        RayMarchingBSDF bsdf = loadGBuffer(offset);
         coverage += (1 - coverage) * bsdf.calcCoverage(direction, coverageBlend);
         if (coverage >= 1 - transmittanceThreshold)
         {
@@ -481,13 +518,17 @@ float3 coverageTest(HitResult hit, float3 direction, RayCone cone)
 float3 debugShading(HitResult hit, float3 v)
 {
     uint offset = hit.gbIndex;
-    TEBSDF bsdf = loadGBuffer(offset);
+    RayMarchingBSDF bsdf = loadGBuffer(offset);
     Ellipsoid e = loadPBuffer(offset);
     float result = 0;
     switch (drawMode)
     {
     case ABSDFDrawMode::Normal:
+        #if USE_VISIBLE_MATERIAL
+        return bsdf.surface.getMainNormal(v, v) * 0.5 + 0.5;
+#else
         return bsdf.surface.getMainNormal(v) * 0.5 + 0.5;
+#endif
     case ABSDFDrawMode::Ellipsoid:
         float3 localPos = hit.cell - hit.cellInt;
         float3 d = localPos - e.center;
@@ -508,6 +549,15 @@ float3 debugShading(HitResult hit, float3 v)
         result = bsdf.primitiveProjAreaFunc.calc(v);
         break;
     case ABSDFDrawMode::InternalVisibility:
+#if USE_VISIBLE_MATERIAL
+        if (internalVisibilityMode == 2) return float3(1);
+        if (internalVisibilityMode == 1)
+        {
+            VisibilityMaskQuery q = queryVisibilityMask(loadVisibilityMaskPair(hit.gbIndex, maskIncidentDirection, v),
+                maskLobe, bsdf.surface.lobeCount);
+            return q.supported ? float3(q.value) : float3(1, 0, 1);
+        }
+#endif
         result = bsdf.calcInternalVisibility(v);
         break;
     case ABSDFDrawMode::TotalArea:
@@ -521,15 +571,19 @@ float3 debugShading(HitResult hit, float3 v)
 
 float3 shading(uint offset, float3 l, float3 v, float3 h, float3 lightColor)
 {
-    TEBSDF BSDF = loadGBuffer(offset);
+    RayMarchingBSDF BSDF = loadGBuffer(offset);
     BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend);
+#if USE_VISIBLE_MATERIAL
+    return lightColor * BSDF.coverage * evalVisibleSurface(BSDF, offset, l, v, h);
+#else
     return lightColor * BSDF.eval(l, v, h);
+#endif
 }
 
 float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     uint offset = hit.gbIndex;
-    TEBSDF BSDF = loadGBuffer(offset);
+    RayMarchingBSDF BSDF = loadGBuffer(offset);
     float3 posW = gridMin + hit.cell * voxelSize;
     LightSample ls = {};
     bool valid = sampleLight(posW, v, BSDF, sg, ls);
@@ -538,7 +592,11 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
         return 0;
 
     ls.pdf = max(ls.pdf, minPdf);
+#if USE_VISIBLE_MATERIAL
+    float3 mainNormal = BSDF.surface.getMainNormal(ls.l, v);
+#else
     float3 mainNormal = BSDF.surface.getMainNormal(ls.l);
+#endif
     float visibility = calcLightVisibility(hit, ls.l, mainNormal, ls.distance / voxelSize.x, cone);
 
     if (visibility > 0)
@@ -546,6 +604,91 @@ float3 shadingDirect(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     return 0;
 }
 
+#if USE_VISIBLE_MATERIAL
+float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
+{
+    float3 radiance = 0;
+    float3 throughput = 1;
+    uint reflectionCount = 0;
+    uint transmissionCount = 0;
+
+    [loop]
+    while (true)
+    {
+        uint offset = hit.gbIndex;
+        RayMarchingBSDF BSDF = loadGBuffer(offset);
+        BSDF.updateCoverage(v, transmittanceThreshold, coverageBlend);
+
+        // Expected direct surface contribution: shadingDirect already includes C(v).
+        radiance += throughput * shadingDirect(hit, v, sg, cone);
+
+        // Classify the coverage event explicitly. h == 0 can also mean an invalid
+        // surface sample, so it must not be used to identify null transmission.
+        bool passThrough = false;
+        if (BSDF.coverage < 1.0f)
+            passThrough = Next(sg) >= BSDF.coverage;
+
+        float3 l, h;
+        RayCone nextCone = cone;
+        if (passThrough)
+        {
+            if (transmissionCount >= maxTransmission)
+                break;
+            transmissionCount++;
+            l = -v;
+            // The discrete event probability cancels its BSDF weight:
+            // (1-C)/(1-C) = 1. No PDF clamp, reflection bounce, or roughness spread.
+        }
+        else
+        {
+            // Test the reflection budget only after selecting the event: even
+            // MAX_BOUNCE == 0 must allow null rays to reach the next surface.
+            if (reflectionCount >= MAX_BOUNCE)
+                break;
+
+            BSDF.surface.sample(v, l, h, sg);
+            float surfacePdf = BSDF.surface.evalPdf(l, v, h);
+            if (surfacePdf <= 0.0f)
+                break;
+
+            // C cancels between the surface BSDF and its event probability.
+            // The same surface evaluator serves direct light and reflection.
+            // Do not apply coverage twice or clamp the conditional PDF.
+            throughput *= evalVisibleSurface(BSDF, offset, l, v, h) / surfacePdf;
+            if (all(throughput <= 0.0f))
+                break;
+            reflectionCount++;
+
+            float rough = maxRoughness(offset);
+            float spreadTan = tan(min(rough, 0.995f) * 1.57f);
+            nextCone.tanHalfAngle = max(cone.tanHalfAngle, spreadTan);
+        }
+
+        HitResult nextHit = rayMarching(hit.cell, l, -1, hit.nodeSize, nextCone, 0,
+                                       (int)firstbithigh(hit.nodeSize));
+        if (!nextHit.hit)
+        {
+#if USE_ENV_MAP
+            // Reflected environment lighting is already estimated by direct
+            // light sampling. Only the camera's uninterrupted null chain adds
+            // an environment endpoint, to avoid counting reflected light twice.
+            if (passThrough && reflectionCount == 0)
+                radiance += throughput * gEnvMapSampler.eval(l);
+#endif
+            break;
+        }
+
+        // No scattering spread for a null event, but its footprint still grows
+        // with propagation distance. cone.bias is the radius at the current hit.
+        nextCone.bias += length(nextHit.cell - hit.cell) * nextCone.tanHalfAngle;
+        cone = nextCone;
+        hit = nextHit;
+        v = -l;
+    }
+    return radiance;
+}
+
+#else
 float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone)
 {
     HitResult[MAX_BOUNCE + 1] hits;
@@ -560,7 +703,7 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     for (int i = 0; i < bounce; i++)
     {
         uint offset = hits[i].gbIndex;
-        TEBSDF BSDF = loadGBuffer(offset);
+        RayMarchingBSDF BSDF = loadGBuffer(offset);
         float3 currentV = i == 0 ? v : -ls[i - 1];
         BSDF.updateCoverage(currentV, transmittanceThreshold, coverageBlend);
         BSDF.sample(currentV, ls[i], hs[i], sg);
@@ -625,6 +768,8 @@ float3 shadingGlobal(HitResult hit, float3 v, inout UniformSampleGenerator sg, R
     return reflectLights[0];
 }
 
+#endif
+
 float3 screenCoordToCell(float2 screenCoord, float NDCDepth)
 {
     float4 NDC = float4(2 * screenCoord.x - 1, 1 - 2 * screenCoord.y, NDCDepth, 1);
@@ -659,7 +804,7 @@ float4 renderBackground(float3 direction)
 // LOD heatmap hue modulated by N·L and shadow.
 float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, RayCone cone, float3 baseColor)
 {
-    TEBSDF BSDF = loadGBuffer(hit.gbIndex);
+    RayMarchingBSDF BSDF = loadGBuffer(hit.gbIndex);
     float3 posW = gridMin + hit.cell * voxelSize;
 
     LightSample ls = {};
@@ -671,7 +816,11 @@ float3 lambertShading(HitResult hit, float3 v, inout UniformSampleGenerator sg, 
     if (!valid || ls.pdf <= 0)
         return ambient;
 
+#if USE_VISIBLE_MATERIAL
+    float3 N = BSDF.surface.getMainNormal(ls.l, v);
+#else
     float3 N = BSDF.surface.getMainNormal(ls.l);
+#endif
     float NdotL = saturate(dot(N, ls.l));
 
     float visibility = calcLightVisibility(hit, ls.l, N, ls.distance / voxelSize.x, cone);
@@ -751,9 +900,9 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
         case ABSDFDrawMode::LODHeatmap:
         {
             Ellipsoid e = loadPBuffer(hit.gbIndex);
-            TEBSDF bsdf = loadGBuffer(hit.gbIndex);
+            RayMarchingBSDF bsdf = loadGBuffer(hit.gbIndex);
 
-            SurfaceBRDF surface = bsdf.surface;
+            RayMarchingSurface surface = bsdf.surface;
 
 
         }

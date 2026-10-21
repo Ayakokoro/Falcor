@@ -1,4 +1,4 @@
-#include "Shading.slang"
+#include "RayMarchingMaterial.slang"
 #include "Math/Triangle.slang"
 import Scene.SceneTypes;
 import Scene.Scene;
@@ -53,7 +53,7 @@ bool checkHitEmissive(float3 posW, float tolerance, out float3 lightColor)
     return false;
 }
 
-bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 v, RayMarchingBSDF BSDF, inout S sg, inout LightSample ls)
 {
     uint lightCount = min(gScene.lightCount, MAX_LIGHT_COUNT - 1);
     float totalIlluminance = 0;
@@ -130,7 +130,7 @@ bool inline sampleGeneralLight<S : ISampleGenerator>(float3 posW, float3 v, TEBS
     return true;
 }
 
-bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, RayMarchingBSDF BSDF, inout S sg, inout LightSample ls)
 {
     TriangleLightSample tls;
     uint triangleCount = gScene.lightCollection.getActiveTriangleCount();
@@ -156,10 +156,14 @@ bool inline sampleEmmisive<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF B
     return true;
 }
 
-bool inline sampleEnvMap<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+bool inline sampleEnvMap<S : ISampleGenerator>(float3 posW, float3 v, RayMarchingBSDF BSDF, inout S sg, inout LightSample ls)
 {
-    SurfaceBRDF BRDF = BSDF.surface; // 采样光源时不考虑delta lobe
+    RayMarchingSurface BRDF = BSDF.surface; // 采样光源时不考虑delta lobe
+#if USE_VISIBLE_MATERIAL
+    float bsdfWeight = BRDF.calcBRDFWeight(v);
+#else
     float bsdfWeight = BRDF.calcBRDFWeight();
+#endif
     ls.pdf = 0;
 
     if (Next(sg) <= bsdfWeight)
@@ -183,7 +187,7 @@ bool inline sampleEnvMap<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSD
     return true;
 }
 
-inline bool sampleLight<S : ISampleGenerator>(float3 posW, float3 v, TEBSDF BSDF, inout S sg, inout LightSample ls)
+inline bool sampleLight<S : ISampleGenerator>(float3 posW, float3 v, RayMarchingBSDF BSDF, inout S sg, inout LightSample ls)
 {
     float weights[LIGHT_TYPES]; // 一般光源，环境光，自发光
     weights[0] = gScene.getLightCount() > 0 ? 1 : 0;

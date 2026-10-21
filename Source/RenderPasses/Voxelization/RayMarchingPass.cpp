@@ -1,6 +1,8 @@
 #include "RayMarchingPass.h"
 #include "VoxelizationMetadata.h"
 #include "Shading.slang"
+#include "VisibleShading.slang"
+#include "../../../LargeSceneVoxelization/VisibleMaterialFile.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Math/FalcorMath.h"
 #include <algorithm>
@@ -77,6 +79,37 @@ TEBSDF convertVoxelData(const VoxelData& data)
     }
     return gb;
 }
+
+VisibleTEBSDF convertVisibleMaterial(const VoxelData& geometry, const VisibleMaterialFile::Data& material)
+{
+    VisibleTEBSDF result{};
+    result.area = material.area;
+    result.coverage = 12345.0f;
+    result.primitiveProjAreaFunc = geometry.primitiveProjAreaFunc;
+    result.polygonsProjAreaFunc = geometry.polygonsProjAreaFunc;
+    result.totalProjAreaFunc = geometry.totalProjAreaFunc;
+    for (uint32_t i = 0; i < VisibleMaterialFile::LobeCount; ++i)
+    {
+        if (!(material.sourceLobes() & (1u << i))) continue;
+        const auto& source = material.lobes[i];
+        const uint32_t compact = result.surface.lobeCount++;
+        auto& lobe = result.surface.lobes[compact];
+        lobe.n = float3(source.normal[0], source.normal[1], source.normal[2]);
+        buildTBNHost(lobe.n, lobe.t, lobe.b);
+        const float rough = std::max(source.rough, 0.01f);
+        lobe.frostBite.diffuse = float3(source.diffuse[0], source.diffuse[1], source.diffuse[2]);
+        lobe.frostBite.rough = rough;
+        lobe.cookTorrence.specular = float3(source.specular[0], source.specular[1], source.specular[2]);
+        lobe.cookTorrence.alpha = rough * rough;
+        const auto spec = lobe.cookTorrence.specular;
+        lobe.specularWeight = saturate((20 * (spec.x + spec.y + spec.z) / 3 + 1) / 21.0f);
+        result.surface.weights[compact] = source.weight;
+    }
+    return result;
+}
+static_assert(LOBE_COUNT == 4 && VISIBLE_LOBE_COUNT == 8);
+static_assert(sizeof(VoxelData) == 420 && sizeof(TEBSDF) == 508 && sizeof(VisibleTEBSDF) == 812);
+static_assert(sizeof(VisibilityMask::Data) == 17 * sizeof(uint32_t));
 } // namespace
 
 RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
@@ -107,6 +140,22 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mOptionsChanged = false;
     mFrameIndex = 0;
     selectedFile = 0;
+
+    // Optional script setup uses the same loader as the UI. Defaults remain legacy.
+    for (const auto& [key, value] : props)
+    {
+        if (key == "voxelFile")
+        {
+            const std::string path = value;
+            filePaths = {std::filesystem::path(path)};
+            mComplete = false;
+        }
+        else if (key == "visibleMaterial") mUseVisibleMaterial = value;
+        else if (key == "internalVisibilityMode") mInternalVisibilityMode = value;
+        else if (key == "maxBounce") mMaxBounce = value;
+        else if (key == "drawMode") mDrawMode = value;
+    }
+    FALCOR_CHECK(mInternalVisibilityMode <= 2, "internalVisibilityMode must be 0, 1 or 2.");
 
     Sampler::Desc samplerDesc;
     samplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point)
@@ -143,6 +192,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
     if (!mComplete)
     {
+        try
+        {
         GridData& gd = VoxelizationBase::GlobalGridData;
 
         std::ifstream f;
@@ -278,6 +329,40 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         for (uint32_t i = 0; i <= maxDepth; i++)
             std::cout << "  Level " << i << ": " << nodeCounts[i] << " nodes" << std::endl;
 
+        mVisibleMaterialActive = false;
+        mVisibilityMasksAvailable = false;
+        mVisibleLODLevels = 0;
+        mExtensionStatus.clear();
+        std::unique_ptr<VisibleMaterialFile::Reader> visibleReader;
+        std::unique_ptr<VisibilityMaskFile::Reader> maskReader;
+        std::vector<uint8_t> requiredVisibleNodes;
+        if (mUseVisibleMaterial)
+        {
+            const auto fingerprint = VisibleMaterialFile::fingerprint(binaryPath.string());
+            visibleReader = std::make_unique<VisibleMaterialFile::Reader>(
+                binaryPath.string() + ".vmat", gd.solidVoxelCount, maxDepth, fingerprint);
+            mVisibleLODLevels = std::min(mAvailableLODLevels, visibleReader->header.lodLevels);
+            if (visibleReader->header.maskBytes)
+            {
+                visibleReader->validateMasks(binaryPath.string() + ".vbm");
+                maskReader = std::make_unique<VisibilityMaskFile::Reader>(binaryPath.string() + ".vbm", gd.solidVoxelCount, fingerprint);
+                mVisibilityMasksAvailable = true;
+            }
+            requiredVisibleNodes.resize(gd.solidVoxelCount, 0);
+            uint32_t first = 0;
+            for (uint32_t level = 0; level <= maxDepth; ++level)
+            {
+                for (uint32_t n = first; n < first + nodeCounts[level]; ++n)
+                {
+                    FALCOR_CHECK(octreeNodes[n].dataIndex < gd.solidVoxelCount, "Invalid extension node index.");
+                    if (level >= maxDepth - mVisibleLODLevels)
+                        requiredVisibleNodes[octreeNodes[n].dataIndex] = 1;
+                }
+                first += nodeCounts[level];
+            }
+            mExtensionStatus = mVisibilityMasksAvailable ? "Visible material + paired masks" : "Visible material; no masks (Q=1)";
+        }
+
         // Create GPU buffer for octree nodes
         auto pOctreeBuffer = mpDevice->createStructuredBuffer(
             sizeof(OctreeNode), totalNodes, ResourceBindFlags::ShaderResource
@@ -288,7 +373,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // structured buffer byte offset = elementIndex * stride.
         // The maximum element count is derived from the current TEBSDF size.
         const uint32_t totalVoxels = gd.solidVoxelCount;
-        const size_t maxElemsPerBuffer = kRayMarchingBufferByteLimit / sizeof(TEBSDF);
+        const size_t materialStride = visibleReader ? sizeof(VisibleTEBSDF) : sizeof(TEBSDF);
+        const size_t maxElemsPerBuffer = kRayMarchingBufferByteLimit / materialStride;
         FALCOR_CHECK(maxElemsPerBuffer > 0, "TEBSDF is larger than the ray-marching buffer limit.");
 
         const size_t splitCount64 = totalVoxels == 0
@@ -313,6 +399,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // Debug: print struct sizes
         std::cout << "sizeof(VoxelData)=" << sizeof(VoxelData)
                   << " sizeof(TEBSDF)=" << sizeof(TEBSDF)
+                  << " activeMaterialStride=" << materialStride
                   << " sizeof(Ellipsoid)=" << sizeof(Ellipsoid) << std::endl;
         std::cout << "RayMarching buffers=" << splitCount
                   << ", maxElementsPerBuffer=" << maxElemsPerBuffer
@@ -320,7 +407,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         for (uint32_t b = 0; b < splitCount; ++b)
         {
             std::cout << "count[" << b << "]=" << counts[b]
-                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0))
+                      << " (" << (size_t(counts[b]) * materialStride / (1024.0 * 1024.0))
                       << " MB gBuffer)" << std::endl;
         }
 
@@ -330,13 +417,15 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         // on the GPU, keeping VRAM at gBuffer + pBuffer only.
         std::vector<ref<Buffer>> gBuffers(splitCount);
         std::vector<ref<Buffer>> pBuffers(splitCount);
+        std::vector<ref<Buffer>> maskBuffers(visibleReader ? splitCount : 0);
 
         for (uint32_t b = 0; b < splitCount; ++b)
         {
             if (counts[b] == 0)
                 continue;
 
-            std::vector<TEBSDF> gbChunk(counts[b]);
+            std::vector<TEBSDF> gbChunk(visibleReader ? 0 : counts[b]);
+            std::vector<VisibleTEBSDF> visibleChunk;
             std::vector<Ellipsoid> pChunk(counts[b]);
 
             // Conversion is pure/read-only with respect to voxelData, so let
@@ -344,7 +433,28 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             // GPU resource creation and setBlob() stay on this render thread.
             const auto sourceBegin = voxelData.begin() + bases[b];
             const auto sourceEnd = sourceBegin + counts[b];
-            std::transform(
+            if (visibleReader)
+            {
+                const auto records = visibleReader->read(bases[b], counts[b]);
+                const auto maskChunk = maskReader ? maskReader->read(bases[b], counts[b]) : std::vector<VisibilityMask::Data>{};
+                visibleChunk.resize(counts[b]);
+                for (uint32_t j = 0; j < counts[b]; ++j)
+                {
+                    const uint32_t index = bases[b] + j;
+                    FALCOR_CHECK(!requiredVisibleNodes[index] || records[j].baked, "Visible material missing for a rendered LOD.");
+                    if (mVisibilityMasksAvailable)
+                        FALCOR_CHECK(maskChunk[j].sourceLobes() == records[j].sourceLobes(), "Mask/material lobe order mismatch.");
+                    visibleChunk[j] = convertVisibleMaterial(voxelData[index], records[j]);
+                }
+                // Keep an explicit zero record bound when no mask was baked.
+                maskBuffers[b] = mpDevice->createStructuredBuffer(sizeof(uint32_t),
+                    mVisibilityMasksAvailable ? counts[b] * VisibilityMask::WordsPerRecord : VisibilityMask::WordsPerRecord,
+                    ResourceBindFlags::ShaderResource);
+                const VisibilityMask::Data empty{};
+                maskBuffers[b]->setBlob(mVisibilityMasksAvailable ? maskChunk.data() : &empty, 0,
+                    (mVisibilityMasksAvailable ? size_t(counts[b]) : 1) * sizeof(empty));
+            }
+            else std::transform(
                 std::execution::par_unseq,
                 sourceBegin,
                 sourceEnd,
@@ -360,7 +470,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             );
 
             gBuffers[b] = mpDevice->createStructuredBuffer(
-                sizeof(TEBSDF), counts[b],
+                materialStride, counts[b],
                 ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess,
                 MemoryType::DeviceLocal
             );
@@ -370,13 +480,14 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
                 MemoryType::DeviceLocal
             );
             std::cout << "gBuffer[" << b << "]: " << (gBuffers[b] ? "OK" : "NULL!")
-                      << " (" << (size_t(counts[b]) * sizeof(TEBSDF) / (1024.0 * 1024.0)) << " MB)"
+                      << " (" << (size_t(counts[b]) * materialStride / (1024.0 * 1024.0)) << " MB)"
                       << std::endl;
             std::cout << "pBuffer[" << b << "]: " << (pBuffers[b] ? "OK" : "NULL!")
                       << " (" << (size_t(counts[b]) * sizeof(Ellipsoid) / (1024.0 * 1024.0)) << " MB)"
                       << std::endl;
             if (gBuffers[b])
-                gBuffers[b]->setBlob(gbChunk.data(), 0, size_t(counts[b]) * sizeof(TEBSDF));
+                gBuffers[b]->setBlob(visibleReader ? static_cast<const void*>(visibleChunk.data()) : gbChunk.data(),
+                    0, size_t(counts[b]) * materialStride);
             if (pBuffers[b])
                 pBuffers[b]->setBlob(pChunk.data(), 0, size_t(counts[b]) * sizeof(Ellipsoid));
         }
@@ -386,6 +497,8 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
         mGBuffers = std::move(gBuffers);
         mPBuffers = std::move(pBuffers);
+        mVisibilityMaskBuffers = std::move(maskBuffers);
+        mVisibleMaterialActive = visibleReader != nullptr;
         mGBufferSplits = std::move(splits);
         mBufferCount = splitCount;
         mOctreeBuffer = pOctreeBuffer;
@@ -393,7 +506,17 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mOctreeNodeCounts = std::move(nodeCounts);
 
         mComplete = true;
+        }
+        catch (const std::exception& error)
+        {
+            mExtensionStatus = error.what();
+            std::cerr << "Voxel loading failed: " << mExtensionStatus << std::endl;
+            mComplete = true; // Report once; the user can select legacy mode and Read again.
+            return;
+        }
     }
+
+    if (mGBuffers.empty() || !mOctreeBuffer) return;
 
     // ---- Step 2: Ray marching ----
     FALCOR_PROFILE(pRenderContext, "RayMarching");
@@ -419,6 +542,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             desc.addTypeConformances(mpScene->getTypeConformances());
             DefineList defines = mpScene->getSceneDefines();
             defines.add(kBufferCountDefine, std::to_string(mBufferCount));
+            defines.add("USE_VISIBLE_MATERIAL", mVisibleMaterialActive ? "1" : "0");
             mpFullScreenPass = FullScreenPass::create(mpDevice, desc, defines);
         }
         pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), float4(-1));
@@ -461,6 +585,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         {
             var["gBuffer"][i] = mGBuffers[i];
             var["pBuffer"][i] = mPBuffers[i];
+            if (mVisibleMaterialActive) var["visibilityMaskBuffer"][i] = mVisibilityMaskBuffers[i];
         }
         var["octreeBuffer"] = mOctreeBuffer;
         var["selectedVoxel"] = mSelectedVoxel;
@@ -485,10 +610,18 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
         cb["forcedLOD"] = mForcedLOD;
         cb["maxLODLevel"] = mMaxLODLevel;
-        cb["availableLODLevels"] = mAvailableLODLevels;
+        cb["availableLODLevels"] = mVisibleMaterialActive ? mVisibleLODLevels : mAvailableLODLevels;
         for (size_t i = 0; i < mGBufferSplits.size(); ++i)
             cb["gbSplits"][i] = mGBufferSplits[i];
         cb["coverageBlend"] = mCoverageBlend;
+        if (mVisibleMaterialActive)
+        {
+            cb["internalVisibilityMode"] = mInternalVisibilityMode;
+            cb["visibilityMasksAvailable"] = mVisibilityMasksAvailable;
+            cb["maxTransmission"] = mMaxTransmission;
+            cb["maskIncidentDirection"] = mMaskIncidentDirection;
+            cb["maskLobe"] = mMaskLobe;
+        }
         mFrameIndex++;
 
         mpFbo->attachColorTarget(pOutputColor, 0);
@@ -503,6 +636,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             desc.setShaderModel(ShaderModel::SM6_5);
             DefineList defines;
             defines.add(kBufferCountDefine, std::to_string(mBufferCount));
+            defines.add("USE_VISIBLE_MATERIAL", mVisibleMaterialActive ? "1" : "0");
             mpDisplayNDFPass = FullScreenPass::create(mpDevice, desc, defines);
         }
         auto var = mpDisplayNDFPass->getRootVar();
@@ -557,6 +691,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     // ---- File selection (from ReadVoxelPass) ----
     if (VoxelizationBase::FileUpdated)
     {
+        const auto previousFile = selectedFile < filePaths.size() ? filePaths[selectedFile] : std::filesystem::path{};
         filePaths.clear();
         for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
         {
@@ -568,6 +703,13 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
                 filePaths.push_back(entry.path());
             }
         }
+        // Preserve a script-specified file outside ResourceFolder as well.
+        if (!previousFile.empty())
+        {
+            auto previous = std::find(filePaths.begin(), filePaths.end(), previousFile);
+            if (previous == filePaths.end()) { filePaths.push_back(previousFile); previous = filePaths.end() - 1; }
+            selectedFile = uint32_t(previous - filePaths.begin());
+        }
         VoxelizationBase::FileUpdated = false;
     }
     Gui::DropdownList list;
@@ -576,8 +718,9 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         list.push_back({i, filePaths[i].filename().string()});
     }
     widget.dropdown("File", list, selectedFile);
+    const bool materialModeChanged = widget.checkbox("Visible material (reload)", mUseVisibleMaterial);
 
-    if (mpScene && widget.button("Read"))
+    if (mpScene && selectedFile < filePaths.size() && (widget.button("Read") || materialModeChanged))
     {
         std::ifstream f;
         f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
@@ -594,6 +737,11 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             // use the previous fixed array layout.
             mGBuffers.clear();
             mPBuffers.clear();
+            mVisibilityMaskBuffers.clear();
+            mVisibleMaterialActive = false;
+            mVisibilityMasksAvailable = false;
+            mVisibleLODLevels = 0;
+            mExtensionStatus.clear();
             mGBufferSplits.clear();
             mOctreeBuffer = nullptr;
             mOctreeMaxDepth = 0;
@@ -619,6 +767,16 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
     widget.text("Solid Voxel Count: " + std::to_string(gridData.solidVoxelCount));
     widget.text("Solid Rate: " + std::to_string(gridData.solidVoxelCount / (float)gridData.totalVoxelCount()));
     widget.text("Ray-Marching Buffer Count: " + std::to_string(mBufferCount));
+    if (!mExtensionStatus.empty()) widget.text(mExtensionStatus);
+    if (mVisibleMaterialActive)
+    {
+        widget.text("Visible-material coarse LODs: " + std::to_string(mVisibleLODLevels));
+        Gui::DropdownList modes = {{0, "Legacy VPA/TPA"}, {1, "Bitmask"}, {2, "Off"}};
+        if (widget.dropdown("Internal visibility", modes, mInternalVisibilityMode)) mOptionsChanged = true;
+        if (widget.slider("Max null transmissions", mMaxTransmission, 0u, 1024u)) mOptionsChanged = true;
+        if (widget.var("Mask incident direction", mMaskIncidentDirection)) mOptionsChanged = true;
+        if (widget.slider("Mask lobe", mMaskLobe, 0u, 7u)) mOptionsChanged = true;
+    }
     widget.text("Max Polygon Count: " + std::to_string(gridData.maxPolygonCount));
     widget.text("Total Polygon Count: " + std::to_string(gridData.totalPolygonCount));
 
@@ -643,7 +801,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (mDebug)
     {
-        int maxLOD = (int)std::min(mOctreeMaxDepth, mAvailableLODLevels);
+        int maxLOD = (int)std::min(mOctreeMaxDepth, mVisibleMaterialActive ? mVisibleLODLevels : mAvailableLODLevels);
         mForcedLOD = std::min(mForcedLOD, maxLOD);
         mMaxLODLevel = std::min(mMaxLODLevel, maxLOD);
         if (widget.slider("Forced LOD", mForcedLOD, -1, maxLOD))

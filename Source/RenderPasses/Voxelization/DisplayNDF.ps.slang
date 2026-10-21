@@ -1,5 +1,5 @@
 #include "Math/VoxelizationUtility.slang"
-#include "Shading.slang"
+#include "RayMarchingMaterial.slang"
 #include "Voxel/VoxelGrid.slang"
 #include "VoxelizationShared.slang"
 
@@ -7,7 +7,7 @@
 #define RAY_MARCHING_BUFFER_COUNT 1
 #endif
 
-StructuredBuffer<TEBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
+StructuredBuffer<RayMarchingBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<float4> selectedVoxel; // 前三个分量表示相机指向体素的方向
 
 cbuffer CB
@@ -27,7 +27,7 @@ uint getBufferIndex(uint globalIdx)
     return RAY_MARCHING_BUFFER_COUNT - 1;
 }
 
-TEBSDF loadGBuffer(uint globalIdx)
+RayMarchingBSDF loadGBuffer(uint globalIdx)
 {
     uint bufferIndex = getBufferIndex(globalIdx);
     uint localIdx = globalIdx - (bufferIndex == 0 ? 0 : gbSplits[bufferIndex - 1]);
@@ -41,7 +41,7 @@ struct PsOut
 
 float3 calcColor(float2 localCoord, int offset, float3 v)
 {
-    SurfaceBRDF BRDF = loadGBuffer(offset).surface;
+    RayMarchingSurface BRDF = loadGBuffer(offset).surface;
     float3 t, b;
     buildTBN(t, b, v);
 

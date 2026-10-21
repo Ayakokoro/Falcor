@@ -17,6 +17,8 @@ int main(int argc, char* argv[]) {
     bool keepTemp = true;              // default: preserve temp files
     bool useInMemory = false;
     bool useSpecGlossMaterials = false; // default matches Falcor FBX import
+    bool visibleMaterial = false;
+    bool visibilityBitmask = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -51,6 +53,11 @@ int main(int argc, char* argv[]) {
             keepTemp = false;
         } else if (arg == "--in-memory") {
             useInMemory = true;
+        } else if (arg == "--visible-material") {
+            visibleMaterial = true;
+        } else if (arg == "--visibility-bitmask") {
+            visibilityBitmask = true;
+            visibleMaterial = true;
         } else if (arg == "--spec-gloss") {
             useSpecGlossMaterials = true;
         } else if (arg[0] != '-') {
@@ -73,6 +80,8 @@ int main(int argc, char* argv[]) {
                   << "  --clean           Delete temp files after completion\n"
                   << "  --in-memory       Use original in-memory pipeline (default: disk-backed)\n"
                   << "  --spec-gloss      Explicitly use SpecGloss input conversion (default: MetalRough)\n";
+        std::cout << "  --visible-material    Bake an optional 8-lobe .vmat extension; keep the legacy .bin\n"
+                  << "  --visibility-bitmask  Also bake paired .vbm masks (implies --visible-material)\n";
         return 0;
     }
 
@@ -86,6 +95,8 @@ int main(int argc, char* argv[]) {
 
     VoxelizationConfig config;
     config.baseResolution = resolution;
+    config.visibleMaterial = visibleMaterial;
+    config.visibilityBitmask = visibilityBitmask;
     config.sampleFrequency = sampleFrequency;
     config.useSpecGlossMaterials = useSpecGlossMaterials;
     config.lodLevels = lodLevels;
@@ -119,11 +130,16 @@ int main(int argc, char* argv[]) {
     voxelizer.setNumThreads(numThreads);
     voxelizer.setKeepTemp(keepTemp);
 
-    bool ok;
+    bool ok = false;
+    try {
     if (useInMemory) {
         ok = voxelizer.process(inputPath, outputPath);
     } else {
         ok = voxelizer.processDisk(inputPath, outputPath);
+    }
+    } catch (const std::exception& error) {
+        std::cerr << "Voxelization failed: " << error.what() << std::endl;
+        return 1;
     }
 
     auto end = std::chrono::high_resolution_clock::now();
