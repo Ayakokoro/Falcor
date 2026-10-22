@@ -126,7 +126,12 @@ bool Console::flush()
     if (mCmdPending.empty())
         return false;
 
-    if (mCmdPending == "cls")
+    // Scripts can call renderFrame(), which calls flush() again. Consume the
+    // command before running it so a nested frame cannot execute it recursively.
+    std::string command;
+    command.swap(mCmdPending);
+
+    if (command == "cls")
     {
         clear();
         return false;
@@ -134,14 +139,12 @@ bool Console::flush()
 
     try
     {
-        mLog += Scripting::interpretScript(mCmdPending);
+        mLog += Scripting::interpretScript(command);
     }
     catch (const std::exception& e)
     {
         mLog += std::string(e.what()) + "\n";
     };
-
-    mCmdPending.clear();
 
     return true;
 }

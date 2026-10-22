@@ -9,6 +9,7 @@
 /media
 /media_internal
 /resource
+/captures/
 
 # Packman folders.
 /external/packman/
