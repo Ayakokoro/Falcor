@@ -18,9 +18,9 @@ def read_entries(path):
         logging.error(f"Cannot open '{path}'!")
         return None
 
-    # Check header.
+    # Both versions use the five tab-separated fields consumed below.
     header = f.readline()
-    if header != "# ninja log v5\n":
+    if header not in ("# ninja log v5\n", "# ninja log v6\n"):
         logging.error(f"{path}:1 has invalid header!")
         return None
 

@@ -1,0 +1,27 @@
+{
+  "graph_script": null,
+  "graph_name": null,
+  "scene": null,
+  "output": "ToneMapper.dst",
+  "accumulation_pass": "AccumulatePass",
+  "sample_pass": null,
+  "samples_per_render": 1,
+  "spp": 256,
+  "fps": 60,
+  "frame_count": 120,
+  "resolution": [512, 512],
+  "warmup_frames": 4,
+  "camera_fov_y_degrees": null,
+  "camera_orbit": {
+    "target": [0, 0.5, 0],
+    "reference_position": [-0.638005257, 1.40110111, 1.7617321],
+    "elevation_degrees": 30.0,
+    "radius_scale": 1.0,
+    "turns": 1.0
+  },
+  "camera_keyframes": [],
+  "output_dir": "captures/video",
+  "encode_video": true,
+  "ffmpeg": "C:/Users/user/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-9.0.2-full_build/bin/ffmpeg.exe",
+  "quit_after": false
+}

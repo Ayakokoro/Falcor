@@ -10,6 +10,7 @@
 - [Scene Formats](./scene-formats.md)
 - [Materials](./materials.md)
 - [Scripting](./scripting.md)
+- [Video Recording](./video-recording.md)
 - [Render Passes](./render-passes.md)
 - [Path Tracer](./path-tracer.md)
 - [Custom Primitives](./custom-primitives.md)
