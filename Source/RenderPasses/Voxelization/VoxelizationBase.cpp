@@ -1,6 +1,7 @@
 #include "VoxelizationBase.h"
 #include "VoxelizationPass.h"
 #include "RayMarchingPass.h"
+#include "Core/Platform/OS.h"
 
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
@@ -11,7 +12,8 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
 uint3 VoxelizationBase::MinFactor = uint3(1, 1, 1);
 bool VoxelizationBase::FileUpdated = true;
 bool VoxelizationBase::LightChanged = true;
-std::string VoxelizationBase::ResourceFolder = "D:/syc/Falcor/resource/";
+// Keep the trailing separator for the voxel writer's filename concatenation.
+std::string VoxelizationBase::ResourceFolder = (getProjectDirectory() / "resource").generic_string() + "/";
 GridData VoxelizationBase::GlobalGridData = {};
 
 std::random_device rd;

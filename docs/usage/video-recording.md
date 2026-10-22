@@ -123,7 +123,9 @@ os.environ["FALCOR_RECORD_CONFIG"] = "scripts/my_recording.json"
 m.script("E:/syc/Falcor/scripts/RecordVideo.py")
 ```
 
-当前 `voxelization_with_diskio` 分支的 `RayMarchingPass` 支持 `voxelFile` 脚本属性。交互录制可直接使用当前调好的 graph；无人值守运行时，应在自定义 graph 脚本中创建 pass 时指定体素文件和显示模式，例如 `createPass("RayMarchingPass", {"voxelFile": "E:/syc/Falcor/resource/scene.bin", "drawMode": 0, "maxBounce": 1})`，再将此 graph 脚本填入 `graph_script`。`scripts/SimplyRendering.py` 本身没有预设体素文件，需要先在界面中选好文件才能直接录制。
+当前 `voxelization_with_diskio` 分支的 `RayMarchingPass` 支持 `voxelFile` 脚本属性，它只预选文件，默认需要点击 **Read** 才加载。选择文件或切换 Visible material 都不会自动读取；加载失败后需再次点击 Read 才重试。交互录制可直接使用已点击 Read 并调好的 graph。
+
+无人值守录制需要显式指定 `autoLoad: True`，例如 `createPass("RayMarchingPass", {"voxelFile": "E:/syc/Falcor/resource/scene.bin", "autoLoad": True, "drawMode": 0, "maxBounce": 1})`，再将此自定义 graph 脚本填入 `graph_script`。自动加载也只尝试一次。`scripts/SimplyRendering.py` 本身没有预设体素文件，需要先在界面中选好文件并点击 Read 才能录制。
 
 ## 输出文件
 

@@ -116,7 +116,6 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     : RenderPass(pDevice), gridData(VoxelizationBase::GlobalGridData)
 {
     mpDevice = pDevice;
-    mComplete = true;
     mShadowBias100 = 0.01f;
     mMinPdf100 = 0.1f;
     mTransmittanceThreshold100 = 5.f;
@@ -141,21 +140,24 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
     mFrameIndex = 0;
     selectedFile = 0;
 
-    // Optional script setup uses the same loader as the UI. Defaults remain legacy.
+    // A script may preselect a file without reading it. Unattended rendering
+    // must explicitly opt in to a single load attempt with autoLoad=true.
+    bool autoLoad = false;
     for (const auto& [key, value] : props)
     {
         if (key == "voxelFile")
         {
             const std::string path = value;
             filePaths = {std::filesystem::path(path)};
-            mComplete = false;
         }
+        else if (key == "autoLoad") autoLoad = value;
         else if (key == "visibleMaterial") mUseVisibleMaterial = value;
         else if (key == "internalVisibilityMode") mInternalVisibilityMode = value;
         else if (key == "maxBounce") mMaxBounce = value;
         else if (key == "drawMode") mDrawMode = value;
     }
     FALCOR_CHECK(mInternalVisibilityMode <= 2, "internalVisibilityMode must be 0, 1 or 2.");
+    mLoadRequested = autoLoad && !filePaths.empty();
 
     Sampler::Desc samplerDesc;
     samplerDesc.setFilterMode(TextureFilteringMode::Point, TextureFilteringMode::Point, TextureFilteringMode::Point)
@@ -178,6 +180,8 @@ RenderPassReflection RayMarchingPass::reflect(const CompileData& compileData)
 
 void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
 {
+    ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
+    pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0));
     if (!mpScene)
         return;
 
@@ -189,9 +193,10 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mOptionsChanged = false;
     }
 
-    // ---- Step 1: Load voxel data from file if needed (from ReadVoxelPass) ----
-    if (!mComplete)
+    // ---- Step 1: Consume one explicit load request. Failures wait for Read. ----
+    if (mLoadRequested)
     {
+        mLoadRequested = false;
         try
         {
         GridData& gd = VoxelizationBase::GlobalGridData;
@@ -199,7 +204,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         std::ifstream f;
         f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
         if (!f.is_open())
+        {
+            mExtensionStatus = "Cannot open voxel file: " + filePaths[selectedFile].string();
+            std::cerr << mExtensionStatus << std::endl;
             return;
+        }
 
         std::cout << "Reading voxel data from: " << filePaths[selectedFile] << std::endl;
         size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
@@ -247,10 +256,9 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             mVoxelLodMode.clear();
             mVoxelProducer.clear();
             mAvailableLODLevels = 0;
-            std::cerr << "Voxel metadata is missing, not Octahedral, or does "
-                      << "not match the binary: "
-                      << VoxelizationMetadata::sidecarPath(binaryPath)
-                      << ". Refusing to load the voxel file." << std::endl;
+            mExtensionStatus = "Voxel metadata is missing, not Octahedral, or does not match the binary: " +
+                VoxelizationMetadata::sidecarPath(binaryPath).string() + ". Refusing to load the voxel file.";
+            std::cerr << mExtensionStatus << std::endl;
             f.close();
             return;
         }
@@ -505,13 +513,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mOctreeMaxDepth = maxDepth;
         mOctreeNodeCounts = std::move(nodeCounts);
 
-        mComplete = true;
         }
         catch (const std::exception& error)
         {
             mExtensionStatus = error.what();
             std::cerr << "Voxel loading failed: " << mExtensionStatus << std::endl;
-            mComplete = true; // Report once; the user can select legacy mode and Read again.
             return;
         }
     }
@@ -521,14 +527,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     // ---- Step 2: Ray marching ----
     FALCOR_PROFILE(pRenderContext, "RayMarching");
     ref<Camera> pCamera = mpScene->getCamera();
-    ref<Texture> pOutputColor = renderData.getTexture(kOutputColor);
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
             mpDevice->createStructuredBuffer(sizeof(float4), 2, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
     }
-
-    pRenderContext->clearRtv(pOutputColor->getRTV().get(), float4(0));
 
     mSelectedPixel = uint2(mSelectedUV.x * pOutputColor->getWidth(), mSelectedUV.y * pOutputColor->getHeight());
 
@@ -689,19 +692,30 @@ void RayMarchingPass::compile(RenderContext* pRenderContext, const CompileData& 
 void RayMarchingPass::renderUI(Gui::Widgets& widget)
 {
     // ---- File selection (from ReadVoxelPass) ----
-    if (VoxelizationBase::FileUpdated)
+    const bool refreshFiles = widget.button("Refresh files");
+    if (!mFileListInitialized || VoxelizationBase::FileUpdated || refreshFiles)
     {
         const auto previousFile = selectedFile < filePaths.size() ? filePaths[selectedFile] : std::filesystem::path{};
         filePaths.clear();
-        for (const auto& entry : std::filesystem::directory_iterator(VoxelizationBase::ResourceFolder))
+        selectedFile = 0;
+        mFileListError.clear();
+        // A missing/inaccessible directory must not unwind out of the UI callback.
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(VoxelizationBase::ResourceFolder, ec), end;
+             !ec && it != end; it.increment(ec))
         {
             // Metadata is a sidecar (<file>.bin.meta), not a selectable voxel
             // data file. Keep the dropdown restricted to binary voxel files.
-            if (std::filesystem::is_regular_file(entry) &&
-                entry.path().extension() == ".bin")
+            if (it->is_regular_file(ec) && it->path().extension() == ".bin")
             {
-                filePaths.push_back(entry.path());
+                filePaths.push_back(it->path());
             }
+            if (ec) break;
+        }
+        if (ec)
+        {
+            mFileListError = "Cannot list voxel files in " + VoxelizationBase::ResourceFolder + ": " + ec.message();
+            logWarning("RayMarchingPass: {}", mFileListError);
         }
         // Preserve a script-specified file outside ResourceFolder as well.
         if (!previousFile.empty())
@@ -710,56 +724,51 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
             if (previous == filePaths.end()) { filePaths.push_back(previousFile); previous = filePaths.end() - 1; }
             selectedFile = uint32_t(previous - filePaths.begin());
         }
+        mFileListInitialized = true;
         VoxelizationBase::FileUpdated = false;
     }
+    if (!mFileListError.empty()) widget.text(mFileListError);
     Gui::DropdownList list;
     for (uint i = 0; i < filePaths.size(); i++)
     {
         list.push_back({i, filePaths[i].filename().string()});
     }
-    widget.dropdown("File", list, selectedFile);
-    const bool materialModeChanged = widget.checkbox("Visible material (reload)", mUseVisibleMaterial);
+    if (list.empty())
+        widget.text("No voxel .bin files found in " + VoxelizationBase::ResourceFolder);
+    else
+        widget.dropdown("File", list, selectedFile);
+    widget.checkbox("Visible material (apply with Read)", mUseVisibleMaterial);
 
-    if (mpScene && selectedFile < filePaths.size() && (widget.button("Read") || materialModeChanged))
+    if (mpScene && selectedFile < filePaths.size() && widget.button("Read"))
     {
-        std::ifstream f;
-        f.open(filePaths[selectedFile], std::ios::binary | std::ios::ate);
-        if (f.is_open())
-        {
-            size_t fileSize = std::filesystem::file_size(filePaths[selectedFile]);
-            size_t offset = 0;
-            tryRead(f, offset, sizeof(GridData), &gridData, fileSize);
-            f.close();
+        // The buffer count is part of the shader resource layout. Drop the
+        // old resources and passes before execute() computes the new count.
+        // All file I/O is deferred to that single load attempt.
+        mGBuffers.clear();
+        mPBuffers.clear();
+        mVisibilityMaskBuffers.clear();
+        mVisibleMaterialActive = false;
+        mVisibilityMasksAvailable = false;
+        mVisibleLODLevels = 0;
+        mExtensionStatus.clear();
+        mGBufferSplits.clear();
+        mOctreeBuffer = nullptr;
+        mOctreeMaxDepth = 0;
+        mOctreeNodeCounts.clear();
+        mAvailableLODLevels = 0;
+        mVoxelFormatVersion = 0;
+        mVoxelLodMode.clear();
+        mVoxelProducer.clear();
+        mHasVoxelMetadata = false;
+        mBufferCount = 1;
+        mpFullScreenPass = nullptr;
+        mpDisplayNDFPass = nullptr;
 
-            // The buffer count is part of the shader resource layout. Drop the
-            // old resources and passes before the next execute() computes the
-            // new count, otherwise a reload with a different scene size would
-            // use the previous fixed array layout.
-            mGBuffers.clear();
-            mPBuffers.clear();
-            mVisibilityMaskBuffers.clear();
-            mVisibleMaterialActive = false;
-            mVisibilityMasksAvailable = false;
-            mVisibleLODLevels = 0;
-            mExtensionStatus.clear();
-            mGBufferSplits.clear();
-            mOctreeBuffer = nullptr;
-            mOctreeMaxDepth = 0;
-            mOctreeNodeCounts.clear();
-            mAvailableLODLevels = 0;
-            mVoxelFormatVersion = 0;
-            mVoxelLodMode.clear();
-            mVoxelProducer.clear();
-            mHasVoxelMetadata = false;
-            mBufferCount = 1;
-            mpFullScreenPass = nullptr;
-            mpDisplayNDFPass = nullptr;
-
-            requestRecompile();
-            mComplete = false;
-            mOptionsChanged = true;
-        }
+        requestRecompile();
+        mLoadRequested = true;
+        mOptionsChanged = true;
     }
+    if (mGBuffers.empty()) widget.text("Select a voxel file and press Read to load it.");
 
     widget.text("Voxel Size: " + ToString(gridData.voxelSize));
     widget.text("Voxel Count: " + ToString((int3)gridData.voxelCount));
@@ -860,7 +869,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
                 mOutputResolution = uint2(1920, 1080);
             else
                 mOutputResolution = uint2(mSelectedResolution, mSelectedResolution);
-            ref<Camera> camera = mpScene->getCamera();
+            ref<Camera> camera = mpScene ? mpScene->getCamera() : nullptr;
             if (camera)
                 camera->setAspectRatio(mOutputResolution.x / (float)mOutputResolution.y);
             requestRecompile();

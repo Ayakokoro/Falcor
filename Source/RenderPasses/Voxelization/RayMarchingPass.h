@@ -42,6 +42,8 @@ private:
 
     GridData& gridData;
     std::vector<std::filesystem::path> filePaths;
+    bool mFileListInitialized = false;
+    std::string mFileListError;
 
     uint mDrawMode;
     uint mMaxBounce;
@@ -55,7 +57,7 @@ private:
     bool mUseEmissiveLight;
     bool mDebug;
     bool mRenderBackGround;
-    bool mComplete;
+    bool mLoadRequested = false; // One attempt per Read click (or explicit script autoLoad).
     int mForcedLOD = -1;  // -1=disabled, 0=finest leaf, 1..N=coarser levels
     int mMaxLODLevel = -1; // -1=no cap, N=never LOD-stop above this level (leaf=0)
     float mCoverageBlend = 0.0f; // 0=raw coverage, 1=fill all empty cavity
