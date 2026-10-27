@@ -19,6 +19,7 @@ int main(int argc, char* argv[]) {
     bool useSpecGlossMaterials = false; // default matches Falcor FBX import
     bool visibleMaterial = false;
     bool visibilityBitmask = false;
+    bool detailedTimings = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -53,6 +54,8 @@ int main(int argc, char* argv[]) {
             keepTemp = false;
         } else if (arg == "--in-memory") {
             useInMemory = true;
+        } else if (arg == "--timings") {
+            detailedTimings = true;
         } else if (arg == "--visible-material") {
             visibleMaterial = true;
         } else if (arg == "--visibility-bitmask") {
@@ -74,7 +77,8 @@ int main(int argc, char* argv[]) {
                   << "  -l, --lod-levels <N>  Additional coarse LOD levels (0 = leaves only)\n"
                   << "  --lod-mode <mode>     approximate or brute-force (default: approximate)\n"
                   << "  --max-polygons-per-node <N>  Per-node cap; 0 = unlimited\n"
-                  << "  -t, --threads <N> Number of clip threads (default: auto-detect)\n"
+                  << "  -t, --threads <N> Number of clip/analyze threads (default: auto-detect)\n"
+                  << "  --timings         Detailed per-task/per-worker elapsed times (stage times always printed)\n"
                   << "  --tmp-dir <path>  Temp directory for intermediate files (default: ./tmp/)\n"
                   << "  --keep-temp       Keep temp files after completion (default)\n"
                   << "  --clean           Delete temp files after completion\n"
@@ -102,6 +106,7 @@ int main(int argc, char* argv[]) {
     config.lodLevels = lodLevels;
     config.lodMode = lodMode;
     config.maxPolygonsPerNode = maxPolygonsPerNode;
+    config.detailedTimings = detailedTimings;
 
     std::cout << "=== LargeSceneVoxelization ===" << std::endl;
     std::cout << "  Input:       " << inputPath << std::endl;
@@ -118,12 +123,13 @@ int main(int argc, char* argv[]) {
     std::cout << "  Threads:     " << numThreads << std::endl;
     std::cout << "  Mode:        " << (useInMemory ? "in-memory" : "disk-backed") << std::endl;
     std::cout << "  Materials:   " << (useSpecGlossMaterials ? "SpecGloss" : "MetalRough") << std::endl;
+    std::cout << "  Timings:     " << (detailedTimings ? "detailed (adds measurement overhead)" : "stages only") << std::endl;
     if (!useInMemory) {
         std::cout << "  Temp dir:    " << tmpDir << std::endl;
         std::cout << "  Keep temp:   " << (keepTemp ? "yes" : "no") << std::endl;
     }
 
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::steady_clock::now();
 
     SceneVoxelization voxelizer(config);
     voxelizer.setTmpDir(tmpDir);
@@ -142,7 +148,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
+    auto end = std::chrono::steady_clock::now();
 
     if (ok) {
         auto seconds = std::chrono::duration<double>(end - start).count();

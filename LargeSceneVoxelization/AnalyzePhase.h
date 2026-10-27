@@ -33,13 +33,15 @@ struct AnalyzeContext
     const std::vector<Texture2D>& normalMapTextures;
     std::vector<VisibleMaterialFile::Data>* visibleMaterials = nullptr;
     std::vector<VisibilityMask::Data>* visibilityMasks = nullptr;
+    bool detailedTimings = false;
 };
 
 inline void analyzeNode(
     OctreeBuilder::OctreeResult& octree,
     uint32_t bfsIndex,
     const std::vector<Polygon>& nodePolys,
-    const AnalyzeContext& ctx)
+    const AnalyzeContext& ctx,
+    BakeTiming::Worker* timings = nullptr)
 {
     const auto& bfsItem = octree.bfsOrder[bfsIndex];
 
@@ -48,8 +50,10 @@ inline void analyzeNode(
     node.request.cell = bfsItem.cellInt;
     node.request.nodeKey = PolygonGenerator::makeNodeKey(
         bfsItem.level, bfsItem.cellInt);
+    BakeTiming::Scope copyTimer(timings, BakeTiming::Task::NodeCopy);
     node.polygons = nodePolys;
     node.storedPolygonCount = static_cast<uint32_t>(node.polygons.size());
+    copyTimer.stop();
 
     VoxelizationCore::TextureSet textures{
         ctx.baseColorTextures,
@@ -62,6 +66,7 @@ inline void analyzeNode(
     options.sampleFrequency = ctx.sampleFrequency;
     options.visibleMaterial = ctx.visibleMaterials != nullptr;
     options.visibilityBitmask = ctx.visibilityMasks != nullptr;
+    options.timings = timings;
 
     const auto result = VoxelizationCore::analyzeNode(
         node, analysisContext, options);
@@ -121,8 +126,11 @@ inline void executeNodes(
     std::atomic<uint64_t> processed{0};
     std::atomic<uint64_t> skipped{0};
     std::atomic<bool> failed{false};
+    std::vector<BakeTiming::Worker> timingWorkers(ctx.detailedTimings ? numThreads : 0);
 
     auto worker = [&](uint64_t start, uint64_t end, uint32_t threadId) {
+        auto* timings = ctx.detailedTimings ? &timingWorkers[threadId] : nullptr;
+        BakeTiming::Scope workerTimer(timings ? &timings->wall : nullptr);
         std::ifstream polyIn(polygonsDatPath, std::ios::binary);
         if (!polyIn)
         {
@@ -136,6 +144,7 @@ inline void executeNodes(
         for (uint64_t ni = start; ni < end; ++ni)
         {
             const auto& nodeIndex = nodeIndices[ni];
+            BakeTiming::Scope readTimer(timings, BakeTiming::Task::PolygonRead);
             polyIn.seekg(static_cast<std::streamoff>(nodeIndex.dataOffset));
             if (!polyIn)
             {
@@ -153,6 +162,7 @@ inline void executeNodes(
                 nodePolys[pi].init();
                 PolygonSerializer::readPolygon(polyIn, nodePolys[pi]);
             }
+            readTimer.stop();
 
             if (nodePolys.empty())
             {
@@ -173,7 +183,7 @@ inline void executeNodes(
 
             try {
                 if (!polyIn) throw std::runtime_error("Truncated node polygon data.");
-                analyzeNode(octree, bfsIt->second, nodePolys, ctx);
+                analyzeNode(octree, bfsIt->second, nodePolys, ctx, timings);
             } catch (const std::exception& error) {
                 failed = true;
                 std::cerr << "  [Analyze] " << error.what() << std::endl;
@@ -194,6 +204,7 @@ inline void executeNodes(
     std::vector<std::thread> threads;
     const uint64_t chunkSize =
         (totalNodes + numThreads - 1) / numThreads;
+    const auto workersStart = ctx.detailedTimings ? BakeTiming::Clock::now() : BakeTiming::Clock::time_point{};
     for (uint32_t threadId = 0; threadId < numThreads; ++threadId)
     {
         const uint64_t start = uint64_t(threadId) * chunkSize;
@@ -204,6 +215,13 @@ inline void executeNodes(
     }
     for (auto& thread : threads)
         thread.join();
+    if (ctx.detailedTimings)
+    {
+        const double workersWall = BakeTiming::secondsSince(workersStart);
+        timingWorkers.resize(threads.size());
+        std::cout << '\n';
+        BakeTiming::reportAnalyze(label, timingWorkers, workersWall);
+    }
     if (ctx.visibleMaterials && (failed || skipped > 0))
         throw std::runtime_error("Visible-material analysis did not complete all nodes.");
 

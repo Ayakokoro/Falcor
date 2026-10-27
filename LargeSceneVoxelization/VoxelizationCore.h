@@ -7,6 +7,7 @@
 #include "TextureSampler.h"
 #include "VoxelData.h"
 #include "VisibleMaterialFile.h"
+#include "BakeTiming.h"
 
 #include <array>
 #include <cstdint>
@@ -74,6 +75,7 @@ struct AnalysisOptions
     bool computeSphericalMaps = false;
     bool computeSplittingError = false;
     bool computeNdf = false;
+    BakeTiming::Worker* timings = nullptr; // Optional caller-owned, per-worker statistics.
 };
 
 struct ProjectionValidation

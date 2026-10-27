@@ -264,6 +264,35 @@ struct Ellipsoid {
         (void)cellInt;  // kept for API compatibility
     }
 
+    // Boolean segment query for projection counting. For a positive quadratic,
+    // t = clamp(-halfB/a, 0, 1) minimizes it. Keep t scaled by a so the sign of
+    // the minimum can be tested without division or square roots.
+    bool intersectsSegment(const float3& from, const float3& to) const {
+        const float3 v = to - from;
+        const float3 f = from - center;
+        const float a = dot(v, B * v);
+        const float halfB = dot(v, B * f);
+        const float c = dot(f, B * f) - 1.0f;
+        // A zero-length segment is a point query. The same endpoint test also
+        // covers a linear/concave quadratic (e.g. a degenerate fitted matrix).
+        if (a <= 0.0f) [[unlikely]] {
+            const float minimum = std::min(c, a + 2.0f * halfB + c);
+            return (minimum <= 0.0f) & ((std::bit_cast<uint32_t>(minimum) & 0x7f800000u) != 0x7f800000u);
+        }
+        const float ac = a * c;
+        // Most disk rays miss thin fitted primitives. Reject their negative
+        // discriminant before doing the segment-interval work, as clip() does.
+        if (halfB * halfB - ac < 0.0f) return false;
+        const float scaledT = std::min(a, std::max(0.0f, -halfB));
+        const float vertexTerm = scaledT * (2.0f * halfB + scaledT);
+        const float minimum = ac + vertexTerm;
+        // Use the existing root test on exact float boundaries. Do not expand
+        // the ellipsoid by an epsilon; non-boundary cases use the minimum test.
+        if (minimum == 0.0f) [[unlikely]] return clip(from, to).x >= 0.0f;
+        // Explicit finite check remains valid with fast-math compiler options.
+        return (minimum < 0.0f) & ((std::bit_cast<uint32_t>(minimum) & 0x7f800000u) != 0x7f800000u);
+    }
+
     // Clip a ray segment against the ellipsoid, returns (tEnter, tExit) in [0,1]
     float2 clip(const float3& from, const float3& to) const {
         float3 v = to - from;

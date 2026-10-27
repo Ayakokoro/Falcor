@@ -1273,6 +1273,13 @@ AnalysisResult analyzeNode(const NodeData& node,
                            const AnalysisContext& context,
                            const AnalysisOptions& options)
 {
+    auto* timings = options.timings;
+    BakeTiming::Scope timer(timings, BakeTiming::Task::PrepareGeometry);
+    if (timings)
+    {
+        ++timings->nodes;
+        timings->polygons += node.polygons.size();
+    }
     AnalysisResult result;
     result.voxelData.init();
 
@@ -1320,6 +1327,7 @@ AnalysisResult analyzeNode(const NodeData& node,
         preparedPolygons.push_back(prepared);
     }
 
+    timer.next(timings, BakeTiming::Task::MaterialInputs);
     std::vector<VisibleABSDFInput> visibleInputs;
     if (options.visibleMaterial || options.visibilityBitmask)
         visibleInputs.reserve(preparedPolygons.size());
@@ -1331,24 +1339,28 @@ AnalysisResult analyzeNode(const NodeData& node,
             visibleInputs.push_back({input.baseColor, input.specular, input.normal, input.area, 0.0f});
     }
     result.voxelData.ABSDF.normalizeSelf();
+    timer.stop();
 
     if (options.visibleMaterial || options.visibilityBitmask)
     {
         // One reusable arena per analysis worker, allocated only in the opt-in path.
         thread_local VisibilityMaskBake::ProjectionMaps scratch;
         result.visibleMaterial = bakeVisibleMaterial(visibleInputs, node.polygons, range,
-            node.request.level, scratch, options.visibilityBitmask ? &result.visibilityMask : nullptr);
+            node.request.level, scratch, options.visibilityBitmask ? &result.visibilityMask : nullptr, timings);
     }
 
     if (result.voxelData.isSolid())
     {
+        if (timings) ++timings->solidNodes;
+        timer.next(timings, BakeTiming::Task::EllipsoidFit);
         result.voxelData.ellipsoid.fit(node.polygons, range);
+        timer.stop();
 
         computeOctahedralProjectionAreas(
             result.voxelData,
             range,
             node.polygons,
-            std::max(1u, options.sampleFrequency));
+            std::max(1u, options.sampleFrequency), timings);
     }
 
     if (options.computeProjectionValidation)

@@ -1,4 +1,5 @@
 #pragma once
+#include "BakeTiming.h"
 #include "Types.h"
 #include "Triangle.h"
 #include "AABB.h"
@@ -115,6 +116,7 @@ static uint64_t clipHierarchicalToStream(
 struct ThreadStats {
     uint64_t entriesWritten = 0;
     uint64_t trianglesProcessed = 0;
+    double wall = 0;
 };
 
 static void clipWorker(
@@ -129,6 +131,7 @@ static void clipWorker(
     std::atomic<uint32_t>& completedCounter,
     ThreadStats& stats)
 {
+    BakeTiming::Scope workerTimer(&stats.wall);
     std::filesystem::path shardPath = clipDir / ("thread_" + PolygonSerializer::pad4(threadId) + ".bin");
     std::ofstream out(shardPath, std::ios::binary);
     if (!out) {
@@ -204,7 +207,8 @@ inline ClipResult executeLevel(
     uint32_t targetLevel,
     const std::filesystem::path& tmpDir,
     uint32_t numThreads,
-    const std::string& phaseName)
+    const std::string& phaseName,
+    bool detailedTimings = false)
 {
     namespace fs = std::filesystem;
     if (targetLevel > maxDepth) {
@@ -269,6 +273,22 @@ inline ClipResult executeLevel(
 
     for (auto& th : threads) th.join();
     std::cout << std::endl;
+    if (detailedTimings) {
+        double sum = 0, longest = 0;
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(6);
+        out << "  [Timing] Clip " << phaseName << " workers (elapsed, including shard I/O):\n";
+        for (uint32_t t = 0; t < numThreads; ++t) {
+            sum += stats[t].wall;
+            longest = std::max(longest, stats[t].wall);
+            out << "    worker " << t << ": wall=" << stats[t].wall << " s, instances="
+                << assignments[t].size() << ", triangles=" << stats[t].trianglesProcessed
+                << ", polygons=" << stats[t].entriesWritten << '\n';
+        }
+        out << "    summed worker elapsed=" << sum << " s, max/mean="
+            << (sum > 0 ? longest * numThreads / sum : 0) << '\n';
+        std::cout << out.str() << std::flush;
+    }
 
     // Build result
     ClipResult result;

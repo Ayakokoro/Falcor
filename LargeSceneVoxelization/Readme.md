@@ -1,5 +1,60 @@
 example use
 
+## CPU 烘焙计时
+
+默认打印 `[Timing]` 各阶段的实际经过时间（`wall`，单位秒）：场景/纹理加载、
+Clip、Merge（叶层包含建树）、Analyze、父级生成、写文件与清理。
+`brute-force` 的每个 LOD 分别计时；Merge 原有的读取、排序、写入细分计时也会保留。
+
+在现有命令后增加 `--timings`，开启 Analyze 热点与线程统计。例如从 `LargeSceneVoxelization` 目录运行：
+
+```powershell
+.\build\Release\LargeSceneVoxelization.exe "..\Scene\Greasewood\greasewood.glb" -o "..\resource\greasewood_profile.bin" -r 512 -s 1024 --visibility-bitmask --lod-levels 4 --lod-mode brute-force --tmp-dir ".\tmp_profile" --timings 2>&1 | Tee-Object -FilePath bake-timing.log
+```
+
+详细输出包含：
+
+- Analyze：节点多边形读取/反序列化/分配、节点复制、几何准备、纹理采样与旧材质聚合、椭球拟合。
+- 投影面积：primitive 射线采样、旧可见面积光栅化、总投影面积，分别计时。
+- 可见材质：准备、depth/owner 光栅化、像素材质累积、最终拟合/打包。
+- Visibility mask：准备、16 方向光栅化与候选面筛选、CDF/拒绝采样/可见性查询。
+- Clip 各线程的实例/三角形/多边形数量与耗时；Analyze 各线程的节点/多边形数量与耗时。
+- primitive 采样总数、mask 候选次数、最终保留样本数与无效 lobe 数。
+
+`summed worker elapsed` 是各工作线程的经过时间之和，通常大于该阶段的 `wall`。
+热点百分比以这个线程累计时间为分母，各项互不重叠；它包含 I/O 等待和线程被调度出去的时间，
+**不是操作系统 CPU 使用率**。`max/mean` 是最慢线程耗时除以平均线程耗时，越大通常说明负载越不均衡，
+也可能受 I/O 或系统调度影响。`other / timer overhead` 包含未细分的查表、释放、进度输出及计时开销。
+mask 的 `retained/candidates` 是最终保留效率：未填满而失效的 lobe，其部分接受样本不会计入 retained。
+
+详细计时使用每线程独立统计，在方向/节点级别取时，不对每条射线或每个像素取时。
+它仍有额外开销，测正常吞吐量时去掉 `--timings`。`--in-memory` 也支持，叶节点分析与近似父级
+处于同一循环，阶段总时间合并报告，父级聚合在详细任务中单列。计时不写入 `.bin/.meta/.vmat/.vbm`。
+
+## CPU 投影采样优化
+
+以下优化默认启用，命令行参数和文件布局不变：
+
+- 按 `-s` 缓存 Hammersley 圆盘样本的半球坐标，所有 Analyze 工作线程共享只读数据。
+  `-s 1024` 的样本表约占 12 KiB；固定的 64 个 Octahedral 子方向及其基底也只初始化一次。
+- 每个节点继续执行原来的射线坐标变换与 AABB 裁剪；采样顺序、样本数量、面积归一化分母保持不变。
+- 椭球面积计数使用 `intersectsSegment()`，通过二次函数在线段上的最小值判断命中，
+  普通路径省去求根与除法；精确落在浮点边界时回退到原 `clip()`，零长度线段按点处理。
+  需要进入/离开参数的调用仍可使用原 `clip()`。
+
+Release 使用 `/fp:fast`（其他编译器对应 `-ffast-math`），缓存中间值和重新组织命中判定会改变
+浮点舍入，**投影面积不保证与旧版本逐位相同**。验证包含采样位置误差、相切/端点/退化线段、
+双精度几何参考和投影面积差异；减少 `-s` 仍会单独影响采样精度。
+
+```powershell
+cmake --build build --config Release --target LargeSceneVoxelization VoxelizationInspector ProjectionTests VisibilityMaskTests
+ctest --test-dir build -C Release --output-on-failure
+
+# 可选：读取已有烘焙，均匀抽取约 1024 个叶节点，对照旧采样/仅缓存/缓存加新判定
+# 这是投影内核测试，不包含场景加载、Clip、Merge 或其他 Analyze 工作。
+.\build\Release\ProjectionTests.exe --benchmark "..\resource\greasewood_visible_lod0.bin"
+```
+
 ## 可选：可见材质与 visibility mask
 
 默认命令继续使用原来的 4-lobe 材质、`.bin` 布局和 version 2 `.meta`。

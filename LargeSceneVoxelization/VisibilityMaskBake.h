@@ -1,4 +1,5 @@
 #pragma once
+#include "BakeTiming.h"
 #include "VisibilityMask.h"
 #include "VisibleABSDF.h"
 #include "Polygon.h"
@@ -118,7 +119,9 @@ struct AreaEntry { uint32_t polygon; double cumulativeArea; };
 inline VisibilityMask::Data bake(const VisibleABSDF& absdf, const PolygonRange& range,
                                  const std::vector<Polygon>& polygons,
                                  const std::vector<uint32_t>& lobePairs,
-                                 ProjectionMaps& maps, uint32_t seed, Stats& stats) {
+                                 ProjectionMaps& maps, uint32_t seed, Stats& stats,
+                                 BakeTiming::Worker* timings = nullptr) {
+    BakeTiming::Scope timer(timings, BakeTiming::Task::MaskSetup);
     if (range.localHead != 0 || range.count != polygons.size() || lobePairs.size() != polygons.size() ||
         maps.directions.size() < VisibilityMask::DirectionCount)
         throw std::invalid_argument("Visibility masks require one complete node polygon block and 16 projections.");
@@ -133,6 +136,7 @@ inline VisibilityMask::Data bake(const VisibleABSDF& absdf, const PolygonRange& 
     stats.activeLobes += lobeCount;
     if (lobeCount == 0) return result;
 
+    timer.next(timings, BakeTiming::Task::MaskRaster);
     std::vector<uint8_t> eligible(polygons.size(), 0);
     for (uint32_t d = 0; d < VisibilityMask::DirectionCount; ++d) {
         maps.rasterize(d, range, polygons, VisibilityMask::direction(d));
@@ -141,6 +145,7 @@ inline VisibilityMask::Data bake(const VisibleABSDF& absdf, const PolygonRange& 
             if (owners[p] != UINT32_MAX) eligible[owners[p]] = 1;
     }
 
+    timer.next(timings, BakeTiming::Task::MaskSampling);
     // Shard merge order depends on clip-worker partitioning. Give the area
     // CDF a stable source-triangle order before drawing deterministic samples.
     std::vector<uint32_t> candidates;

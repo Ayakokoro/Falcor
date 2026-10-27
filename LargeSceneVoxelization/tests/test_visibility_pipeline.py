@@ -5,6 +5,7 @@ import subprocess
 import sys
 import shutil
 import uuid
+import re
 from contextlib import contextmanager
 
 
@@ -82,6 +83,19 @@ def extension(path, expected_lods, with_masks=True):
     return material[80:], masks[48:] if masks else None
 
 
+def comparable_memory_legacy(path):
+    data, nodes, _, _, _, voxel_start = legacy(path)
+    data = bytearray(data)
+    # The existing in-memory path leaves Ellipsoid uninitialized for unbaked
+    # (area == 0) parents. Compare all defined fields without making allocator
+    # contents part of the instrumentation regression contract.
+    for node in range(nodes):
+        start = voxel_start + node * 420
+        if struct.unpack_from('<f', data, start + 176)[0] == 0:
+            data[start + 180:start + 228] = bytes(48)
+    return data
+
+
 def main():
     executable = Path(sys.argv[1]).resolve()
     work = Path(sys.argv[2]).resolve()
@@ -111,12 +125,15 @@ f 1//5 5//5 8//5 4//5
 f 2//6 3//6 7//6 6//6
 ''', encoding='ascii')
 
+        logs = {}
+
         def run(name, *options, succeeds=True):
             output = root / (name + '.bin')
             command = [str(executable), str(model), '-o', str(output), '-r', '4', '-s', '8',
                        '--tmp-dir', str(root / (name + '-cache')), *options]
             result = subprocess.run(command, capture_output=True, text=True)
             assert (result.returncode == 0) == succeeds, result.stdout + result.stderr
+            logs[name] = result.stdout
             return output
 
         for lod_mode in ['approximate', 'brute-force']:
@@ -129,6 +146,32 @@ f 2//6 3//6 7//6 6//6
             assert extension(new, lods, False)[0] == extension(mask, lods)[0]
             assert not Path(str(old) + '.vmat').exists()
 
+            timed_name = lod_mode + '-timed'
+            timed = run(timed_name, *options, '--visibility-bitmask', '--timings')
+            assert legacy(timed)[0] == legacy(mask)[0], 'Timing changed legacy bake data'
+            assert extension(timed, lods) == extension(mask, lods), 'Timing changed extension payloads'
+            assert '[Timing] Load scene wall=' in logs[lod_mode + '-old']
+            assert 'summed worker elapsed=' not in logs[lod_mode + '-old'], 'Detailed timing must be opt-in'
+            assert 'Clip clip workers' in logs[timed_name]
+            if lods:
+                for stage in ['Clip LOD 1', 'Merge LOD 1', 'Analyze LOD 1']:
+                    assert f'[Timing] {stage} wall=' in logs[timed_name]
+
+            # Check real work accounting per level, not timing thresholds that
+            # depend on machine load. Cube leaves and coarse nodes are solid.
+            _, _, _, counts, _, _ = legacy(timed)
+            totals = re.findall(r'analyzed nodes=(\d+), polygons=(\d+), solid=(\d+), primitive samples=(\d+)', logs[timed_name])
+            expected_counts = [counts[-1]] + ([counts[-2]] if lods else [])
+            assert [int(row[0]) for row in totals] == expected_counts
+            for nodes, polygons, solid, samples in totals:
+                assert int(nodes) == int(solid) and int(polygons) >= int(nodes)
+                assert int(samples) == int(solid) * 16 * 4 * 8
+            for section in logs[timed_name].split('    task totals:')[1:]:
+                task_values = re.findall(r'^      .+: ([\d.]+) s \(([\d.]+)%\)', section, re.MULTILINE)
+                assert len(task_values) == 17  # 16 disjoint tasks + unaccounted time
+                assert all(float(seconds) >= 0 for seconds, _ in task_values)
+                assert abs(sum(float(percent) for _, percent in task_values) - 100) < 0.01
+
         outputs = []
         for name, options in [('disk1', ['-t', '1']), ('disk2', ['-t', '2']),
                               ('memory', ['--in-memory', '-t', '1'])]:
@@ -136,12 +179,23 @@ f 2//6 3//6 7//6 6//6
             outputs.append(extension(path, 0))
         assert outputs[0] == outputs[1] == outputs[2], 'Material/mask bake depends on scheduling or pipeline'
 
+        for name, options in [('disk2', ['-t', '2']), ('memory', ['--in-memory', '-t', '1'])]:
+            timed = run(name + '-timed', '--visibility-bitmask', '--timings', *options)
+            untimed = root / (name + '.bin')
+            if name == 'memory':
+                assert comparable_memory_legacy(timed) == comparable_memory_legacy(untimed)
+            else:
+                assert legacy(timed)[0] == legacy(untimed)[0]
+            assert extension(timed, 0) == outputs[0], 'Profiling changed threaded/in-memory results'
+            assert 'worker 0: wall=' in logs[name + '-timed']
+            assert ('worker 1: wall=' in logs[name + '-timed']) == (name == 'disk2')
+
         # Replacing a bake in legacy mode must invalidate its optional extensions.
         old = run('memory', '--in-memory', '-t', '1')
         assert not Path(str(old) + '.vmat').exists() and not Path(str(old) + '.vbm').exists()
         Path(str(root / 'broken.bin') + '.vbm').mkdir()
         run('broken', '--visibility-bitmask', succeeds=False)
-    print('Visibility pipeline: legacy compatibility, LODs, paired masks, determinism and output failure passed.')
+    print('Visibility pipeline: legacy compatibility, LODs, paired masks, determinism, timing and output failure passed.')
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ enum class LODBuildMode {
 struct VoxelizationConfig {
     bool visibleMaterial = false;
     bool visibilityBitmask = false;
+    bool detailedTimings = false;
     uint baseResolution = 512;     // N = 2^D
     uint sampleFrequency = 1024;   // rays per octahedral direction
 
@@ -58,6 +59,7 @@ public:
 
     // Existing in-memory pipeline (unchanged)
     bool process(const std::string& fbxPath, const std::string& outputPath) {
+        BakeTiming::Stage stage("Load scene");
         // ---- Phase 0: Load scene (instanced mode: unique meshes + transforms) ----
         std::cout << "Loading (instanced): " << fbxPath << std::endl;
         SceneLoader loader(mConfig.useSpecGlossMaterials);
@@ -70,6 +72,7 @@ public:
                   << "  Instances: " << scene.instances.size()
                   << "  Materials: " << scene.materials.size() << std::endl;
 
+        stage.next("Grid setup");
         // Compute grid from all instances' world-space bounds
         setupGrid(scene);
 
@@ -83,6 +86,7 @@ public:
         mMaxDepth = 0;
         while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 
+        stage.next("Load textures");
         loadTextures(scene.materials);
 
         uint generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
@@ -101,6 +105,7 @@ public:
                   << "  maxDepth=" << mMaxDepth << std::endl;
 
         // ---- Phase 1: Hierarchical clip (leaf-only polygon storage) ----
+        stage.next("Clip (in-memory)");
         PolygonGenerator gen(mGrid);
         gen.reset();
 
@@ -148,10 +153,16 @@ public:
                       << " maxPolyPerNode=" << maxPolyPerNode << std::endl;
         }
 
+        stage.next("Build octree (in-memory)");
         gen.finalizeBFS(mMaxDepth, 0, int3(0, 0, 0));
+        stage.next("Initialize extensions");
         initExtensions(gen.gBuffer.size());
 
         // ---- Phase 2: Per-node analysis (reverse BFS: leaves first) ----
+        stage.next("Analyze + approximate parents (in-memory)");
+        std::vector<BakeTiming::Worker> timingWorkers(mConfig.detailedTimings ? 1 : 0);
+        auto* timings = mConfig.detailedTimings ? &timingWorkers[0] : nullptr;
+        BakeTiming::Scope analyzeTimer(timings ? &timings->wall : nullptr);
         for (int nodeIdx = (int)gen.gBuffer.size() - 1; nodeIdx >= 0; nodeIdx--) {
             uint level = gen.mBFSOrder[nodeIdx].level;
 
@@ -163,9 +174,11 @@ public:
                 debugNode.request.cell = gen.mBFSOrder[nodeIdx].cellInt;
                 debugNode.request.nodeKey = PolygonGenerator::makeNodeKey(
                     level, debugNode.request.cell);
+                BakeTiming::Scope copyTimer(timings, BakeTiming::Task::NodeCopy);
                 debugNode.polygons = gen.polygonArrays[nodeIdx];
                 debugNode.storedPolygonCount =
                     static_cast<uint32_t>(debugNode.polygons.size());
+                copyTimer.stop();
 
                 VoxelizationCore::TextureSet debugTextures{
                     mBaseColorTextures,
@@ -178,6 +191,7 @@ public:
                 debugOptions.sampleFrequency = mConfig.sampleFrequency;
                 debugOptions.visibleMaterial = mConfig.visibleMaterial || mConfig.visibilityBitmask;
                 debugOptions.visibilityBitmask = mConfig.visibilityBitmask;
+                debugOptions.timings = timings;
 
                 const auto debugResult = VoxelizationCore::analyzeNode(
                     debugNode, debugContext, debugOptions);
@@ -332,6 +346,7 @@ public:
 #endif
             } else if (mConfig.lodMode == LODBuildMode::Approximate &&
                        level >= mMaxDepth - generatedLodLevels) {
+                BakeTiming::Scope parentTimer(timings, BakeTiming::Task::ParentAggregation);
                 // ── NON-LEAF: aggregate from children's VoxelData ──
                 VoxelData& vd = gen.gBuffer[nodeIdx];
                 vd.init();
@@ -432,16 +447,24 @@ public:
             }
         }
 
+        analyzeTimer.stop();
+        stage.stop();
+        if (timings) BakeTiming::reportAnalyze("in-memory + parents", timingWorkers, timings->wall);
+
         // ---- Phase 3: Write output ----
+        stage.next("Write legacy binary + metadata");
         std::cout << "Writing output: " << outputPath << std::endl;
         writeOutput(outputPath, gen);
+        stage.next("Write extensions (including fingerprints)");
         if (!writeExtensions(outputPath)) return false;
 
         // Free polygon data
+        stage.next("Cleanup");
         gen.polygonArrays.clear();
         gen.polygonArrays.shrink_to_fit();
         gen.mNodePolygonMap.clear();
 
+        stage.stop();
         std::cout << "Done." << std::endl;
         return true;
     }
@@ -917,6 +940,7 @@ inline bool SceneVoxelization::processDisk(
     const std::string& fbxPath, const std::string& outputPath)
 {
     namespace fs = std::filesystem;
+    BakeTiming::Stage stage("Load scene");
 
     // ---- Phase 0: Load scene (same as in-memory path) ----
     std::cout << "Loading (instanced): " << fbxPath << std::endl;
@@ -930,6 +954,7 @@ inline bool SceneVoxelization::processDisk(
               << "  Instances: " << scene.instances.size()
               << "  Materials: " << scene.materials.size() << std::endl;
 
+    stage.next("Grid setup");
     setupGrid(scene);
 
     uint32_t resolution = std::max({mGrid.voxelCount.x, mGrid.voxelCount.y, mGrid.voxelCount.z});
@@ -942,6 +967,7 @@ inline bool SceneVoxelization::processDisk(
     mMaxDepth = 0;
     while ((1u << mMaxDepth) < resolution) mMaxDepth++;
 
+    stage.next("Load textures");
     loadTextures(scene.materials);
 
     uint32_t generatedLodLevels = std::min(mConfig.lodLevels, mMaxDepth);
@@ -960,9 +986,10 @@ inline bool SceneVoxelization::processDisk(
 
     // ---- Phase 1: Multi-threaded clip → shard files ----
     std::cout << "\n=== Phase 1: Multi-threaded Clip ===" << std::endl;
+    stage.next("Clip leaves");
     auto clipResult = ClipPhase::executeLevel(
         scene, mGrid, mMaxDepth, mMaxDepth,
-        mTmpDir, mNumThreads, "clip");
+        mTmpDir, mNumThreads, "clip", mConfig.detailedTimings);
     if (clipResult.shardFiles.empty()) {
         std::cerr << "Clip phase produced no output." << std::endl;
         return false;
@@ -970,6 +997,7 @@ inline bool SceneVoxelization::processDisk(
 
     // ---- Phase 2: Merge shards → leaves.idx + polygons.dat + octree ----
     std::cout << "\n=== Phase 2: Merge ===" << std::endl;
+    stage.next("Merge leaves + build octree");
     auto mergeResult = MergePhase::execute(
         clipResult, mTmpDir, mMaxDepth, mConfig.maxPolygonsPerNode);
     if (mergeResult.totalLeaves == 0) {
@@ -978,22 +1006,28 @@ inline bool SceneVoxelization::processDisk(
     }
 
     // ---- Phase 3: Stream-based leaf analysis ----
+    stage.next("Initialize extensions");
     initExtensions(mergeResult.octree->gBuffer.size());
     std::cout << "\n=== Phase 3: Analyze ===" << std::endl;
     AnalyzePhase::AnalyzeContext actx{
         scene, mGrid, mMaxDepth, mConfig.sampleFrequency,
         mBaseColorTextures, mSpecularTextures, mMetallicTextures, mNormalMapTextures,
         mVisibleMaterials.empty() ? nullptr : &mVisibleMaterials,
-        mVisibilityMasks.empty() ? nullptr : &mVisibilityMasks
+        mVisibilityMasks.empty() ? nullptr : &mVisibilityMasks,
+        mConfig.detailedTimings
     };
+    stage.next("Analyze leaves");
     AnalyzePhase::execute(mergeResult, actx, mNumThreads);
+    stage.stop();
 
     // ---- Phase 4: Parent LOD generation ----
     auto& octree = *mergeResult.octree;
 
     if (mConfig.lodMode == LODBuildMode::Approximate) {
         std::cout << "\n=== Phase 4: Approximate Parent Aggregation ===" << std::endl;
+        stage.next("Approximate parent aggregation");
         aggregateParents(octree, mMaxDepth, generatedLodLevels);
+        stage.stop();
     } else if (generatedLodLevels > 0) {
         std::cout << "\n=== Phase 4: Brute-Force Parent LODs ===" << std::endl;
 
@@ -1009,9 +1043,10 @@ inline bool SceneVoxelization::processDisk(
             std::cout << "\n--- Exact LOD " << lod
                       << " (tree level " << targetLevel << ") ---" << std::endl;
 
+            stage.next("Clip LOD " + std::to_string(lod));
             auto lodClipResult = ClipPhase::executeLevel(
                 scene, mGrid, mMaxDepth, targetLevel,
-                mTmpDir, mNumThreads, clipPhaseName);
+                mTmpDir, mNumThreads, clipPhaseName, mConfig.detailedTimings);
 
             if (lodClipResult.shardFiles.empty()) {
                 std::cerr << "  [LOD " << lod << "] clip produced no shards."
@@ -1019,10 +1054,12 @@ inline bool SceneVoxelization::processDisk(
                 return false;
             }
 
+            stage.next("Merge LOD " + std::to_string(lod));
             auto lodMergeResult = MergePhase::executeLevel(
                 lodClipResult, levelMergeDir, mMaxDepth, targetLevel,
                 mConfig.maxPolygonsPerNode);
 
+            stage.next("Analyze LOD " + std::to_string(lod));
             if (lodMergeResult.totalNodes > 0) {
                 AnalyzePhase::executeNodes(
                     lodMergeResult.nodesIdxPath,
@@ -1037,21 +1074,26 @@ inline bool SceneVoxelization::processDisk(
             }
 
             // Polygon files are only needed until this level is analyzed.
+            stage.next("Cleanup LOD " + std::to_string(lod));
             if (!mKeepTemp) {
                 std::error_code ec;
                 fs::remove_all(levelMergeDir, ec);
             }
+            stage.stop();
         }
     }
 
     // ---- Phase 5: Write output ----
     std::cout << "\n=== Phase 5: Write Output ===" << std::endl;
+    stage.next("Write legacy binary + metadata");
     writeOutputDisk(outputPath, octree, mergeResult.totalPolygons,
                     mergeResult.maxPolyPerNode);
+    stage.next("Write extensions (including fingerprints)");
     if (!writeExtensions(outputPath)) return false;
 
     // Clip shards are cleaned by MergePhase. Merge data is kept by default
     // for inspection and removed when --clean is selected.
+    stage.next("Cleanup");
     if (!mKeepTemp) {
         std::error_code ec;
         fs::remove_all(fs::path(mTmpDir) / "merge", ec);
@@ -1059,6 +1101,7 @@ inline bool SceneVoxelization::processDisk(
         std::cout << "Merge data kept in: " << mTmpDir << "/merge" << std::endl;
     }
 
+    stage.stop();
     std::cout << "Done." << std::endl;
     return true;
 }

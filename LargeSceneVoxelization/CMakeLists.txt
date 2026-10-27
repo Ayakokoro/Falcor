@@ -139,6 +139,15 @@ install(TARGETS LargeSceneVoxelization VoxelizationInspector RUNTIME DESTINATION
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(ProjectionTests tests/ProjectionTests.cpp)
+    target_link_libraries(ProjectionTests PRIVATE VoxelizationCore)
+    # Match production floating-point optimization when checking compatibility.
+    if(MSVC)
+        target_compile_options(ProjectionTests PRIVATE /W3 /arch:AVX2 /fp:fast $<$<CONFIG:Release>:/O2>)
+    else()
+        target_compile_options(ProjectionTests PRIVATE -Wall -Wextra -march=native -ffast-math $<$<CONFIG:Release>:-O3>)
+    endif()
+    add_test(NAME ProjectionUnit COMMAND ProjectionTests)
     add_executable(VisibilityMaskTests tests/VisibilityMaskTests.cpp)
     target_link_libraries(VisibilityMaskTests PRIVATE VoxelizationCore)
     add_test(NAME VisibilityMaskUnit COMMAND VisibilityMaskTests ${CMAKE_CURRENT_BINARY_DIR}/visibility-unit)

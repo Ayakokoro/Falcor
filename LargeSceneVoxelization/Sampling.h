@@ -1,6 +1,9 @@
 #pragma once
 #include "Types.h"
 #include "Polygon.h"
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 struct SamplingRay {
     float3 origin;
@@ -26,13 +29,60 @@ inline float2 Hammersley2D(uint i, uint numSamples) {
     return float2(u, v);
 }
 
-// Ray from disk on unit hemisphere toward voxel center
-inline SamplingRay rayToVoxel(const float2& uDisk, const float3& direction,
-                               const Basis2& basis, const float3& cellCenter) {
+// Direction-independent part of a disk/hemisphere ray. Keep the original
+// formulas and sample order. Fast-math may round an uncached/fused expression
+// differently from a stored float, so bitwise identity is not guaranteed.
+struct VoxelRaySample {
+    float uu, ww, h;
+};
+
+inline VoxelRaySample makeVoxelRaySample(const float2& uDisk) {
     float2 p = sampleDisk(uDisk);
     const float r = 0.8660254f;
     float uu = p.x * r, ww = p.y * r;
     float h = std::sqrt(std::max(0.0f, r * r - uu * uu - ww * ww));
-    float3 point = h * direction + uu * basis.u + ww * basis.w;
+    return {uu, ww, h};
+}
+
+// Immutable tables are shared by workers. The thread-local fast path avoids a
+// lock/refcount operation per node; weak entries release unused frequencies.
+// The returned reference stays valid until this thread requests another count.
+inline const std::vector<VoxelRaySample>& voxelRaySamples(uint32_t frequency) {
+    using Table = std::vector<VoxelRaySample>;
+    static std::mutex mutex;
+    static std::unordered_map<uint32_t, std::weak_ptr<const Table>> tables;
+    thread_local std::shared_ptr<const Table> current;
+    frequency = std::max(1u, frequency);
+    if (!current || current->size() != frequency) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = tables.begin(); it != tables.end();) {
+            if (it->second.expired()) it = tables.erase(it);
+            else ++it;
+        }
+        auto& entry = tables[frequency];
+        auto table = entry.lock();
+        if (!table) {
+            auto samples = std::make_shared<Table>();
+            samples->reserve(frequency);
+            for (uint32_t i = 0; i < frequency; ++i)
+                samples->push_back(makeVoxelRaySample(Hammersley2D(i, frequency)));
+            table = samples;
+            entry = table;
+        }
+        current = std::move(table);
+    }
+    return *current;
+}
+
+// Ray from disk on unit hemisphere toward voxel center. Translation and the
+// subsequent AABB clipping remain per node, including their float rounding.
+inline SamplingRay rayToVoxel(const VoxelRaySample& sample, const float3& direction,
+                               const Basis2& basis, const float3& cellCenter) {
+    float3 point = sample.h * direction + sample.uu * basis.u + sample.ww * basis.w;
     return { point + cellCenter, -direction };
+}
+
+inline SamplingRay rayToVoxel(const float2& uDisk, const float3& direction,
+                               const Basis2& basis, const float3& cellCenter) {
+    return rayToVoxel(makeVoxelRaySample(uDisk), direction, basis, cellCenter);
 }
