@@ -1154,7 +1154,7 @@ Objects:  {
 			P: "EmissiveFactor", "Number", "", "A",0
 			P: "DiffuseColor", "Color", "", "A",0.600000023841858,0.600000023841858,0.600000023841858
 			P: "DiffuseFactor", "Number", "", "A",0.800000011920929
-			P: "SpecularColor", "Color", "", "A",1,1,1
+			P: "SpecularColor", "Color", "", "A",1,1,0
 			P: "SpecularFactor", "Number", "", "A",0.0399999991059303
 			P: "ShininessExponent", "Number", "", "A",511.999957693655
 			P: "ReflectionColor", "Color", "", "A",1,1,1
