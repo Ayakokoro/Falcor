@@ -2,6 +2,7 @@
 #include "Math/VoxelizationUtility.slang"
 #include "VoxelizationShared.slang"
 #include "MixLightSampler.slang"
+#include "VoxelSelection.slang"
 import Rendering.Materials.StandardMaterial;
 import Utils.Sampling.UniformSampleGenerator;
 
@@ -26,7 +27,7 @@ StructuredBuffer<uint> visibilityMaskBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<Ellipsoid> pBuffer[RAY_MARCHING_BUFFER_COUNT];
 StructuredBuffer<OctreeNode> octreeBuffer;
 
-RWStructuredBuffer<float4> selectedVoxel;
+RWStructuredBuffer<VoxelSelection> selectedVoxel;
 
 cbuffer GridData
 {
@@ -48,6 +49,7 @@ cbuffer CB
     bool renderBackGround;
     float4 clearColor;
     uint2 selectedPixel;
+    bool pickEnabled;
     float tanHalfFovY;  // tan(FovY / 2), for primary ray cone
     int forcedLOD;      // -1=disabled, 0=finest leaf, N=stop N levels above leaf
     int maxLODLevel;    // cap dynamic LOD stop: -1=no cap, N=never stop coarser than N levels above leaf
@@ -79,6 +81,7 @@ struct HitResult
     uint gbIndex;    // gBuffer offset at leaf node
     uint nodeSize;   // size in LOD-0 cells of the node where hit occurred (1=leaf, >1=LOD stop)
     float lodLevel;  // continuous LOD = log2(footprint), clamped to ≥0; 0=leaf
+    int3 nodeMinCell; // Actual traversed node, independent of rounding at its exit face.
 };
 
 struct PsOut
@@ -184,21 +187,21 @@ HitResult rayHitTE(Ellipsoid ellipsoid, float3 cell, float3 direction, int3 cell
     float3 hitCell = float3(nodeMinCell) + hitLocal * float(nodeSize);
     int3 hitCellInt = int3(floor(hitCell));
 
-    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize, 0.0f };
+    HitResult result = { inOut.x >= 0, hitCellInt, hitCell, gbIndex, nodeSize, 0.0f, nodeMinCell };
     return result;
 }
 
 HitResult rayHitVoxel(float3 cell, float3 direction, int3 cellInt, uint gbIndex, uint nodeSize)
 {
 #if !CHECK_ELLIPSOID
-    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f };
+    return { true, cellInt, cellInt + 0.5f, gbIndex, nodeSize, 0.0f, (cellInt / int(nodeSize)) * int(nodeSize) };
 #else
     Ellipsoid ellipsoid = loadPBuffer(gbIndex);
     HitResult hit = rayHitTE(ellipsoid, cell, direction, cellInt, gbIndex, nodeSize);
     if (hit.hit)
         return hit;
 #endif
-    return { false, cellInt, cellInt + 0.5f, 0, nodeSize, 0.0f };
+    return { false, cellInt, cellInt + 0.5f, 0, nodeSize, 0.0f, int3(0) };
 }
 
 // --- Parametric octree traversal (negative direction DDA) ---
@@ -218,7 +221,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
 {
     direction = normalizeSafe(direction);
     if (all(direction == float3(0)))
-        return { false, int3(from), from, 0, 0, 0.0f };
+        return { false, int3(from), from, 0, 0, 0.0f, int3(0) };
 
     // ===== Phase 1: ignoreNodeSize pre-skip (unchanged logic) =====
     float3 rayOrigin = from;
@@ -295,7 +298,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         t_max = min(t_max, t_min + maxDistance / float(rootSize));
 
     if (t_min > t_max)
-        return { false, int3(0), float3(0), 0, 0, 0.0f };
+        return { false, int3(0), float3(0), 0, 0, 0.0f, int3(0) };
 
     // ===== Phase 4: initialize state machine =====
     int2 stack[S_MAX + 1];
@@ -473,7 +476,7 @@ HitResult rayMarching(float3 from, float3 direction, float maxDistance, uint ign
         }
     }
 
-    return { false, int3(0), float3(0), 0, 0, 0.0f };
+    return { false, int3(0), float3(0), 0, 0, 0.0f, int3(0) };
 }
 
 float calcTrasmissionVisibility(HitResult hit, float3 direction, RayCone cone)
@@ -862,18 +865,18 @@ PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
     RayCone primaryCone = { coneTan, initialDistance * coneTan };
     HitResult hit = rayMarching(from, direction, -1, 0, primaryCone, initialDistance, -1);
 
-    if (all(pixel == selectedPixel))
+    if (pickEnabled && all(pixel == selectedPixel))
     {
+        VoxelSelection selection = {};
         if (hit.hit)
         {
-            selectedVoxel[0] = float4(-direction, (float)hit.gbIndex);
-            selectedVoxel[1] = float4(float3(hit.cellInt), 0);
+            selection.valid = 1;
+            selection.gbIndex = hit.gbIndex;
+            selection.nodeSize = hit.nodeSize;
+            selection.nodeMinCell = hit.nodeMinCell;
+            selection.viewDirection = -direction;
         }
-        else
-        {
-            selectedVoxel[0] = float4(-1);
-            selectedVoxel[1] = float4(-1);
-        }
+        selectedVoxel[0] = selection;
     }
 
     if (hit.hit)

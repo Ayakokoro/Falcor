@@ -41,6 +41,12 @@ target_sources(Voxelization PRIVATE
     PrepareShadingData.cs.slang
     RayMarching.ps.slang
     DisplayNDF.ps.slang
+    VoxelSelection.slang
+    VoxelInspector.h
+    VoxelInspector.cpp
+    VoxelInspectorShared.slang
+    ClipInspector.cs.slang
+    InspectVoxel.ps.slang
 
     ComputeOctahedralMap.cs.slang
     ComputeSplittingError.cs.slang

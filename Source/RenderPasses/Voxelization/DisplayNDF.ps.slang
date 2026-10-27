@@ -2,13 +2,14 @@
 #include "RayMarchingMaterial.slang"
 #include "Voxel/VoxelGrid.slang"
 #include "VoxelizationShared.slang"
+#include "VoxelSelection.slang"
 
 #ifndef RAY_MARCHING_BUFFER_COUNT
 #define RAY_MARCHING_BUFFER_COUNT 1
 #endif
 
 StructuredBuffer<RayMarchingBSDF> gBuffer[RAY_MARCHING_BUFFER_COUNT];
-StructuredBuffer<float4> selectedVoxel; // 前三个分量表示相机指向体素的方向
+StructuredBuffer<VoxelSelection> selectedVoxel;
 
 cbuffer CB
 {
@@ -58,14 +59,14 @@ float3 calcColor(float2 localCoord, int offset, float3 v)
 PsOut main(float2 texCoord: TEXCOORD, float4 pos: SV_POSITION)
 {
     PsOut psOut = { clearColor };
-    float4 vo = selectedVoxel[0];
-    if (vo.w > 0)
+    VoxelSelection vo = selectedVoxel[0];
+    if (vo.valid)
     {
         float2 localCoord = (texCoord - float2(0.25f, 1.0f / 18)) / float2(0.5f, 16.0f / 18); // 默认窗口为16:9
         localCoord = localCoord * 2 - 1;                                                      // 映射到[-1,1]
         if (length(localCoord) <= 1)
         {
-            psOut.color = float4(calcColor(localCoord, (int)vo.w, vo.xyz), 1);
+            psOut.color = float4(calcColor(localCoord, (int)vo.gbIndex, vo.viewDirection), 1);
         }
     }
     return psOut;

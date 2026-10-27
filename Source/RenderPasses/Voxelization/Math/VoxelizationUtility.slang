@@ -85,12 +85,9 @@ inline uint planeClip(
 }
 
 // 用轴对齐包围盒裁剪三角形
-inline Polygon boxClipTriangle(float3 minPoint, float3 maxPoint, Triangle tri)
+inline uint boxClipTriangleVertices(
+    float3 minPoint, float3 maxPoint, Triangle tri, out float3 vertices[MAX_VERTEX_COUNT_PROCESSING])
 {
-    Polygon poly;
-    poly.count = 0;
-
-    float3 vertices[MAX_VERTEX_COUNT_PROCESSING];
     float3 temp[MAX_VERTEX_COUNT_PROCESSING];
 
     uint vCount = 3;
@@ -109,8 +106,7 @@ inline Polygon boxClipTriangle(float3 minPoint, float3 maxPoint, Triangle tri)
 
         if (newCount == 0)
         {
-            poly.count = 0;
-            return poly;
+            return 0;
         }
 
         // 把 temp 拷回 vertices
@@ -125,6 +121,15 @@ inline Polygon boxClipTriangle(float3 minPoint, float3 maxPoint, Triangle tri)
 
     if (vCount > 3)
         vCount = removeAdjacentRepeatPoints(vertices, vCount);
+
+    return vCount;
+}
+
+inline Polygon boxClipTriangle(float3 minPoint, float3 maxPoint, Triangle tri)
+{
+    Polygon poly = {};
+    float3 vertices[MAX_VERTEX_COUNT_PROCESSING];
+    uint vCount = boxClipTriangleVertices(minPoint, maxPoint, tri, vertices);
 
     for (uint i = 0; i < vCount; ++i)
     {

@@ -1,5 +1,6 @@
 #pragma once
 #include "VoxelizationBase.h"
+#include "VoxelInspector.h"
 #include <Rendering/Lights/EnvMapSampler.h>
 #include <Core/Pass/FullScreenPass.h>
 #include <fstream>
@@ -37,6 +38,9 @@ private:
     int3 mSelectedCellInt = int3(-1);
     uint mSelectedGbOffset = 0xFFFFFFFF;
     bool mSelectedHit = false;
+    VoxelSelection mSelection = {};
+    std::unique_ptr<VoxelInspector> mpInspector;
+    bool mInspectNode = false;
     ref<Fbo> mpFbo;
     std::unique_ptr<EnvMapSampler> mpEnvMapSampler;
 

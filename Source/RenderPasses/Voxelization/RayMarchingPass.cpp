@@ -109,6 +109,7 @@ VisibleTEBSDF convertVisibleMaterial(const VoxelData& geometry, const VisibleMat
 }
 static_assert(LOBE_COUNT == 4 && VISIBLE_LOBE_COUNT == 8);
 static_assert(sizeof(VoxelData) == 420 && sizeof(TEBSDF) == 508 && sizeof(VisibleTEBSDF) == 812);
+static_assert(sizeof(VoxelSelection) == 48);
 static_assert(sizeof(VisibilityMask::Data) == 17 * sizeof(uint32_t));
 } // namespace
 
@@ -155,6 +156,7 @@ RayMarchingPass::RayMarchingPass(ref<Device> pDevice, const Properties& props)
         else if (key == "internalVisibilityMode") mInternalVisibilityMode = value;
         else if (key == "maxBounce") mMaxBounce = value;
         else if (key == "drawMode") mDrawMode = value;
+        else if (key == "debug") mDebug = value;
     }
     FALCOR_CHECK(mInternalVisibilityMode <= 2, "internalVisibilityMode must be 0, 1 or 2.");
     mLoadRequested = autoLoad && !filePaths.empty();
@@ -197,6 +199,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
     if (mLoadRequested)
     {
         mLoadRequested = false;
+        mInspectNode = false;
+        mSelectedHit = false;
+        mSelection = {};
+        mSelectedVoxel = nullptr;
+        if (mpInspector) mpInspector->reset();
         try
         {
         GridData& gd = VoxelizationBase::GlobalGridData;
@@ -524,13 +531,33 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
 
     if (mGBuffers.empty() || !mOctreeBuffer) return;
 
+    if (mDebug && mInspectNode && mSelection.valid && mpInspector)
+    {
+        const auto split = std::upper_bound(mGBufferSplits.begin(), mGBufferSplits.end(), mSelection.gbIndex);
+        if (split != mGBufferSplits.end())
+        {
+            const size_t buffer = size_t(split - mGBufferSplits.begin());
+            VoxelInspector::Resources resources;
+            resources.material = mGBuffers[buffer];
+            resources.primitive = mPBuffers[buffer];
+            resources.localIndex = mSelection.gbIndex - (buffer ? mGBufferSplits[buffer - 1] : 0);
+            resources.visible = mVisibleMaterialActive;
+            resources.masksAvailable = mVisibilityMasksAvailable;
+            resources.visibilityMode = mInternalVisibilityMode;
+            if (mVisibleMaterialActive) resources.masks = mVisibilityMaskBuffers[buffer];
+            mpInspector->execute(pRenderContext, mpScene, pOutputColor, gridData.gridMin, gridData.voxelSize, resources);
+        }
+        return; // Locked selection: no picking or per-frame CPU readback is needed.
+    }
+
     // ---- Step 2: Ray marching ----
     FALCOR_PROFILE(pRenderContext, "RayMarching");
     ref<Camera> pCamera = mpScene->getCamera();
     if (!mSelectedVoxel)
     {
         mSelectedVoxel =
-            mpDevice->createStructuredBuffer(sizeof(float4), 2, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+            mpDevice->createStructuredBuffer(sizeof(VoxelSelection), 1, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource);
+        pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), uint4(0));
     }
 
     mSelectedPixel = uint2(mSelectedUV.x * pOutputColor->getWidth(), mSelectedUV.y * pOutputColor->getHeight());
@@ -548,7 +575,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             defines.add("USE_VISIBLE_MATERIAL", mVisibleMaterialActive ? "1" : "0");
             mpFullScreenPass = FullScreenPass::create(mpDevice, desc, defines);
         }
-        pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), float4(-1));
+        if (mDebug) pRenderContext->clearUAV(mSelectedVoxel->getUAV().get(), uint4(0));
 
         mpFullScreenPass->addDefine("CHECK_ELLIPSOID", mCheckEllipsoid ? "1" : "0");
         mpFullScreenPass->addDefine("CHECK_VISIBILITY", mCheckVisibility ? "1" : "0");
@@ -608,6 +635,7 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         cb["minPdf"] = mMinPdf100 / 100;
         cb["transmittanceThreshold"] = mTransmittanceThreshold100 / 100;
         cb["selectedPixel"] = mSelectedPixel;
+        cb["pickEnabled"] = mDebug;
         cb["renderBackGround"] = mRenderBackGround;
         cb["clearColor"] = float4(mClearColor, 0);
         cb["tanHalfFovY"] = std::tan(Falcor::focalLengthToFovY(pCamera->getFocalLength(), pCamera->getFrameHeight()) * 0.5f);
@@ -656,23 +684,22 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
         mpDisplayNDFPass->execute(pRenderContext, mpFbo);
     }
 
-    // Readback selected voxel info for UI display
-    if (mSelectedVoxel)
+    // Debug is the ONLY path that copies selection to the CPU and waits for it.
+    // NDF rendering consumes the GPU buffer directly and preserves its selection.
+    if (mDebug && !mDisplayNDF && mSelectedVoxel)
     {
         if (!mpSelectedVoxelStaging)
             mpSelectedVoxelStaging = mpDevice->createBuffer(mSelectedVoxel->getSize(), ResourceBindFlags::None, MemoryType::ReadBack);
         pRenderContext->copyResource(mpSelectedVoxelStaging.get(), mSelectedVoxel.get());
         pRenderContext->submit(true);
-        float4* pData = reinterpret_cast<float4*>(mpSelectedVoxelStaging->map());
-        float4 v0 = pData[0];
-        float4 v1 = pData[1];
+        mSelection = *static_cast<const VoxelSelection*>(mpSelectedVoxelStaging->map());
         mpSelectedVoxelStaging->unmap();
 
-        if (v0.x != -1.0f || v0.y != -1.0f || v0.z != -1.0f || v0.w != -1.0f)
+        if (mSelection.valid)
         {
             mSelectedHit = true;
-            mSelectedGbOffset = (uint)v0.w;
-            mSelectedCellInt = int3((int)v1.x, (int)v1.y, (int)v1.z);
+            mSelectedGbOffset = mSelection.gbIndex;
+            mSelectedCellInt = mSelection.nodeMinCell;
         }
         else
         {
@@ -807,9 +834,34 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
 
     // ---- Ray marching controls (original) ----
     if (widget.checkbox("Debug", mDebug))
+    {
         mOptionsChanged = true;
+        if (!mDebug) { mInspectNode = false; mDisplayNDF = false; }
+    }
     if (mDebug)
     {
+        if (mSelectedHit)
+        {
+            widget.text("Selected node min cell: " + ToString(mSelectedCellInt));
+            widget.text("Selected node size: " + std::to_string(mSelection.nodeSize) + " leaf cells");
+            widget.text("Selected node data index: " + std::to_string(mSelectedGbOffset));
+            if (widget.checkbox("Inspect isolated node", mInspectNode))
+            {
+                mOptionsChanged = true;
+                if (mInspectNode)
+                {
+                    mDisplayNDF = false;
+                    if (!mpInspector) mpInspector = std::make_unique<VoxelInspector>(mpDevice);
+                    mpInspector->select(mSelection);
+                }
+            }
+        }
+        else widget.text("Click a voxel to select a node for inspection.");
+        if (mInspectNode && mpInspector)
+        {
+            mOptionsChanged |= mpInspector->renderUI(widget);
+            return;
+        }
         int maxLOD = (int)std::min(mOctreeMaxDepth, mVisibleMaterialActive ? mVisibleLODLevels : mAvailableLODLevels);
         mForcedLOD = std::min(mForcedLOD, maxLOD);
         mMaxLODLevel = std::min(mMaxLODLevel, maxLOD);
@@ -849,7 +901,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         mOptionsChanged = true;
     if (widget.slider("Max Bounce", mMaxBounce, 0u, 10u))
         mOptionsChanged = true;
-    if (widget.checkbox("Display NDF", mDisplayNDF))
+    if (mDebug && widget.checkbox("Display NDF", mDisplayNDF))
         mOptionsChanged = true;
     if (widget.rgbColor("Clear Color", mClearColor))
         mOptionsChanged = true;
@@ -876,16 +928,7 @@ void RayMarchingPass::renderUI(Gui::Widgets& widget)
         }
     }
 
-    widget.text("Selected Pixel: " + ToString(mSelectedPixel));
-    if (mSelectedHit)
-    {
-        widget.text("Selected Voxel cellInt: " + ToString(mSelectedCellInt));
-        widget.text("Selected Voxel gbOffset: " + std::to_string(mSelectedGbOffset));
-    }
-    else
-    {
-        widget.text("Selected Voxel: none (no hit)");
-    }
+    if (mDebug) widget.text("Selected Pixel: " + ToString(mSelectedPixel));
 }
 
 void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
@@ -893,13 +936,24 @@ void RayMarchingPass::setScene(RenderContext* pRenderContext, const ref<Scene>& 
     mpScene = pScene;
     mpFullScreenPass = nullptr;
     mpDisplayNDFPass = nullptr;
-    mDebug = false;
+    mInspectNode = false;
+    mSelectedHit = false;
+    mSelection = {};
+    mSelectedVoxel = nullptr;
+    mpSelectedVoxelStaging = nullptr;
+    if (mpInspector) mpInspector->reset();
     mUseEmissiveLight = false;
 }
 
 bool RayMarchingPass::onMouseEvent(const MouseEvent& mouseEvent)
 {
-    if (mouseEvent.type == MouseEvent::Type::ButtonDown && mouseEvent.button == Input::MouseButton::Left)
+    if (mDebug && mInspectNode && mpInspector)
+    {
+        const bool handled = mpInspector->onMouseEvent(mouseEvent);
+        mOptionsChanged |= handled;
+        return handled;
+    }
+    if (mDebug && !mDisplayNDF && mouseEvent.type == MouseEvent::Type::ButtonDown && mouseEvent.button == Input::MouseButton::Left)
     {
         mSelectedUV = mouseEvent.pos;
         return true;
