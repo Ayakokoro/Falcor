@@ -192,6 +192,43 @@ void testVisibleMaterials() {
     require(std::memcmp(&material,&withoutMask,sizeof(material))==0,"Mask changed material fitting.");
 }
 
+void testVisibleNormalAreaFit() {
+    // Thin parallel sheets have the same raster footprint in both principal
+    // views, but different shading normals on the two visible outer sheets.
+    // The hidden middle sheet biases the principal normal toward the rear.
+    std::vector<Polygon> polygons{quad(.1f,.1f,.9f,.9f,.5002f),
+                                  quad(.1f,.1f,.9f,.9f,.5f),
+                                  quad(.1f,.1f,.9f,.9f,.4998f)};
+    const float3 frontNormal(0, 0, 1), rearNormal(.6f, 0, .8f);
+    std::vector<VisibleABSDFInput> inputs{
+        {float3(1,0,0),float4(0,.4f,0,1),frontNormal,polygons[0].calcArea(),0},
+        {float3(0,1,0),float4(0,.4f,0,1),rearNormal,polygons[1].calcArea(),0},
+        {float3(0,0,1),float4(0,.4f,0,1),rearNormal,polygons[2].calcArea(),0}};
+    PolygonRange range; range.count = uint32_t(polygons.size());
+    VisibilityMaskBake::ProjectionMaps scratch;
+    const auto material = bakeVisibleMaterial(inputs, polygons, range, 0, scratch);
+    const uint32_t frontIndex = VisibleNormalIndex8(frontNormal);
+    const uint32_t backIndex = VisibleNormalIndex8(-rearNormal);
+    const auto& front = material.lobes[frontIndex];
+    const auto& back = material.lobes[backIndex];
+    const float3 visibleFront(front.normal[0], front.normal[1], front.normal[2]);
+    const float3 visibleBack(back.normal[0], back.normal[1], back.normal[2]);
+    require(length(visibleFront - frontNormal) < 1e-5f && length(visibleBack + rearNormal) < 1e-5f,
+            "Hidden sheets changed the visible outer normals.");
+    const float3 principal = safeNormalize(frontNormal + 2.0f * rearNormal);
+    require(length(scratch.directions[frontIndex] - principal) < 1e-5f &&
+            length(scratch.directions[backIndex] + principal) < 1e-5f,
+            "Visible-area sampling no longer uses the original principal directions.");
+    // Reconstruct areas exactly as the renderer does. Equal measured areas
+    // must stay equal even though the stored visible normals are asymmetric.
+    const float frontArea = front.weight * dot(visibleFront, principal);
+    const float backArea = back.weight * dot(visibleBack, -principal);
+    require(frontArea > 0 && std::abs(frontArea - backArea) < 1e-5f,
+            "Area fit does not use the visible normals used by the renderer.");
+    require(std::abs(front.weight + back.weight - 2.0f) < 1e-5f,
+            "Visible-area amplitudes lost their common normalization.");
+}
+
 void testMaterialFiles(const std::filesystem::path& dir) {
     std::filesystem::create_directories(dir);
     VisibleMaterialFile::Data data; data.baked=1; data.area=1;
@@ -245,6 +282,7 @@ int main(int argc, char** argv) {
     try {
         testQueries();
         testVisibleMaterials();
+        testVisibleNormalAreaFit();
         testMaterialFiles(argc > 1 ? argv[1] : "visibility-mask-test-output");
         testLayers();
         testThinLayersAndEdges();

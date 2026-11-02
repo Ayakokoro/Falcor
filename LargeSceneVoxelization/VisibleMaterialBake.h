@@ -37,10 +37,10 @@ inline VisibleMaterialFile::Data bakeVisibleMaterial(
         if (mainNormalArea[k] > 0.0f)
             mainDirections[k] = safeNormalize(mainNormalSum[k]);
 
-    // Fit one visible-area amplitude per lobe from the depth/owner maps that
-    // the material bake already generates. No extra persistent voxel data.
-    float fitNumerator[VISIBLE_LOBE_COUNT] = {};
-    float fitDenominator[VISIBLE_LOBE_COUNT] = {};
+    // Retain each principal view's measured areas until all visible normals
+    // are known. Rows are projection directions, columns are source lobes.
+    // Reuse the existing raster passes; no extra persistent voxel data.
+    float visibleAreasByDirection[VISIBLE_LOBE_COUNT][VISIBLE_LOBE_COUNT] = {};
     const float pixelArea = PROJ_PIXEL_SIZE * PROJ_PIXEL_SIZE;
     timer.stop();
     for (uint32_t k = 0; k < VISIBLE_LOBE_COUNT; ++k) {
@@ -59,7 +59,7 @@ inline VisibleMaterialFile::Data bakeVisibleMaterial(
         scratch.bases[k] = orthonormal_basis(direction);
 
         timer.next(timings, BakeTiming::Task::VisibleAccumulate);
-        float visibleByLobe[VISIBLE_LOBE_COUNT] = {};
+        auto& visibleByLobe = visibleAreasByDirection[k];
         for (uint32_t pixel = 0; pixel < PROJ_RES * PROJ_RES; ++pixel) {
             uint32_t polygonIndex = ids[pixel];
             if (polygonIndex == std::numeric_limits<uint32_t>::max())
@@ -81,23 +81,28 @@ inline VisibleMaterialFile::Data bakeVisibleMaterial(
             input.projArea = pixelArea;
             material.accumulate(input);
         }
-        for (uint32_t m = 0; m < VISIBLE_LOBE_COUNT; ++m) {
-            if (mainNormalArea[m] <= 0.0f)
-                continue;
-            float cosine = std::max(0.0f, dot(mainDirections[m], direction));
-            fitNumerator[m] += cosine * visibleByLobe[m];
-            fitDenominator[m] += cosine * cosine;
-        }
         material.lobes[k].normalizeSelf();
         timer.stop();
     }
 
     timer.next(timings, BakeTiming::Task::VisibleFinalize);
     for (uint32_t k = 0; k < VISIBLE_LOBE_COUNT; ++k) {
-        if (!material.lobes[k].isValid())
+        auto& lobe = material.lobes[k];
+        if (!lobe.isValid())
             continue;
-        material.lobes[k].weight = fitDenominator[k] > 1e-8f
-            ? std::max(0.0f, fitNumerator[k] / fitDenominator[k]) : 0.0f;
+        // Fit the same visible-normal cosine model used by the renderer,
+        // evaluated at the original principal sampling directions.
+        float fitNumerator = 0.0f;
+        float fitDenominator = 0.0f;
+        for (uint32_t m = 0; m < VISIBLE_LOBE_COUNT; ++m) {
+            if (mainNormalArea[m] <= 0.0f)
+                continue;
+            float cosine = std::max(0.0f, dot(lobe.normal, mainDirections[m]));
+            fitNumerator += cosine * visibleAreasByDirection[m][k];
+            fitDenominator += cosine * cosine;
+        }
+        lobe.weight = fitDenominator > 1e-8f
+            ? std::max(0.0f, fitNumerator / fitDenominator) : 0.0f;
     }
     material.normalizeWeightsOnly();
     timer.stop();
