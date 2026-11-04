@@ -139,13 +139,13 @@ VisibilityMaskPair loadVisibilityMaskPair(uint index, float3 l, float3 v)
 
 float3 evalVisibleSurface(RayMarchingBSDF bsdf, uint index, float3 l, float3 v, float3 h)
 {
+    VisibilityMaskPair pair = {0, 0, 0};
 #if CHECK_VISIBILITY
-    if (internalVisibilityMode == 0)
-        return bsdf.surface.eval(l, v, h) * bsdf.calcInternalVisibility(l);
     if (internalVisibilityMode == 1 && visibilityMasksAvailable)
-        return bsdf.surface.evalVisible(l, v, h, loadVisibilityMaskPair(index, l, v));
+        pair = loadVisibilityMaskPair(index, l, v);
 #endif
-    return bsdf.surface.eval(l, v, h);
+    return evalRayMarchingSurface(bsdf, l, v, h, true,
+        internalVisibilityMode, visibilityMasksAvailable, pair);
 }
 #endif
 

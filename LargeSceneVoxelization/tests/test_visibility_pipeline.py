@@ -6,6 +6,8 @@ import sys
 import shutil
 import uuid
 import re
+import csv
+import math
 from contextlib import contextmanager
 
 
@@ -96,9 +98,69 @@ def comparable_memory_legacy(path):
     return data
 
 
+def check_inspector(inspector, model, path, cache, root):
+    """Compare re-analysis with the actual serialized production bake at two LODs."""
+    data, _, depth, _, node_start, _ = legacy(path)
+    materials = Path(str(path) + '.vmat').read_bytes()
+    masks = Path(str(path) + '.vbm').read_bytes()
+    for lod in (0, 1):
+        output = root / f'inspect-lod{lod}'
+        base = [str(inspector), '--scene', str(model), '--bin', str(path),
+                '--tmp-dir', str(cache), '--lod', str(lod), '--cell', '0', '0', '0',
+                '--visibility-bitmask', '--sample-frequency', '8', '--samples-per-polygon', '16',
+                '--spherical-resolution', '8', '--block-count', '4', '--block-size', '4',
+                '--ndf-resolution', '8', '--threads', '1']
+        run = subprocess.run(base + ['--mode', 'all', '--out', str(output)], capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        summary = dict(line.split('=', 1) for line in (output / 'summary.txt').read_text().splitlines() if '=' in line)
+        assert summary['materialModel'] == 'visible8' and summary['internalVisibility'] == 'bitmask'
+        node = 0
+        for _ in range(depth - lod):
+            child, mask, _ = struct.unpack_from('<3I', data, node_start + node * 12)
+            assert mask & 1, 'Fixture must contain cell 0,0,0'
+            node = child
+        index = struct.unpack_from('<I', data, node_start + node * 12 + 8)[0]
+        for k in range(8):
+            fields = struct.unpack_from('<11f', materials, 80 + index * 360 + k * 44)
+            observed = []
+            for name in ('weight', 'normal', 'roughness', 'diffuse', 'specular'):
+                observed.extend(map(float, summary[f'visibleLobe[{k}].{name}'].split(',')))
+            assert len(observed) == 11
+            assert all(math.isclose(a, b, rel_tol=2e-6, abs_tol=2e-7) for a, b in zip(fields, observed)), (lod, k, fields, observed)
+        area, baked = struct.unpack_from('<fI', materials, 80 + index * 360 + 352)
+        assert math.isclose(float(summary['visibleArea']), area, rel_tol=2e-6)
+        assert int(summary['visibleBaked']) == baked == 1
+        words = struct.unpack_from('<17I', masks, 48 + index * 68)
+        assert [int(summary[f'mask[{d}]']) for d in range(16)] + [int(summary['mask.metadata'])] == list(words)
+
+        def range_line(file):
+            with file.open('rb') as stream:
+                assert stream.readline() == b'P5\n'
+                return stream.readline()
+
+        for name, reference_suffix in [('splitting_error', 'gt'), ('ndf', 'gt'),
+                                        ('spherical_primitive', 'exact'), ('spherical_polygons', 'exact'),
+                                        ('spherical_total', 'exact')]:
+            assert range_line(output / f'{name}_{reference_suffix}.pgm') == range_line(output / f'{name}_approx.pgm')
+        with (output / 'splitting_error.csv').open() as stream:
+            rows = list(csv.DictReader(stream))
+        assert all(math.isfinite(float(row[c])) and float(row[c]) >= 0 for row in rows for c in 'rgba')
+        assert all(math.isclose(float(row['b']), abs(float(row['r']) - float(row['g'])), abs_tol=2e-6, rel_tol=2e-5) for row in rows)
+        off_output = root / f'inspect-off-lod{lod}'
+        run = subprocess.run(base + ['--mode', 'splitting', '--internal-visibility', 'off', '--out', str(off_output)], capture_output=True, text=True)
+        assert run.returncode == 0, run.stdout + run.stderr
+        with (off_output / 'splitting_error.csv').open() as stream:
+            off_rows = list(csv.DictReader(stream))
+        assert len(rows) == len(off_rows)
+        for masked, off in zip(rows, off_rows):
+            assert masked['r'] == off['r'], 'Changing approximation mode changed the reference samples'
+            assert float(masked['g']) <= float(off['g']) + 2e-6, 'Bitmask increased the surface response'
+
+
 def main():
     executable = Path(sys.argv[1]).resolve()
     work = Path(sys.argv[2]).resolve()
+    inspector = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else None
     work.mkdir(parents=True, exist_ok=True)
     with scratch_directory(work) as temp:
         root = Path(temp)
@@ -140,11 +202,13 @@ f 2//6 3//6 7//6 6//6
             options = ['--lod-levels', '1', '--lod-mode', lod_mode, '-t', '1']
             old = run(lod_mode + '-old', *options)
             new = run(lod_mode + '-visible', *options, '--visible-material')
-            mask = run(lod_mode + '-mask', *options, '--visibility-bitmask')
+            mask = run(lod_mode + '-mask', *options, '--visibility-bitmask', '--keep-temp')
             assert legacy(old)[0] == legacy(new)[0] == legacy(mask)[0], 'Opt-in bake changed legacy content'
             lods = int(lod_mode == 'brute-force')
             assert extension(new, lods, False)[0] == extension(mask, lods)[0]
             assert not Path(str(old) + '.vmat').exists()
+            if inspector and lod_mode == 'brute-force':
+                check_inspector(inspector, model, mask, root / (lod_mode + '-mask-cache'), root)
 
             timed_name = lod_mode + '-timed'
             timed = run(timed_name, *options, '--visibility-bitmask', '--timings')
@@ -196,6 +260,8 @@ f 2//6 3//6 7//6 6//6
         Path(str(root / 'broken.bin') + '.vbm').mkdir()
         run('broken', '--visibility-bitmask', succeeds=False)
     print('Visibility pipeline: legacy compatibility, LODs, paired masks, determinism, timing and output failure passed.')
+    if inspector:
+        print('Inspector pipeline: serialized material/mask parity at two LODs, visibility modes and common image scales passed.')
 
 
 if __name__ == '__main__':

@@ -26,11 +26,13 @@ cbuffer CB
     float3 cameraForward;
     float3 lightDirection;
     float lightIntensity;
+    bool checkEllipsoid;
     bool checkCoverage;
     bool checkVisibility;
     bool masksAvailable;
     uint internalVisibilityMode;
     float coverageBlend;
+    float transmittanceThreshold;
     float textureLod;
 };
 
@@ -111,15 +113,27 @@ float3 shadeVoxel(float3 origin, float3 direction)
     float3 start = origin + direction * (100.f * bounds.x);
     float3 end = origin + direction * (100.f * bounds.y);
     Ellipsoid primitive = inspectorPrimitive[localIndex];
-    float2 interval = primitive.clip(start, end);
-    if (interval.x < 0) return 0;
-    float3 position = lerp(start, end, interval.x);
+    float3 position = start;
+    if (checkEllipsoid)
+    {
+        float2 interval = primitive.clip(start, end);
+        if (interval.x < 0) return 0;
+        position = lerp(start, end, interval.x);
+    }
     RayMarchingBSDF bsdf = inspectorMaterial[localIndex];
     float3 v = -direction, l = lightDirection, h = safeNormalize(l + v);
-    float coverage = checkCoverage ? bsdf.calcCoverage(v, coverageBlend) : 1.f;
+    bsdf.updateCoverage(v, transmittanceThreshold, coverageBlend);
+    float coverage = checkCoverage ? bsdf.coverage : 1.f;
     if (viewMode == 3)
     {
         float3 n = safeNormalize(mul(primitive.B, position - primitive.center));
+        if (!checkEllipsoid)
+        {
+            float3 offset = position - float3(0.5f);
+            float3 extent = abs(offset);
+            n = extent.x >= max(extent.y, extent.z) ? float3(sign(offset.x), 0, 0) :
+                (extent.y >= extent.z ? float3(0, sign(offset.y), 0) : float3(0, 0, sign(offset.z)));
+        }
         return coverage * (abs(dot(n, v)) < 0.15f ? float3(1) : float3(0.04f));
     }
     if (viewMode == 1 || viewMode == 2)
@@ -139,26 +153,22 @@ float3 shadeVoxel(float3 origin, float3 direction)
         }
         return coverage * sum / max(total, 1e-8f);
     }
-    float3 result = bsdf.surface.eval(l, v, h);
-    if (checkVisibility)
-    {
+    VisibilityMaskPair pair = {0, 0, 0};
 #if USE_VISIBLE_MATERIAL
-        if (internalVisibilityMode == 0) result *= bsdf.calcInternalVisibility(l);
-        else if (internalVisibilityMode == 1 && masksAvailable)
+    if (checkVisibility && internalVisibilityMode == 1 && masksAvailable)
+    {
+        uint li = visibilityMaskDirectionIndex(l), vi = visibilityMaskDirectionIndex(v);
+        if (li < kVisibilityMaskDirectionCount && vi < kVisibilityMaskDirectionCount)
         {
-            uint li = visibilityMaskDirectionIndex(l), vi = visibilityMaskDirectionIndex(v);
-            if (li < kVisibilityMaskDirectionCount && vi < kVisibilityMaskDirectionCount)
-            {
-                uint first = localIndex * kVisibilityMaskWordsPerRecord;
-                VisibilityMaskPair pair = { inspectorMasks[first + li], inspectorMasks[first + vi],
-                    inspectorMasks[first + kVisibilityMaskDirectionCount] };
-                result = bsdf.surface.evalVisible(l, v, h, pair);
-            }
+            uint first = localIndex * kVisibilityMaskWordsPerRecord;
+            pair.incident = inspectorMasks[first + li];
+            pair.outgoing = inspectorMasks[first + vi];
+            pair.metadata = inspectorMasks[first + kVisibilityMaskDirectionCount];
         }
-#else
-        result *= bsdf.calcInternalVisibility(l);
-#endif
     }
+#endif
+    float3 result = evalRayMarchingSurface(bsdf, l, v, h, checkVisibility,
+        internalVisibilityMode, masksAvailable, pair);
     return coverage * lightIntensity * result;
 }
 

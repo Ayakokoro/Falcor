@@ -17,6 +17,11 @@ public:
         bool visible = false;
         bool masksAvailable = false;
         uint32_t visibilityMode = 1;
+        bool checkEllipsoid = true;
+        bool checkCoverage = true;
+        bool checkVisibility = true;
+        float coverageBlend = 0.f;
+        float transmittanceThreshold = 0.f;
     };
 
     explicit VoxelInspector(ref<Device> device) : mpDevice(device) {}
@@ -39,9 +44,12 @@ private:
     bool mDirty = true;
     bool mVisible = false;
     bool mDragging = false;
+    bool mFollowRenderer = true;
+    bool mEllipsoid = true;
     bool mCoverage = true;
     bool mVisibility = true;
     float mCoverageBlend = 0.f;
+    float mTransmittanceThreshold = 0.f;
     float mYaw = 0.f, mPitch = 15.f, mDistance = 2.8f;
     float mLightIntensity = 3.14159265f;
     float3 mLightDirection = float3(-1, 1, 1);

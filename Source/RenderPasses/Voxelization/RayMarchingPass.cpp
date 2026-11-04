@@ -544,6 +544,11 @@ void RayMarchingPass::execute(RenderContext* pRenderContext, const RenderData& r
             resources.visible = mVisibleMaterialActive;
             resources.masksAvailable = mVisibilityMasksAvailable;
             resources.visibilityMode = mInternalVisibilityMode;
+            resources.checkEllipsoid = mCheckEllipsoid;
+            resources.checkCoverage = mCheckCoverage;
+            resources.checkVisibility = mCheckVisibility;
+            resources.coverageBlend = mCoverageBlend;
+            resources.transmittanceThreshold = mTransmittanceThreshold100 / 100.f;
             if (mVisibleMaterialActive) resources.masks = mVisibilityMaskBuffers[buffer];
             mpInspector->execute(pRenderContext, mpScene, pOutputColor, gridData.gridMin, gridData.voxelSize, resources);
         }

@@ -35,6 +35,7 @@ struct Arguments
     bool hasCell = false;
     std::string mode = "all";
     bool dumpPolygons = false;
+    bool useSpecGlossMaterials = false;
 
     VoxelizationCore::AnalysisOptions analysis;
 };
@@ -55,6 +56,7 @@ void printUsage()
         << "  --merge-dir <path>       Direct merge_lod directory\n"
         << "  --index <path>            Explicit nodes.idx/leaves.idx\n"
         << "  --polygons <path>         Explicit polygons.dat\n\n"
+        << "  --spec-gloss              Match a voxel bake using SpecGloss input conversion\n\n"
         << "Analysis:\n"
         << "  --mode projection|spherical|splitting|ndf|all\n"
         << "  --sample-frequency <N>    Primitive projection samples (default 1024)\n"
@@ -65,7 +67,8 @@ void printUsage()
         << "  --ndf-resolution <N>      NDF disk map resolution\n"
         << "  --threads <N>             Map worker threads; 0 = auto\n"
         << "  --visible-material       Use visible 8-lobe material in diagnostics\n"
-        << "  --visibility-bitmask     Also dump directional masks to summary.txt\n"
+        << "  --visibility-bitmask     Bake and use per-lobe masks; implies visible material\n"
+        << "  --internal-visibility legacy|bitmask|off (default bitmask for visible material)\n"
         << "  --dump-polygons           Write every clipped polygon to polygons.txt\n"
         << "  --out <path>              Output directory (default ./voxel_debug)\n"
         << "  --help                    Show this help\n";
@@ -177,8 +180,24 @@ Arguments parseArguments(int argc, char* argv[])
             args.analysis.visibleMaterial = true;
             args.analysis.visibilityBitmask = true;
         }
+        else if (option == "--internal-visibility") {
+            const std::string mode = nextValue(i, argc, argv, "--internal-visibility");
+            if (mode == "legacy")
+                args.analysis.internalVisibilityMode = VoxelizationCore::InternalVisibilityMode::Legacy;
+            else if (mode == "bitmask") {
+                args.analysis.internalVisibilityMode = VoxelizationCore::InternalVisibilityMode::Bitmask;
+                args.analysis.visibleMaterial = true;
+                args.analysis.visibilityBitmask = true;
+            }
+            else if (mode == "off")
+                args.analysis.internalVisibilityMode = VoxelizationCore::InternalVisibilityMode::Off;
+            else
+                throw std::runtime_error("unknown --internal-visibility: " + mode);
+        }
         else if (option == "--dump-polygons")
             args.dumpPolygons = true;
+        else if (option == "--spec-gloss")
+            args.useSpecGlossMaterials = true;
         else
             throw std::runtime_error("unknown option: " + option);
     }
@@ -214,34 +233,29 @@ bool isUnitDiskPixel(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
     return u * u + v * v <= 1.0f;
 }
 
+float displayMaximum(const std::vector<float>& values)
+{
+    float maximum = 0;
+    for (const float value : values)
+        if (std::isfinite(value)) maximum = std::max(maximum, value);
+    return maximum;
+}
+
 void writeScalarPgm(const fs::path& path, uint32_t width, uint32_t height,
-                    const std::vector<float>& values, bool unitDiskMask = false)
+                    const std::vector<float>& values, bool unitDiskMask = false,
+                    float maximum = 0)
 {
     if (width == 0 || height == 0 || values.size() != size_t(width) * height)
         return;
 
-    float minimum = std::numeric_limits<float>::max();
-    float maximum = std::numeric_limits<float>::lowest();
-    for (uint32_t y = 0; y < height; ++y)
-        for (uint32_t x = 0; x < width; ++x)
-        {
-            if (unitDiskMask && !isUnitDiskPixel(x, y, width, height))
-                continue;
-            const float value = values[size_t(y) * width + x];
-            if (!std::isfinite(value))
-                continue;
-            minimum = std::min(minimum, value);
-            maximum = std::max(maximum, value);
-        }
-    if (minimum == std::numeric_limits<float>::max())
-        minimum = maximum = 0;
-    if (maximum <= minimum)
-        maximum = minimum + 1.0f;
+    if (!(maximum > 0)) maximum = displayMaximum(values);
+    if (!(maximum > 0)) maximum = 1.f;
 
     std::ofstream out(path, std::ios::binary);
     if (!out)
         throw std::runtime_error("cannot write " + path.string());
-    out << "P5\n" << width << " " << height << "\n255\n";
+    out << "P5\n# linear range: 0 " << std::setprecision(9) << maximum
+        << '\n' << width << " " << height << "\n255\n";
     for (uint32_t y = 0; y < height; ++y)
         for (uint32_t x = 0; x < width; ++x)
         {
@@ -250,8 +264,8 @@ void writeScalarPgm(const fs::path& path, uint32_t width, uint32_t height,
             if (!unitDiskMask || isUnitDiskPixel(x, y, width, height))
             {
                 const float value = values[index];
-                const float normalized = std::clamp(
-                    (value - minimum) / (maximum - minimum), 0.0f, 1.0f);
+                const float normalized = std::isfinite(value)
+                    ? std::clamp(value / maximum, 0.0f, 1.0f) : 0.f;
                 byte = static_cast<unsigned char>(std::lround(normalized * 255.0f));
             }
             out.write(reinterpret_cast<const char*>(&byte), 1);
@@ -277,10 +291,11 @@ void writeFunctionMap(const fs::path& outputDir, const std::string& name,
                 << map.error[index] << '\n';
         }
 
+    const float maximum = std::max(displayMaximum(map.exact), displayMaximum(map.approximation));
     writeScalarPgm(outputDir / (name + "_exact.pgm"), map.width, map.height,
-                   map.exact, true);
+                   map.exact, true, maximum);
     writeScalarPgm(outputDir / (name + "_approx.pgm"), map.width, map.height,
-                   map.approximation, true);
+                   map.approximation, true, maximum);
     writeScalarPgm(outputDir / (name + "_error.pgm"), map.width, map.height,
                    map.error, true);
 }
@@ -310,10 +325,12 @@ void writeFloat4Map(const fs::path& outputDir, const std::string& name,
             channels[3].push_back(value.w);
         }
 
-    writeScalarPgm(outputDir / (name + "_gt.pgm"), map.width, map.height, channels[0]);
-    writeScalarPgm(outputDir / (name + "_approx.pgm"), map.width, map.height, channels[1]);
-    writeScalarPgm(outputDir / (name + "_error.pgm"), map.width, map.height, channels[2]);
-    writeScalarPgm(outputDir / (name + "_aux.pgm"), map.width, map.height, channels[3]);
+    const bool disk = name == "ndf";
+    const float maximum = std::max(displayMaximum(channels[0]), displayMaximum(channels[1]));
+    writeScalarPgm(outputDir / (name + "_gt.pgm"), map.width, map.height, channels[0], disk, maximum);
+    writeScalarPgm(outputDir / (name + "_approx.pgm"), map.width, map.height, channels[1], disk, maximum);
+    writeScalarPgm(outputDir / (name + "_error.pgm"), map.width, map.height, channels[2], disk);
+    writeScalarPgm(outputDir / (name + "_aux.pgm"), map.width, map.height, channels[3], disk);
 }
 
 void writePolygonDump(const fs::path& outputDir,
@@ -351,7 +368,8 @@ void writePolygonDump(const fs::path& outputDir,
 void writeSummary(const fs::path& outputDir,
                   const VoxelizationCore::NodeData& node,
                   const VoxelizationCore::AnalysisResult& result,
-                  const VoxelizationCore::AnalysisOptions& options)
+                  const VoxelizationCore::AnalysisOptions& options,
+                  bool useSpecGlossMaterials)
 {
     std::ofstream out(outputDir / "summary.txt");
     if (!out)
@@ -367,13 +385,29 @@ void writeSummary(const fs::path& outputDir,
     out << "area=" << result.voxelData.ABSDF.area << '\n';
     out << "sampleFrequency=" << options.sampleFrequency << '\n';
     out << "samplesPerPolygon=" << options.samplesPerPolygon << '\n';
+    out << "inputMaterialWorkflow=" << (useSpecGlossMaterials ? "SpecGloss" : "MetalRough") << '\n';
     out << "materialModel=" << (options.visibleMaterial ? "visible8" : "legacy4") << '\n';
+    const char* visibilityMode = options.internalVisibilityMode == VoxelizationCore::InternalVisibilityMode::Off
+        ? "off" : (options.visibleMaterial && options.internalVisibilityMode == VoxelizationCore::InternalVisibilityMode::Bitmask
+            ? "bitmask" : "legacy");
+    out << "internalVisibility=" << visibilityMode << '\n';
+    out << "visibilityMaskBaked=" << options.visibilityBitmask << '\n';
+    out << "splitting.r=joint surface-integral reference (incident cosine included, no coverage)\n";
+    out << "splitting.g=selected baked material with selected internal visibility (no coverage)\n";
+    out << "splitting.b=abs(r-g)\n";
+    out << "splitting.a=material-only error, before internal visibility\n";
+    out << "pgmScale=reference and approximation share a zero-based linear range; each PGM header records its range\n";
+    out << "projectionReference=direct 64x64 raster (visible), sampled fitted ellipsoid (primitive), polygon sum (total)\n";
     if (options.visibleMaterial) {
+        out << "visibleArea=" << result.visibleMaterial.area << '\n';
+        out << "visibleBaked=" << result.visibleMaterial.baked << '\n';
         for (uint32_t i = 0; i < 8; ++i) {
             const auto& l = result.visibleMaterial.lobes[i];
             out << "visibleLobe[" << i << "].weight=" << l.weight << '\n';
             out << "visibleLobe[" << i << "].normal=" << l.normal[0] << ',' << l.normal[1] << ',' << l.normal[2] << '\n';
             out << "visibleLobe[" << i << "].diffuse=" << l.diffuse[0] << ',' << l.diffuse[1] << ',' << l.diffuse[2] << '\n';
+            out << "visibleLobe[" << i << "].specular=" << l.specular[0] << ',' << l.specular[1] << ',' << l.specular[2] << '\n';
+            out << "visibleLobe[" << i << "].roughness=" << l.rough << '\n';
         }
         if (options.visibilityBitmask) {
             out << "mask.metadata=" << result.visibilityMask.metadata << '\n';
@@ -466,7 +500,7 @@ int main(int argc, char* argv[])
         std::vector<Texture2D> normalMapTextures;
         if (!VoxelizationCore::loadSceneResources(
                 args.scenePath, scene, baseColorTextures, specularTextures,
-                metallicTextures, normalMapTextures, error))
+                metallicTextures, normalMapTextures, error, args.useSpecGlossMaterials))
             throw std::runtime_error("scene loading failed: " + error);
 
         VoxelizationCore::TextureSet textures{
@@ -480,7 +514,7 @@ int main(int argc, char* argv[])
             throw std::runtime_error("node analysis failed: " + result.error);
 
         fs::create_directories(args.outputDir);
-        writeSummary(args.outputDir, node, result, args.analysis);
+        writeSummary(args.outputDir, node, result, args.analysis, args.useSpecGlossMaterials);
         if (args.dumpPolygons)
             writePolygonDump(args.outputDir, node);
 

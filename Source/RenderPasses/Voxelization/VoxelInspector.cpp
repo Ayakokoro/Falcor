@@ -87,6 +87,20 @@ void VoxelInspector::execute(RenderContext* context, const ref<Scene>& scene, co
     float3 gridMin, float3 voxelSize, const Resources& resources)
 {
     if (!mSelection.valid) return;
+    // Follow the actual render settings by default. Copy them into the local
+    // controls as well, so opting into overrides starts from this exact state.
+    if (mFollowRenderer)
+    {
+        if (mEllipsoid != resources.checkEllipsoid || mCoverage != resources.checkCoverage ||
+            mVisibility != resources.checkVisibility || mCoverageBlend != resources.coverageBlend ||
+            mTransmittanceThreshold != resources.transmittanceThreshold)
+            mFrame = 0;
+        mEllipsoid = resources.checkEllipsoid;
+        mCoverage = resources.checkCoverage;
+        mVisibility = resources.checkVisibility;
+        mCoverageBlend = resources.coverageBlend;
+        mTransmittanceThreshold = resources.transmittanceThreshold;
+    }
     const auto updates = scene->getUpdates();
     if (is_set(updates, IScene::UpdateFlags::GeometryMoved) || is_set(updates, IScene::UpdateFlags::SceneGraphChanged) ||
         is_set(updates, IScene::UpdateFlags::GeometryChanged) || is_set(updates, IScene::UpdateFlags::MeshesChanged))
@@ -136,9 +150,11 @@ void VoxelInspector::execute(RenderContext* context, const ref<Scene>& scene, co
     cb["cameraForward"] = forward;
     cb["lightDirection"] = dot(mLightDirection, mLightDirection) > 1e-8f ? normalize(mLightDirection) : outward;
     cb["lightIntensity"] = mLightIntensity;
+    cb["checkEllipsoid"] = mEllipsoid;
     cb["checkCoverage"] = mCoverage;
     cb["checkVisibility"] = mVisibility;
     cb["coverageBlend"] = mCoverageBlend;
+    cb["transmittanceThreshold"] = mTransmittanceThreshold;
     cb["masksAvailable"] = resources.masksAvailable;
     cb["internalVisibilityMode"] = resources.visibilityMode;
     cb["textureLod"] = mTextureLod;
@@ -161,9 +177,15 @@ bool VoxelInspector::renderUI(Gui::Widgets& widget)
     changed |= widget.slider("Orbit distance", mDistance, 1.3f, 10.f);
     changed |= widget.var("Light direction", mLightDirection, -1.f, 1.f, 0.01f);
     changed |= widget.slider("Light intensity", mLightIntensity, 0.f, 20.f);
-    changed |= widget.checkbox("Inspector coverage", mCoverage);
-    changed |= widget.slider("Inspector coverage blend", mCoverageBlend, 0.f, 1.f);
-    changed |= widget.checkbox("Inspector internal visibility / local shadows", mVisibility);
+    changed |= widget.checkbox("Follow renderer settings", mFollowRenderer);
+    if (!mFollowRenderer)
+    {
+        changed |= widget.checkbox("Inspector ellipsoid", mEllipsoid);
+        changed |= widget.checkbox("Inspector coverage", mCoverage);
+        changed |= widget.slider("Inspector coverage blend", mCoverageBlend, 0.f, 1.f);
+        changed |= widget.slider("Inspector transmittance threshold", mTransmittanceThreshold, 0.f, 0.1f);
+        changed |= widget.checkbox("Inspector internal visibility / local shadows", mVisibility);
+    }
     changed |= widget.slider("Reference texture LOD", mTextureLod, 0.f, 12.f);
     if (widget.button("Reclip selected node")) { mDirty = true; changed = true; }
     if (changed) mFrame = 0;

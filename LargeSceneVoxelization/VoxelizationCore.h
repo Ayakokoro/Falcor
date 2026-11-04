@@ -59,10 +59,19 @@ enum class ProjectionAreaFunctionType : uint32_t
     TotalProjArea = 2,
 };
 
+// Same values and missing-mask fallback as the renderer's InternalVisibilityMode.
+enum class InternalVisibilityMode : uint32_t
+{
+    Legacy = 0,
+    Bitmask = 1,
+    Off = 2,
+};
+
 struct AnalysisOptions
 {
     bool visibleMaterial = false;
     bool visibilityBitmask = false;
+    InternalVisibilityMode internalVisibilityMode = InternalVisibilityMode::Bitmask;
     uint32_t sampleFrequency = 1024;
     uint32_t samplesPerPolygon = 4;
     uint32_t sphericalResolution = 256;
@@ -116,9 +125,24 @@ struct AnalysisResult
     VisibilityMask::Data visibilityMask;
     std::vector<ProjectionValidation> projectionValidation;
     std::array<FunctionMap, 3> projectionMaps;
+    // R: direct-geometry MC reference; G: selected baked surface response;
+    // B: |R-G|; A: visible-material-only error (before incident visibility).
     Float4Map splittingError;
     Float4Map ndf;
 };
+
+// Conditional surface response, including the incident cosine exactly once.
+// Coverage and inter-voxel shadows are deliberately outside this local diagnostic.
+// A null material selects the legacy four-lobe path; missing/invalid masks use
+// the renderer's bright fallback in the visible-material Bitmask mode.
+float3 evaluateBakedSurface(const VoxelData& voxelData,
+                           const VisibleMaterialFile::Data* visibleMaterial,
+                           const VisibilityMask::Data* visibilityMask,
+                           const float3& wi, const float3& wo,
+                           InternalVisibilityMode mode = InternalVisibilityMode::Bitmask);
+
+// Uniform surface-area sampling of a convex clipped polygon (two uniform variates).
+float3 samplePolygonSurface(const Polygon& polygon, const float2& u);
 
 // Node-key helpers kept behind the shared library boundary.  The encoding is
 // the same v2 encoding used by PolygonGenerator and the serialized index.
@@ -174,7 +198,8 @@ bool loadSceneResources(const std::filesystem::path& scenePath,
                         std::vector<Texture2D>& specularTextures,
                         std::vector<Texture2D>& metallicTextures,
                         std::vector<Texture2D>& normalMapTextures,
-                        std::string& error);
+                        std::string& error,
+                        bool useSpecGlossMaterials = false);
 
 // Analyze exactly one clipped node.  VoxelData is always generated; the
 // optional maps are controlled by AnalysisOptions.

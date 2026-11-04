@@ -369,6 +369,27 @@ PointMaterial samplePointMaterial(const PreparedPolygon& prepared,
     return result;
 }
 
+float3 samplePointNormal(const PreparedPolygon& prepared,
+                         const AnalysisContext& context,
+                         const float3& leafCoordinate, const float2& uv)
+{
+    const Triangle& triangle = prepared.sourceTriangle;
+    if (prepared.materialId >= context.textures.normalMap.size() ||
+        context.textures.normalMap[prepared.materialId].width <= 0)
+        return triangle.lerpNormal(leafCoordinate);
+
+    // Use the same normal-map decode and triangle frame as makeAggregateInput,
+    // but sample the original texture at this surface point for the reference.
+    const float4 texel = sampleTextureLod0(context.textures.normalMap,
+        prepared.materialId, uv, float4(0.5f, 0.5f, 1.0f, 1.0f));
+    const float3 tangentNormal = safeNormalize(float3(texel) * 2.0f - 1.0f);
+    const float3 tangent(triangle.TBN[0].x, triangle.TBN[1].x, triangle.TBN[2].x);
+    const float3 bitangent(triangle.TBN[0].y, triangle.TBN[1].y, triangle.TBN[2].y);
+    const float3 normal(triangle.TBN[0].z, triangle.TBN[1].z, triangle.TBN[2].z);
+    return safeNormalize(tangent * tangentNormal.x + bitangent * tangentNormal.y +
+                         normal * tangentNormal.z);
+}
+
 uint32_t hash32(uint32_t value)
 {
     value = value * 747796405u + 2891336453u;
@@ -388,12 +409,26 @@ float3 samplePointOnPolygon(const Polygon& polygon, const float2& u)
     if (polygon.count < 3)
         return polygon.vertices[0];
 
-    const float uTri = u.x * static_cast<float>(polygon.count - 2);
-    uint32_t triangleIndex = static_cast<uint32_t>(uTri);
-    if (triangleIndex >= polygon.count - 2)
-        triangleIndex = polygon.count - 3;
-    const float fraction = std::clamp(
-        uTri - static_cast<float>(triangleIndex), 0.0f, 1.0f);
+    // Clipping produces unequal fan triangles. Choosing them by index would
+    // not match the area/N integration weights used by the reference maps.
+    float areas[MAX_VERTEX_COUNT - 2] = {};
+    float totalArea = 0;
+    uint32_t lastTriangle = 0;
+    for (uint32_t i = 0; i + 2 < polygon.count; ++i)
+    {
+        areas[i] = length(cross(polygon.vertices[i + 1] - polygon.vertices[0],
+                                polygon.vertices[i + 2] - polygon.vertices[0]));
+        totalArea += areas[i];
+        if (areas[i] > 0) lastTriangle = i;
+    }
+    if (!(totalArea > 0)) return polygon.vertices[0];
+    float remaining = std::clamp(u.x, 0.0f, 1.0f) * totalArea;
+    uint32_t triangleIndex = 0;
+    while (triangleIndex < lastTriangle &&
+           (areas[triangleIndex] <= 0 || remaining >= areas[triangleIndex]))
+        remaining -= areas[triangleIndex++];
+    const float fraction = areas[triangleIndex] > 0 ?
+        std::clamp(remaining / areas[triangleIndex], 0.0f, 1.0f) : 0.0f;
     const float3 v0 = polygon.vertices[0];
     const float3 v1 = polygon.vertices[triangleIndex + 1];
     const float3 v2 = polygon.vertices[triangleIndex + 2];
@@ -467,7 +502,7 @@ float lambdaTerm(float nDotX, float alpha)
     return (temp / std::max(1e-6f, nDotX) - 1.0f) * 0.5f;
 }
 
-float3 evalPointBSDF(const float3& wi, const float3& wo, const float3& h,
+float3 evalPointCosBSDF(const float3& wi, const float3& wo, const float3& h,
                      const float3& shadingNormal, const float3& diffuse,
                      const float3& specular, float roughness)
 {
@@ -501,7 +536,7 @@ float3 evalPointBSDF(const float3& wi, const float3& wo, const float3& h,
     const float wiScatter = lerp(1.0f, fd90, pow5(1.0f - lightLocal.z));
     const float woScatter = lerp(1.0f, fd90, pow5(1.0f - viewLocal.z));
     const float3 diffuseValue =
-        wiScatter * woScatter * energyFactor * diffuse / M_PI_F;
+        wiScatter * woScatter * energyFactor * diffuse / M_PI_F * lightLocal.z;
 
     const float nDotH = std::max(0.0f, halfLocal.z);
     const float alpha2 = alpha * alpha;
@@ -511,14 +546,14 @@ float3 evalPointBSDF(const float3& wi, const float3& wo, const float3& h,
     const float3 fresnel = lerp(
         specular, float3(1), pow5(1.0f - dot(viewLocal, halfLocal)));
 
-    const float nDotV = std::max(viewLocal.z, 1e-8f);
-    const float nDotL = std::max(lightLocal.z, 1e-8f);
+    const float nDotV = viewLocal.z;
+    const float nDotL = lightLocal.z;
     const float lambdaV = lambdaTerm(nDotV, alpha);
     const float lambdaL = lambdaTerm(nDotL, alpha);
     const float geometry = 1.0f / std::max(1.0f + lambdaV + lambdaL, 1e-6f);
     const float3 specularValue =
         fresnel * distribution * geometry /
-        std::max(4.0f * nDotV * nDotL, 1e-6f);
+        (4.0f * std::max(nDotV, 1e-6f));
 
     return diffuseValue + specularValue;
 }
@@ -544,6 +579,7 @@ struct SurfaceBRDF
     void init(const ABSDF& absdf)
     {
         count = 0;
+        visibleModel = false;
         for (uint32_t i = 0; i < LOBE_COUNT; ++i)
         {
             const ABSDFLobe& source = absdf.lobes[i];
@@ -630,11 +666,12 @@ struct SurfaceBRDF
             std::max(1.0f + lambdaTerm(lightLocal.z, lobe.alpha) +
                      lambdaTerm(viewLocal.z, lobe.alpha), 1e-6f);
         const float3 specularValue = fresnel * distribution * geometry /
-            std::max(4.0f * viewLocal.z, 1e-6f);
+            (4.0f * std::max(viewLocal.z, 1e-6f));
         return diffuseValue + specularValue;
     }
 
-    float3 eval(const float3& wi, const float3& wo, const float3& h) const
+    float3 eval(const float3& wi, const float3& wo, const float3& h,
+                const VisibilityMask::Data* masks = nullptr) const
     {
         float3 value(0);
         float frontSum = 0;
@@ -647,7 +684,11 @@ struct SurfaceBRDF
         {
             const float weight = visibleModel ?
                 lobes[i].weight * std::max(0.0f, dot(lobes[i].normal, wo)) / frontSum : lobes[i].weight;
-            value += weight * evalLobe(lobes[i], wi, wo, h);
+            float visibility = 1;
+            if (visibleModel && masks && masks->lobeCount() == count)
+                visibility = VisibilityMask::query(*masks, i,
+                    VisibilityMask::directionIndex(wi), VisibilityMask::directionIndex(wo)).value;
+            value += weight * evalLobe(lobes[i], wi, wo, h) * visibility;
         }
         return value;
     }
@@ -666,6 +707,25 @@ struct SurfaceBRDF
         return result;
     }
 };
+
+float3 evaluateSurface(const SurfaceBRDF& surface, const VoxelData& voxelData,
+                       const VisibilityMask::Data* masks, const float3& wi,
+                       const float3& wo, const float3& halfVector,
+                       InternalVisibilityMode mode)
+{
+    if (surface.visibleModel && mode == InternalVisibilityMode::Bitmask)
+        return surface.eval(wi, wo, halfVector, masks);
+
+    float visibility = 1;
+    if (mode != InternalVisibilityMode::Off)
+    {
+        // The legacy material always uses the one-way projection ratio.
+        const float totalArea = voxelData.totalProjAreaFunc.eval(wi);
+        if (totalArea > 0)
+            visibility = std::clamp(voxelData.polygonsProjAreaFunc.eval(wi) / totalArea, 0.0f, 1.0f);
+    }
+    return surface.eval(wi, wo, halfVector) * visibility;
+}
 
 float3 octahedralMapping(uint32_t x, uint32_t y, uint32_t resolution)
 {
@@ -772,7 +832,8 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
                          const std::vector<PreparedPolygon>& polygons,
                          const AnalysisContext& context,
                          float nodeScale, const AnalysisOptions& options,
-                   const VisibleMaterialFile::Data* visibleMaterial)
+                   const VisibleMaterialFile::Data* visibleMaterial,
+                   const VisibilityMask::Data* visibilityMask)
 {
     if (options.splittingBlockCount == 0 || options.splittingBlockSize == 0)
         return;
@@ -806,20 +867,13 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
                 const uint32_t blockY = y / blockSize;
                 const uint32_t pixelX = x % blockSize;
                 const uint32_t pixelY = y % blockSize;
-                const uint32_t blockIndex = blockY * blockCount + blockX;
-                const uint32_t pixelIndex = pixelY * blockSize + pixelX;
-
                 const float3 wi = octahedralMapping(blockX, blockY, blockCount);
                 const float3 wo = octahedralMapping(pixelX, pixelY, blockSize);
                 const float3 halfVector = safeNormalize(wi + wo);
 
                 float sumFViVoCc = 0;
-                float sumViVoCc = 0;
                 float sumVoCo = 0;
-                float sumFCc = 0;
-                float sumCo = 0;
-                float sumVoCiCo = 0;
-                float totalWeight = 0;
+                float sumFVoCc = 0;
 
                 for (uint32_t polygonIndex = 0; polygonIndex < polygons.size(); ++polygonIndex)
                 {
@@ -827,9 +881,9 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
                     const Polygon& polygon = *prepared.polygon;
                     const float sampleWeight = polygon.calcArea() /
                         static_cast<float>(samplesPerPolygon);
-                    const uint32_t baseSeed = hash32(
-                        polygonIndex * 2654435761u +
-                        blockIndex * 3266489917u + pixelIndex);
+                    // Reuse the same surface samples for every direction pair.
+                    // Changing view/light must not also change the MC realization.
+                    const uint32_t baseSeed = hash32(polygonIndex * 2654435761u);
 
                     for (uint32_t sampleIndex = 0; sampleIndex < samplesPerPolygon; ++sampleIndex)
                     {
@@ -839,67 +893,54 @@ void computeSplittingMap(Float4Map& output, const VoxelData& voxelData,
                         const float3 localPosition = samplePointOnPolygon(polygon, randomPoint);
                         const float3 leafCoordinate = localPosition * nodeScale;
                         const float2 uv = prepared.sourceTriangle.lerpUV(leafCoordinate);
-                        const float3 sampleNormal = prepared.sourceTriangle.lerpNormal(leafCoordinate);
+                        const float3 sampleNormal = samplePointNormal(prepared, context, leafCoordinate, uv);
 
                         const float dotSampleI = dot(sampleNormal, wi);
                         const float dotSampleO = dot(sampleNormal, wo);
-                        if (dotSampleI * dotSampleO <= 0.0f)
-                            continue;
-
                         const float3 effectiveNormal = dotSampleO < 0.0f
                             ? -sampleNormal : sampleNormal;
-                        const float cosSampleI = std::abs(dotSampleI);
                         const float cosSampleO = std::abs(dotSampleO);
-                        const PointMaterial material = samplePointMaterial(
-                            prepared, context, uv);
                         const float3 rayOrigin = localPosition + effectiveNormal * 1e-6f;
-                        const float visibilityI = traceVisibility(
-                            rayOrigin, wi, 2.0f, polygons);
                         const float visibilityO = traceVisibility(
                             rayOrigin, wo, 2.0f, polygons);
-                        const float3 fValue = glm::abs(evalPointBSDF(
+                        // All view-visible area belongs in the normalization,
+                        // including surfaces that are back-facing to the light.
+                        sumVoCo += visibilityO * cosSampleO * sampleWeight;
+                        if (visibilityO <= 0 || dotSampleI * dotSampleO <= 0.0f)
+                            continue;
+
+                        const PointMaterial material = samplePointMaterial(prepared, context, uv);
+                        const float visibilityI = traceVisibility(rayOrigin, wi, 2.0f, polygons);
+                        const float3 fValue = evalPointCosBSDF(
                             wi, wo, halfVector, effectiveNormal,
                             lerp(material.baseColor, float3(0), material.specular.b),
                             lerp(float3(0.04f), material.baseColor, material.specular.b),
-                            std::max(material.specular.g, 0.01f)));
+                            std::max(material.specular.g, 0.01f));
                         const float fLuminance =
                             fValue.x * 0.299f + fValue.y * 0.587f + fValue.z * 0.114f;
-                        const float weight = sampleWeight;
-
+                        // evalPointCosBSDF already contains the incident cosine.
                         sumFViVoCc += fLuminance * visibilityI * visibilityO *
-                            cosSampleI * cosSampleO * weight;
-                        sumViVoCc += visibilityI * visibilityO *
-                            cosSampleI * cosSampleO * weight;
-                        sumVoCo += visibilityO * cosSampleO * weight;
-                        sumFCc += fLuminance * cosSampleI * cosSampleO * weight;
-                        sumCo += cosSampleO * weight;
-                        sumVoCiCo += visibilityO * cosSampleI * cosSampleO * weight;
-                        totalWeight += weight;
+                            cosSampleO * sampleWeight;
+                        sumFVoCc += fLuminance * visibilityO * cosSampleO * sampleWeight;
                     }
                 }
 
-                float groundTruth = 0;
-                if (totalWeight > 0 && sumViVoCc > 0 && sumVoCo > 0)
-                    groundTruth = sumFViVoCc / sumVoCo;
+                const float groundTruth = sumVoCo > 0 ? sumFViVoCc / sumVoCo : 0;
+                const float visibleMaterialReference = sumVoCo > 0 ? sumFVoCc / sumVoCo : 0;
 
                 const float3 lobeValue = surface.eval(wi, wo, halfVector);
                 const float lobeBsdf =
                     lobeValue.x * 0.299f + lobeValue.y * 0.587f + lobeValue.z * 0.114f;
 
-                float approximate = 0;
-                float formula4 = 0;
-                if (totalWeight > 0 && sumCo > 0 && sumVoCiCo > 0 && sumViVoCc > 0)
-                {
-                    formula4 = sumFCc / sumCo;
-                    const float formula5 = sumViVoCc / sumVoCiCo;
-                    approximate = formula4 * formula5;
-                }
+                const float3 approximationValue = evaluateSurface(surface, voxelData,
+                    visibilityMask, wi, wo, halfVector, options.internalVisibilityMode);
+                const float approximate = dot(approximationValue, float3(0.299f, 0.587f, 0.114f));
 
                 output.values[size_t(y) * output.width + x] = float4(
                     groundTruth,
                     approximate,
                     std::abs(groundTruth - approximate),
-                    std::abs(formula4 - lobeBsdf));
+                    std::abs(visibleMaterialReference - lobeBsdf));
             }
         }
     };
@@ -946,9 +987,7 @@ void computeNdfMap(Float4Map& output, const VoxelData& voxelData,
                     const Polygon& polygon = *prepared.polygon;
                     const float sampleWeight = polygon.calcArea() /
                         static_cast<float>(samplesPerPolygon);
-                    const uint32_t baseSeed = hash32(
-                        polygonIndex * 2654435761u +
-                        x * 3266489917u + y);
+                    const uint32_t baseSeed = hash32(polygonIndex * 2654435761u);
 
                     for (uint32_t sampleIndex = 0; sampleIndex < samplesPerPolygon; ++sampleIndex)
                     {
@@ -958,7 +997,8 @@ void computeNdfMap(Float4Map& output, const VoxelData& voxelData,
                         const float3 localPosition = samplePointOnPolygon(polygon, randomPoint);
                         const float3 leafCoordinate = localPosition * nodeScale;
                         const float2 sampleUv = prepared.sourceTriangle.lerpUV(leafCoordinate);
-                        const float3 sampleNormal = prepared.sourceTriangle.lerpNormal(leafCoordinate);
+                        const float3 sampleNormal = samplePointNormal(
+                            prepared, context, leafCoordinate, sampleUv);
                         const PointMaterial material = samplePointMaterial(
                             prepared, context, sampleUv);
                         const float roughness = std::max(material.specular.g, 0.01f);
@@ -984,6 +1024,24 @@ void computeNdfMap(Float4Map& output, const VoxelData& voxelData,
 }
 
 } // namespace
+
+float3 samplePolygonSurface(const Polygon& polygon, const float2& u)
+{
+    return samplePointOnPolygon(polygon, u);
+}
+
+float3 evaluateBakedSurface(const VoxelData& voxelData,
+                           const VisibleMaterialFile::Data* visibleMaterial,
+                           const VisibilityMask::Data* visibilityMask,
+                           const float3& wi, const float3& wo,
+                           InternalVisibilityMode mode)
+{
+    SurfaceBRDF surface;
+    if (visibleMaterial) surface.init(*visibleMaterial);
+    else surface.init(voxelData.ABSDF);
+    return evaluateSurface(surface, voxelData, visibilityMask, wi, wo,
+                           safeNormalize(wi + wo), mode);
+}
 
 uint64_t makeNodeKey(uint32_t level, const int3& cell)
 {
@@ -1209,9 +1267,10 @@ bool loadSceneResources(const std::filesystem::path& scenePath,
                         std::vector<Texture2D>& specularTextures,
                         std::vector<Texture2D>& metallicTextures,
                         std::vector<Texture2D>& normalMapTextures,
-                        std::string& error)
+                        std::string& error,
+                        bool useSpecGlossMaterials)
 {
-    SceneLoader loader;
+    SceneLoader loader(useSpecGlossMaterials);
     if (!loader.loadMeshInstances(scenePath.string(), scene))
     {
         error = loader.getError();
@@ -1405,7 +1464,8 @@ AnalysisResult analyzeNode(const NodeData& node,
         computeSplittingMap(
             result.splittingError, result.voxelData, preparedPolygons,
             context, nodeScale, options,
-            (options.visibleMaterial || options.visibilityBitmask) ? &result.visibleMaterial : nullptr);
+            (options.visibleMaterial || options.visibilityBitmask) ? &result.visibleMaterial : nullptr,
+            options.visibilityBitmask ? &result.visibilityMask : nullptr);
     }
 
     if (options.computeNdf)

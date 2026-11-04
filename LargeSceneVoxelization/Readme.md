@@ -47,7 +47,7 @@ Release 使用 `/fp:fast`（其他编译器对应 `-ffast-math`），缓存中�
 双精度几何参考和投影面积差异；减少 `-s` 仍会单独影响采样精度。
 
 ```powershell
-cmake --build build --config Release --target LargeSceneVoxelization VoxelizationInspector ProjectionTests VisibilityMaskTests
+cmake --build build --config Release --target LargeSceneVoxelization VoxelizationInspector ProjectionTests VisibilityMaskTests InspectorTests
 ctest --test-dir build -C Release --output-on-failure
 
 # 可选：读取已有烘焙，均匀抽取约 1024 个叶节点，对照旧采样/仅缓存/缓存加新判定
@@ -94,9 +94,24 @@ createPass("RayMarchingPass", {
 })
 ```
 
-Inspector 的 `--visible-material` 让 NDF/材质诊断使用新模型；增加 `--visibility-bitmask`
-会在 `summary.txt` 写出 mask metadata 和方向位值。投影面积诊断继续使用原 Octahedral 表。
-Inspector 从保留的节点 polygons 重新分析，不从 `.vmat` 反推几何。
+Inspector 从保留的节点 polygons 调用与体素化相同的 `analyzeNode()`，重新生成材质、面积表和可选 mask；
+不从 `.vmat` 反推几何。`--visible-material` 使用当前平均可见法线拟合的 8-lobe 材质。
+若体素化时使用了 `--spec-gloss`，Inspector 也应传入该参数，以保持材质输入转换一致。
+`--visibility-bitmask` 同时启用可见材质和 mask 烘焙，并在 splitting 图中逐 lobe 应用双向可见性，
+`summary.txt` 也会写出 mask metadata 和方向位值。
+`--internal-visibility legacy|bitmask|off` 选择渲染时的内部可见性模式；显式选择 `bitmask` 同时启用其烘焙。
+可见材质默认选择 Bitmask，没有烘焙 mask 时使用 `Q=1`，与 Renderer 一致；旧 4-lobe 材质默认使用 VPA/TPA。
+
+`splitting_error.csv` 的 `r` 为逐点材质及局部遮挡的联合积分参考值，`g` 为所选烘焙材质和内部可见性的实际求值，
+`b=abs(r-g)`，`a` 为加入入射可见性之前的材质误差。两种响应均包含一次入射余弦，不包含 coverage。
+参考积分按多边形面积均匀采样，并保留观察方向可见但背向光源的表面对分母的贡献。
+参考值和近似值的 PGM 使用相同的零起点线性范围，范围写入 PGM 注释；CSV 保留原始数值。
+投影面积诊断仍用于检查 Octahedral 表：其中 visible 参考是直接 64×64 光栅化，primitive 参考是拟合椭球的采样投影，
+两者均不是原网格的高精度 ground truth。NDF 图是面积平均的法线分布诊断，不代表完整可见材质响应。
+
+交互式 Voxel Inspector 默认启用 **Follow renderer settings**，跟随主渲染器的椭球、coverage、内部可见性开关、
+coverage blend 和 transmittance threshold，并共用材质求值函数。取消该选项后可独立调整这些 Inspector 控件。
+右侧参考仍是所选节点内的裁剪三角形，在 Inspector 的独立方向光下着色；不包含其他体素的遮挡或场景间接光。
 
 扩展布局与内存：
 
@@ -110,7 +125,7 @@ Inspector 从保留的节点 polygons 重新分析，不从 `.vmat` 反推几何
 此功能迁移保留当前分支的文件流程；实验分支已有的 VPW3/SH 主文件不能直接作为这里的输入。
 
 ```powershell
-cmake --build build --config Release --target LargeSceneVoxelization VoxelizationInspector VisibilityMaskTests
+cmake --build build --config Release --target LargeSceneVoxelization VoxelizationInspector ProjectionTests VisibilityMaskTests InspectorTests
 ctest --test-dir build -C Release --output-on-failure
 ```
 
@@ -177,5 +192,5 @@ summary.txt
 
 # spherical_* maps use an N x N upper-hemisphere disk, matching the NDF map:
 # the disk center is +Z, the boundary is the XY equator, and pixels outside
-# the unit disk are zero. CSV files contain raw values; PGM files are display
-# normalized inside the disk.
+# the unit disk are zero. CSV files contain raw values; reference/approximation
+# PGM pairs share one zero-based linear range, recorded in their header comments.
