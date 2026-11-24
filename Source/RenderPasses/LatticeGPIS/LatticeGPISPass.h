@@ -2,6 +2,7 @@
 #include "Falcor.h"
 #include "Core/Pass/ComputePass.h"
 #include "RenderGraph/RenderPass.h"
+#include "DensityClipmap.h"
 #include "MeshClipmap.h"
 #include "MeshDistanceField.h"
 #include "SdfField.h"
@@ -49,15 +50,35 @@ private:
         float2 heightRange = {0.f, 0.6f};
         float latticeSpacingInEll = 0.5f;
         float kernelRadiusInEll = 3.f;
+        bool surfaceEnabled = true;
+        bool cloudEnabled = false;
+        float3 cloudCenter = {0.55f, 0.15f, 0.25f};
+        float3 cloudRadii = {1.2f, 0.65f, 0.85f};
+        float cloudCorrelationLength = 0.14f;
+        float cloudAmplitude = 0.095f;
+        float cloudMeanOffset = 0.095f;
+        float3 cloudColor = {0.96f, 0.97f, 0.99f};
+        std::filesystem::path cloudDensityFile;
+        std::string cloudDensityGrid = "density";
+        bool densityUseClipmap = true;
+        uint32_t densityClipmapResolution = 65;
+        uint32_t densityClipmapLevels = 8;
+        float cloudExtinctionScale = 1.f;
+        float cloudDensityWorldScale = 1.f;
+        float3 cloudDensityTranslation = float3(0.f);
         uint32_t seed = 0;
+        bool usesDualFieldShader() const { return cloudEnabled || !surfaceEnabled; }
+        bool usesDensityShader() const { return cloudEnabled && !cloudDensityFile.empty(); }
         bool hasVaryingKernel() const
         {
             return kernelMode == KernelMode::Linear && (correlationLength != correlationLengthEnd || amplitude != amplitudeEnd);
         }
-        void validate(const AABB& bounds) const;
+        AABB cloudBounds(const DensityClipmap* density) const;
+        void validate(const AABB& bounds, const DensityClipmap* density) const;
     };
 
-    void applyOptions(Options options, const AABB& bounds);
+    void applyOptions(Options options, const AABB& bounds, const DensityClipmap* density);
+    void renderDensitySourceUI(Gui::Widgets& widget);
     void updateStationaryWeights(const Options& options);
     AABB getFieldBounds() const;
     void frameField();
@@ -68,6 +89,7 @@ private:
     ref<Texture> mpBaseColor;
     ref<Sampler> mpMeshSampler;
     std::unique_ptr<MeshClipmap> mpClipmap;
+    std::unique_ptr<DensityClipmap> mpDensityClipmap;
     ref<ComputePass> mpTrace;
     ref<Buffer> mpStationaryWeights;
     float mStationarySpacingInEll = 0.f;
@@ -80,6 +102,7 @@ private:
     bool mReset = true;
     float3 mSpeedSamplePosition = float3(0.f);
     std::string mFileInput, mGridInput, mTextureInput, mError;
+    std::string mDensityFileInput, mDensityGridInput;
 };
 
 FALCOR_ENUM_REGISTER(LatticeGPISPass::KernelMode);

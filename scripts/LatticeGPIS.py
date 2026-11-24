@@ -22,7 +22,32 @@ baseColorTexture property or GPIS > Browse texture. At each hit the pass
 projects onto the nearest source triangle and interpolates its corner UVs.
 Open Scene/UVSphere/RenderGPIS.py in Mogwai for a textured example.
 
-Both kernel modes accept latticeSpacingInEll (default 0.5) and
+Open Scene/CloudAndSurface/RenderGPIS.py for a cloud-like GPIS intersecting
+the textured sphere. Each ray scatters at the first zero crossing of either
+field. Move or resize the cloud with cloudCenter and cloudRadii in world
+units. Its stationary kernel uses cloudCorrelationLength and cloudAmplitude.
+Increasing cloudMeanOffset above zero makes crossings rarer at fixed amplitude.
+Toggle surfaceEnabled and cloudEnabled to inspect either field individually.
+
+Open Scene/SmokeDensity/RenderGPIS.py to use the density grid from Falcor's
+media/test_scenes/volumes/smoke.vdb. Set cloudDensityFile and cloudDensityGrid
+to load another nonnegative, zero-background OpenVDB float grid. The cloud
+has its own camera-following densityClipmapResolution and densityClipmapLevels.
+cloudDensityWorldScale and cloudDensityTranslation place the VDB in the scene.
+cloudExtinctionScale converts density to target extinction per world unit;
+cloudCorrelationLength sets the GPIS microstructure scale in world units.
+The conversion approximates volume extinction. Set cloudDensityFile to an
+empty string to use the analytic cloud again.
+
+Scene/SmokeComparison/Compare.py compares illuminated smoke on the native
+grids with clipmaps disabled. VolumeReferencePass reads the original density.
+BakedGPISPass reads a separate gpisMean VDB containing the normalized mean
+and stored kernel parameters, then samples the random field's zero crossings.
+The script caches the conversion under build/gpis-bakes. Both paths use the
+same directional light, isotropic phase, scattering albedo and background.
+Their linear transmittance and single-scattering radiance can be captured as EXR.
+
+Both surface kernel modes accept latticeSpacingInEll (default 0.5) and
 kernelRadiusInEll (default 3.0). Spacing is measured in units of the
 shortest correlation length and support radius in units of the local length.
 The stationary support boundary rounds up to the next lattice knot.

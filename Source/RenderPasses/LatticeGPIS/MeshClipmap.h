@@ -1,6 +1,7 @@
 #pragma once
 #include "Falcor.h"
 #include "Core/Pass/ComputePass.h"
+#include <functional>
 
 class MeshDistanceField;
 
@@ -12,6 +13,11 @@ public:
                 uint32_t resolution, uint32_t levelCount, float padding = 0.f);
     MeshClipmap(Falcor::ref<Falcor::Device> device, const std::filesystem::path& path,
                 uint32_t resolution, uint32_t levelCount, float padding = 0.f);
+    // Use the same toroidal cache for a scalar grid with a known, aligned root.
+    // Nodes are relative to the root corner, measured in the requested level's units.
+    using RowSampler = std::function<void(int level, Falcor::int3 node, int count, float* dst)>;
+    MeshClipmap(Falcor::ref<Falcor::Device> device, uint32_t resolution, uint32_t levelCount,
+                float coarseSpacing, RowSampler sampler);
 
     void update(Falcor::RenderContext* context, Falcor::float3 cameraPosition);
     void bind(const Falcor::ShaderVar& var) const;
@@ -31,10 +37,12 @@ private:
     };
 
     void updateLevel(int levelIndex, Falcor::int3 origin);
+    void initialize(Falcor::ref<Falcor::Device> device, uint32_t levelCount, float coarseSpacing);
     void sampleRegion(int levelIndex, Falcor::int3 lower, Falcor::int3 upper);
     void upload(Falcor::RenderContext* context);
 
     std::shared_ptr<const MeshDistanceField> mpMesh;
+    RowSampler mSampleRow;
     Falcor::ref<Falcor::Texture> mpAtlas;
     Falcor::ref<Falcor::ComputePass> mpUploadPass;
     Falcor::ref<Falcor::Buffer> mpDistances, mpRows;

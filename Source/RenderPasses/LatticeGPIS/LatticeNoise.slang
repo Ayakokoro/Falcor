@@ -23,6 +23,8 @@
  *     3. This notice may not be removed or altered from any source
  *        distribution.
  */
+#include "GPISCameraRay.slang"
+
 struct LatticeKernel
 {
     uint nonstationary;
@@ -36,15 +38,6 @@ struct LatticeKernel
 };
 
 StructuredBuffer<float2> gStationaryWeights; // Value and cell-coordinate slope at nonnegative offsets.
-
-uint latticeHash(uint x)
-{
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    return x ^ (x >> 16);
-}
 
 // Adjacent source indices share a Box-Muller pair. Cell revisits regenerate
 // exactly the same coefficients. Both uniforms are strictly inside (0,1).

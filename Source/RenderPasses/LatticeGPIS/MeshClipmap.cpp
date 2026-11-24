@@ -15,6 +15,15 @@ int wrap(int index, int resolution)
     const int remainder = index % resolution;
     return remainder < 0 ? remainder + resolution : remainder;
 }
+
+void validateSize(ref<Device> device, uint32_t resolution, uint32_t levelCount)
+{
+    FALCOR_CHECK(resolution >= 9 && resolution <= 129 && ((resolution - 1) & (resolution - 2)) == 0,
+                 "LatticeGPIS: clipmap resolution must be 9, 17, 33, 65 or 129 nodes.");
+    FALCOR_CHECK(levelCount >= 1 && levelCount <= 12, "LatticeGPIS: clipmap level count must be in [1,12].");
+    FALCOR_CHECK(resolution * levelCount <= device->getGfxDevice()->getDeviceInfo().limits.maxTextureDimension3D,
+                 "LatticeGPIS: the clipmap atlas exceeds this device's maximum 3D texture dimension.");
+}
 }
 
 MeshClipmap::MeshClipmap(ref<Device> device, const std::filesystem::path& path, uint32_t resolution, uint32_t levelCount, float padding)
@@ -26,12 +35,8 @@ MeshClipmap::MeshClipmap(ref<Device> device, std::shared_ptr<const MeshDistanceF
     : mpMesh(std::move(mesh)), mResolution(int(resolution))
 {
     FALCOR_CHECK(mpMesh, "LatticeGPIS: a mesh is required for the SDF clipmap.");
-    FALCOR_CHECK(resolution >= 9 && resolution <= 129 && ((resolution - 1) & (resolution - 2)) == 0,
-                 "LatticeGPIS: clipmap resolution must be 9, 17, 33, 65 or 129 nodes.");
-    FALCOR_CHECK(levelCount >= 1 && levelCount <= 12, "LatticeGPIS: clipmap level count must be in [1,12].");
+    validateSize(device, resolution, levelCount);
     FALCOR_CHECK(std::isfinite(padding) && padding >= 0.f, "LatticeGPIS: clipmap padding must be finite and nonnegative.");
-    FALCOR_CHECK(resolution * levelCount <= device->getGfxDevice()->getDeviceInfo().limits.maxTextureDimension3D,
-                 "LatticeGPIS: the clipmap atlas exceeds this device's maximum 3D texture dimension.");
 
     const AABB meshBounds = getMeshBounds();
     const float3 extent = meshBounds.extent();
@@ -47,6 +52,20 @@ MeshClipmap::MeshClipmap(ref<Device> device, std::shared_ptr<const MeshDistanceF
         mBounds.minPoint[axis] = float(center - double(cells) * coarseSpacing * 0.5);
         mBounds.maxPoint[axis] = mBounds.minPoint[axis] + cells * coarseSpacing;
     }
+    initialize(device, levelCount, coarseSpacing);
+}
+
+MeshClipmap::MeshClipmap(ref<Device> device, uint32_t resolution, uint32_t levelCount, float coarseSpacing, RowSampler sampler)
+    : mSampleRow(std::move(sampler)), mResolution(int(resolution))
+{
+    validateSize(device, resolution, levelCount);
+    FALCOR_CHECK(mSampleRow && coarseSpacing > 0.f && std::isfinite(coarseSpacing), "Invalid scalar clipmap layout.");
+    mBounds = AABB(float3(0.f), float3((resolution - 1) * coarseSpacing));
+    initialize(device, levelCount, coarseSpacing);
+}
+
+void MeshClipmap::initialize(ref<Device> device, uint32_t levelCount, float coarseSpacing)
+{
     mLevels.resize(levelCount);
     for (uint32_t i = 0; i < levelCount; ++i)
         mLevels[i].spacing = std::ldexp(coarseSpacing, int(i) - int(levelCount - 1));
@@ -54,7 +73,7 @@ MeshClipmap::MeshClipmap(ref<Device> device, std::shared_ptr<const MeshDistanceF
     const float maxCoord = std::max({maxPerAxis.x, maxPerAxis.y, maxPerAxis.z});
     FALCOR_CHECK(std::isfinite(maxCoord) && std::nextafter(maxCoord, INFINITY) - maxCoord <= getFinestSpacing(),
                  "LatticeGPIS: the finest spacing is below world-coordinate precision. Recenter the model or reduce its clipmap levels.");
-    mpAtlas = device->createTexture3D(resolution, resolution, resolution * levelCount, ResourceFormat::R32Float, 1, nullptr,
+    mpAtlas = device->createTexture3D(mResolution, mResolution, mResolution * levelCount, ResourceFormat::R32Float, 1, nullptr,
                                       ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess);
     mpUploadPass = ComputePass::create(device, "RenderPasses/LatticeGPIS/UploadMeshClipmap.cs.slang");
 }
@@ -161,7 +180,8 @@ void MeshClipmap::sampleRegion(int index, int3 lower, int3 upper)
         const int3 node = level.origin + local;
         const float3 start(mBounds.minPoint.x, mBounds.minPoint.y + node.y * level.spacing, mBounds.minPoint.z + node.z * level.spacing);
         const uint32_t offset = uint32_t(base + size_t(row) * size.x);
-        mpMesh->sampleRow(start, level.spacing, size.x, mDistances.data() + offset, node.x);
+        if (mSampleRow) mSampleRow(index, node, size.x, mDistances.data() + offset);
+        else mpMesh->sampleRow(start, level.spacing, size.x, mDistances.data() + offset, node.x);
         int3 dst = (local + level.ringOffset) % int3(mResolution);
         dst.z += index * mResolution;
         mRows[rowBase + row] = uint4(dst.x + mResolution * (dst.y + mResolution * dst.z), offset, size.x, 0);

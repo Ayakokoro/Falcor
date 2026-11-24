@@ -39,6 +39,11 @@
 /LargeSceneVoxelization/tmp*/
 
 /Scene/*
+!/Scene/CloudAndSurface/
+!/Scene/SmokeDensity/
+!/Scene/SmokeComparison/
+!/Scene/MountainCloud/
+!/Scene/MountainCloud/Ridge.obj
 !/Scene/UVSphere/
 !/Scene/UVSphere/UVSphere.obj
 

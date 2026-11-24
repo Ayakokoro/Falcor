@@ -4,8 +4,22 @@
 #ifndef GPIS_TEXTURED_MESH
 #define GPIS_TEXTURED_MESH 0
 #endif
-#if GPIS_TEXTURED_MESH
+#ifndef GPIS_SECOND_FIELD
+#define GPIS_SECOND_FIELD 0
+#endif
+#ifndef GPIS_DENSITY_CLIPMAP
+#define GPIS_DENSITY_CLIPMAP 0
+#endif
+#if GPIS_SECOND_FIELD
+#include "CloudGPIS.slang"
+#if GPIS_DENSITY_CLIPMAP
+#include "DensityGPIS.slang"
+#endif
+#endif
+#if GPIS_TEXTURED_MESH || GPIS_SECOND_FIELD
 import Utils.Math.MathHelpers;
+#endif
+#if GPIS_TEXTURED_MESH
 #include "MeshSurfaceUV.slang"
 
 Texture2D<float4> gMeshBaseColor;
@@ -25,8 +39,10 @@ float3 meshAlbedo(float3 hit, float3 ray, float3 normal, float pixelWidth)
     float2 duvdy = float2(dot(surface.gradU, dy), dot(surface.gradV, dy));
     return gMeshBaseColor.SampleGrad(gMeshSampler, surface.uv, duvdx, duvdy).rgb;
 }
+#endif
 
-float3 sampleMeshDiffuse(float3 normal, uint key)
+#if GPIS_TEXTURED_MESH || GPIS_SECOND_FIELD
+float3 sampleGPISDiffuse(float3 normal, uint key)
 {
     uint2 bits = uint2(latticeHash(key), latticeHash(key ^ 0x27d4eb2fu));
     float2 u = (float2(bits >> 9) + 0.5f) / 8388608.f;
@@ -58,6 +74,16 @@ struct PassParameters
     float gKernelRadiusInEll;
     int gStationaryRadius;
     float2 gStationaryInvVariance;
+#if GPIS_SECOND_FIELD
+    uint gSurfaceEnabled, gCloudEnabled;
+    float3 gCloudCenter, gCloudRadii;
+    float gCloudCorrelationLength, gCloudAmplitude, gCloudMeanOffset;
+    float3 gCloudColor;
+#if GPIS_DENSITY_CLIPMAP
+    float3 gDensityTranslation;
+    float gDensityWorldScale, gDensityExtinctionScale;
+#endif
+#endif
 };
 uniform PassParameters CB;
 
@@ -107,22 +133,14 @@ float3 incidentLight(float3 origin, float3 direction, out float lightDistance)
 #endif
 }
 
-float tentSample(uint bits)
-{
-    float u = (float(bits >> 9) + 0.5f) / 8388608.f;
-    return u < 0.5f ? sqrt(2.f * u) - 1.f : 1.f - sqrt(2.f * (1.f - u));
-}
-
 [numthreads(8, 8, 1)]
 void main(uint3 threadID : SV_DispatchThreadID)
 {
     uint2 pixel = threadID.xy;
     if (any(pixel >= CB.gFrameDim)) return;
-    uint seed = latticeHash((pixel.y * CB.gFrameDim.x + pixel.x) ^ latticeHash(CB.gSeed + 0x85ebca6bu));
-    float2 jitter = float2(tentSample(latticeHash(seed)), tentSample(latticeHash(seed + 1u)));
-    float2 ndc = (float2(pixel) + 0.5f + jitter) / float2(CB.gFrameDim) * 2.f - 1.f;
+    uint seed;
+    float3 cameraRay = gpisCameraRay(pixel, CB.gFrameDim, CB.gSeed, CB.gCameraU, CB.gCameraV, CB.gCameraW, seed);
     float3 origin = CB.gCameraPosition;
-    float3 cameraRay = CB.gCameraW + ndc.x * CB.gCameraU - ndc.y * CB.gCameraV;
     float3 direction = normalize(cameraRay);
 #if GPIS_TEXTURED_MESH
     float pixelAngle = 2.f * max(length(CB.gCameraU) / CB.gFrameDim.x, length(CB.gCameraV) / CB.gFrameDim.y) / length(cameraRay);
@@ -142,6 +160,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float3 throughput = float3(1.f);
     float3 radiance = float3(0.f);
     float3 gradient = float3(0.f);
+#if GPIS_SECOND_FIELD
+    bool previousWasCloud = false;
+#endif
     [loop]
     for (uint bounce = 0; bounce <= 20; ++bounce)
     {
@@ -150,13 +171,48 @@ void main(uint3 threadID : SV_DispatchThreadID)
         float2 span = float2(0.f, lightDistance);
         bool hit = false;
         float distance = 0.f;
-        if (clipBox(origin, direction, gField.boundsMin, gField.boundsMax, span))
+        uint flightSeed = latticeHash(seed + (bounce + 1u) * 0x9e3779b9u);
+        float3 birthGradient = gradient;
+        bool traceSurface = true;
+        bool conditionSurface = bounce != 0;
+#if GPIS_SECOND_FIELD
+        traceSurface = CB.gSurfaceEnabled != 0u;
+        conditionSurface = conditionSurface && !previousWasCloud;
+#endif
+        if (traceSurface && clipBox(origin, direction, gField.boundsMin, gField.boundsMax, span))
         {
-            uint flightSeed = latticeHash(seed + (bounce + 1u) * 0x9e3779b9u);
-            float3 birthGradient = gradient;
-            hit = latticeIntersect(origin, direction, span.x, span.y, flightSeed, kernel, bounce != 0,
+            hit = latticeIntersect(origin, direction, span.x, span.y, flightSeed, kernel, conditionSurface,
                                    birthGradient, distance, gradient);
         }
+#if GPIS_SECOND_FIELD
+        // The two GPIS flights have independent random coefficients. Only the
+        // field that produced the previous hit inherits its value and gradient.
+        bool cloudHit = false;
+        if (CB.gCloudEnabled != 0u)
+        {
+            float cloudDistance;
+            float3 cloudGradient;
+            float limit = hit ? distance : lightDistance;
+            uint cloudSeed = latticeHash(flightSeed ^ 0x650ea347u);
+#if GPIS_DENSITY_CLIPMAP
+            cloudHit = densityGPISIntersect(origin, direction, limit, CB.gDensityTranslation, CB.gDensityWorldScale,
+                                            CB.gCloudCorrelationLength, CB.gCloudAmplitude, CB.gDensityExtinctionScale,
+                                            cloudSeed, previousWasCloud, birthGradient, cloudDistance, cloudGradient);
+#else
+            cloudHit = cloudGPISIntersect(origin, direction, limit, CB.gCloudCenter, CB.gCloudRadii,
+                                          CB.gCloudCorrelationLength, CB.gCloudAmplitude, CB.gCloudMeanOffset,
+                                          cloudSeed, previousWasCloud, birthGradient, cloudDistance, cloudGradient);
+#endif
+            if (cloudHit && cloudDistance < limit)
+            {
+                hit = true;
+                distance = cloudDistance;
+                gradient = cloudGradient;
+            }
+            else cloudHit = false;
+        }
+        previousWasCloud = cloudHit;
+#endif
         if (!hit)
         {
             radiance = throughput * light;
@@ -167,11 +223,23 @@ void main(uint3 threadID : SV_DispatchThreadID)
         if (!(n2 > 0.f)) break;
 #if GPIS_TEXTURED_MESH
         pathLength += distance;
+#endif
+#if GPIS_SECOND_FIELD
+        if (cloudHit)
+        {
+            float3 normal = gradient * rsqrt(n2);
+            if (dot(normal, direction) > 0.f) normal = -normal;
+            throughput *= CB.gCloudColor;
+            direction = sampleGPISDiffuse(normal, seed ^ ((bounce + 1u) * 0xc2b2ae35u));
+            continue;
+        }
+#endif
+#if GPIS_TEXTURED_MESH
         float3 normal = gradient * rsqrt(n2);
         if (dot(normal, direction) > 0.f) normal = -normal;
         // Cosine sampling cancels Lambert's cosine / pi term in the path weight.
         throughput *= meshAlbedo(origin, direction, normal, pathLength * pixelAngle);
-        direction = sampleMeshDiffuse(normal, seed ^ ((bounce + 1u) * 0x165667b1u));
+        direction = sampleGPISDiffuse(normal, seed ^ ((bounce + 1u) * 0x165667b1u));
 #else
         direction = normalize(reflect(direction, gradient * rsqrt(n2)));
         throughput *= float3(0.15f, 0.8f, 0.5f);

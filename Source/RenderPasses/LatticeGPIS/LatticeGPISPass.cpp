@@ -1,4 +1,5 @@
 #include "LatticeGPISPass.h"
+#include "BakedGPISPass.h"
 #include "Core/AssetResolver.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Utils/Image/Bitmap.h"
@@ -12,6 +13,12 @@ const float3 kReferenceTarget(0.f, 0.6f, 0.f);
 extern "C" FALCOR_API_EXPORT void registerPlugin(PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, LatticeGPISPass>();
+    registry.registerClass<RenderPass, BakedGPISPass>();
+    ScriptBindings::registerBinding([](pybind11::module& m) {
+        m.def("bake_gpis_density", &DensityClipmap::bakeGPIS, pybind11::arg("source"), pybind11::arg("grid"),
+              pybind11::arg("output"), pybind11::arg("ell"), pybind11::arg("sigma"),
+              pybind11::arg("extinction_scale"), pybind11::arg("world_scale"), pybind11::arg("samples_per_voxel") = 1);
+    });
 }
 
 LatticeGPISPass::LatticeGPISPass(ref<Device> device, const Properties& props) : RenderPass(device)
@@ -52,6 +59,22 @@ void LatticeGPISPass::setProperties(const Properties& props)
     props.getTo("heightRange", options.heightRange);
     props.getTo("latticeSpacingInEll", options.latticeSpacingInEll);
     props.getTo("kernelRadiusInEll", options.kernelRadiusInEll);
+    props.getTo("surfaceEnabled", options.surfaceEnabled);
+    props.getTo("cloudEnabled", options.cloudEnabled);
+    props.getTo("cloudCenter", options.cloudCenter);
+    props.getTo("cloudRadii", options.cloudRadii);
+    props.getTo("cloudCorrelationLength", options.cloudCorrelationLength);
+    props.getTo("cloudAmplitude", options.cloudAmplitude);
+    props.getTo("cloudMeanOffset", options.cloudMeanOffset);
+    props.getTo("cloudColor", options.cloudColor);
+    props.getTo("cloudDensityFile", options.cloudDensityFile);
+    props.getTo("cloudDensityGrid", options.cloudDensityGrid);
+    props.getTo("densityUseClipmap", options.densityUseClipmap);
+    props.getTo("densityClipmapResolution", options.densityClipmapResolution);
+    props.getTo("densityClipmapLevels", options.densityClipmapLevels);
+    props.getTo("cloudExtinctionScale", options.cloudExtinctionScale);
+    props.getTo("cloudDensityWorldScale", options.cloudDensityWorldScale);
+    props.getTo("cloudDensityTranslation", options.cloudDensityTranslation);
     props.getTo("seed", options.seed);
 
     auto resolve = [](const std::filesystem::path& file)
@@ -109,8 +132,19 @@ void LatticeGPISPass::setProperties(const Properties& props)
         auto path = options.sdfFile.empty() ? std::filesystem::path() : resolve(options.sdfFile);
         newField = std::make_unique<SdfField>(mpDevice, path, options.gridName);
     }
+    const bool useDensity = !options.cloudDensityFile.empty();
+    std::unique_ptr<DensityClipmap> newDensity;
+    if (useDensity && (!mpDensityClipmap || props.has("cloudDensityFile") || options.cloudDensityGrid != mOptions.cloudDensityGrid ||
+                       options.densityUseClipmap != mOptions.densityUseClipmap ||
+                       (options.densityUseClipmap && (options.densityClipmapLevels != mOptions.densityClipmapLevels ||
+                                                     options.densityClipmapResolution != mOptions.densityClipmapResolution))))
+        newDensity = std::make_unique<DensityClipmap>(mpDevice, resolve(options.cloudDensityFile), options.cloudDensityGrid,
+                                                       options.densityClipmapResolution, options.densityClipmapLevels, options.densityUseClipmap);
+    const bool frameDensity = newDensity && options.cloudEnabled && (!mpDensityClipmap || props.has("cloudDensityFile"));
     const auto bounds = newClipmap ? newClipmap->getBounds() : (newField ? newField->getBounds() : getFieldBounds());
-    applyOptions(std::move(options), bounds);
+    applyOptions(std::move(options), bounds, useDensity ? (newDensity ? newDensity.get() : mpDensityClipmap.get()) : nullptr);
+    if (newDensity) mpDensityClipmap = std::move(newDensity);
+    if (!useDensity) mpDensityClipmap.reset();
     if (!useMesh) { texture = nullptr; surfaceUV = {}; }
     if (modeChanged || bool(texture) != bool(mpBaseColor)) mpTrace = nullptr;
     mpBaseColor = std::move(texture);
@@ -120,7 +154,6 @@ void LatticeGPISPass::setProperties(const Properties& props)
         mpField.reset();
         mpMesh = std::move(mesh);
         if (newClipmap) mpClipmap = std::move(newClipmap);
-        if (!mpScene && (modeChanged || props.has("meshFile"))) frameField();
     }
     else
     {
@@ -128,13 +161,60 @@ void LatticeGPISPass::setProperties(const Properties& props)
         mpMesh.reset();
         if (newField) mpField = std::move(newField);
     }
+    if (!mpScene && (frameDensity || (useMesh && (modeChanged || props.has("meshFile"))))) frameField();
     mFileInput = (useMesh ? mOptions.meshFile : mOptions.sdfFile).string();
     mGridInput = mOptions.gridName;
     mTextureInput = mOptions.baseColorTexture.string();
+    mDensityFileInput = mOptions.cloudDensityFile.string();
+    mDensityGridInput = mOptions.cloudDensityGrid;
 }
 
-void LatticeGPISPass::Options::validate(const AABB& bounds) const
+AABB LatticeGPISPass::Options::cloudBounds(const DensityClipmap* density) const
 {
+    if (!density)
+        return AABB(cloudCenter - cloudRadii, cloudCenter + cloudRadii);
+    const auto b = density->getBounds();
+    return AABB(b.minPoint * cloudDensityWorldScale + cloudDensityTranslation, b.maxPoint * cloudDensityWorldScale + cloudDensityTranslation);
+}
+
+void LatticeGPISPass::Options::validate(const AABB& bounds, const DensityClipmap* density) const
+{
+    FALCOR_CHECK(std::isfinite(cloudExtinctionScale) && cloudExtinctionScale >= 0.f, "Cloud extinction scale must be finite and nonnegative.");
+    FALCOR_CHECK(std::isfinite(cloudDensityWorldScale) && cloudDensityWorldScale > 0.f && std::isfinite(1.f / cloudDensityWorldScale),
+                 "Cloud density world scale must be finite and positive.");
+    FALCOR_CHECK(densityClipmapResolution >= 9 && densityClipmapResolution <= 129 &&
+                 ((densityClipmapResolution - 1) & (densityClipmapResolution - 2)) == 0 &&
+                 densityClipmapLevels >= 1 && densityClipmapLevels <= 12,
+                 "Density clipmaps require 9, 17, 33, 65 or 129 nodes per axis and 1 to 12 levels.");
+    FALCOR_CHECK(!cloudDensityGrid.empty(), "Cloud density grid name must not be empty.");
+    const AABB cloud = cloudBounds(density);
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        const float lo = cloudCenter[axis] - cloudRadii[axis];
+        const float hi = cloudCenter[axis] + cloudRadii[axis];
+        FALCOR_CHECK(std::isfinite(lo) && std::isfinite(hi) && lo < hi,
+                     "The cloud center and radii must define positive, finite world-space intervals.");
+        FALCOR_CHECK(cloudColor[axis] >= 0.f && cloudColor[axis] <= 1.f, "Cloud albedo must be in [0, 1].");
+        FALCOR_CHECK(std::isfinite(cloudDensityTranslation[axis]) && std::isfinite(cloud.minPoint[axis]) &&
+                     std::isfinite(cloud.maxPoint[axis]) && cloud.minPoint[axis] < cloud.maxPoint[axis],
+                     "Cloud density bounds must be finite and representable after placement.");
+    }
+    FALCOR_CHECK(std::isfinite(cloudCorrelationLength) && cloudCorrelationLength > 0.f &&
+                 std::isfinite(cloudAmplitude) && cloudAmplitude >= 0.f && std::isfinite(cloudMeanOffset),
+                 "Cloud correlation length must be finite and positive, amplitude finite and nonnegative, and mean offset finite.");
+    if (density)
+    {
+        const float factor = 2.506628275f * cloudCorrelationLength * cloudExtinctionScale;
+        FALCOR_CHECK(std::isfinite(factor) && std::isfinite(factor * density->getMaxDensity()),
+                     "The product of cloud correlation length, extinction scale and maximum density exceeds float precision.");
+    }
+    const auto cloudExtent = cloud.extent();
+    const double cloudDiameter = density ? std::hypot(double(cloudExtent.x), double(cloudExtent.y), double(cloudExtent.z))
+                                         : 2.0 * std::max({cloudRadii.x, cloudRadii.y, cloudRadii.z});
+    const float cloudSpacing = 0.5f * cloudCorrelationLength;
+    FALCOR_CHECK(std::isfinite(float(cloudDiameter)) &&
+                 (cloudAmplitude == 0.f || (cloudSpacing > 0.f && cloudDiameter / cloudSpacing + 6.0 < 8388608.0)),
+                 "The cloud diameter must be finite and its lattice knots representable at this correlation length.");
     FALCOR_CHECK(
         std::isfinite(correlationLength) && correlationLength > 0.f && std::isfinite(correlationLengthEnd) && correlationLengthEnd > 0.f,
         "LatticeGPISPass requires finite, positive correlation lengths."
@@ -169,10 +249,12 @@ void LatticeGPISPass::Options::validate(const AABB& bounds) const
     );
 }
 
-void LatticeGPISPass::applyOptions(Options options, const AABB& bounds)
+void LatticeGPISPass::applyOptions(Options options, const AABB& bounds, const DensityClipmap* density)
 {
-    options.validate(bounds);
+    options.validate(bounds, density);
     updateStationaryWeights(options);
+    if (options.usesDualFieldShader() != mOptions.usesDualFieldShader() || options.usesDensityShader() != mOptions.usesDensityShader())
+        mpTrace = nullptr;
     mOptions = std::move(options);
     mError.clear();
     mReset = true;
@@ -236,6 +318,22 @@ Properties LatticeGPISPass::getProperties() const
     props["heightRange"] = mOptions.heightRange;
     props["latticeSpacingInEll"] = mOptions.latticeSpacingInEll;
     props["kernelRadiusInEll"] = mOptions.kernelRadiusInEll;
+    props["surfaceEnabled"] = mOptions.surfaceEnabled;
+    props["cloudEnabled"] = mOptions.cloudEnabled;
+    props["cloudCenter"] = mOptions.cloudCenter;
+    props["cloudRadii"] = mOptions.cloudRadii;
+    props["cloudCorrelationLength"] = mOptions.cloudCorrelationLength;
+    props["cloudAmplitude"] = mOptions.cloudAmplitude;
+    props["cloudMeanOffset"] = mOptions.cloudMeanOffset;
+    props["cloudColor"] = mOptions.cloudColor;
+    props["cloudDensityFile"] = mOptions.cloudDensityFile;
+    props["cloudDensityGrid"] = mOptions.cloudDensityGrid;
+    props["densityUseClipmap"] = mOptions.densityUseClipmap;
+    props["densityClipmapResolution"] = mOptions.densityClipmapResolution;
+    props["densityClipmapLevels"] = mOptions.densityClipmapLevels;
+    props["cloudExtinctionScale"] = mOptions.cloudExtinctionScale;
+    props["cloudDensityWorldScale"] = mOptions.cloudDensityWorldScale;
+    props["cloudDensityTranslation"] = mOptions.cloudDensityTranslation;
     props["seed"] = mOptions.seed;
     return props;
 }
@@ -280,7 +378,13 @@ AABB LatticeGPISPass::getFieldBounds() const
 
 void LatticeGPISPass::frameField()
 {
-    const AABB bounds = mpMesh ? mpMesh->getBounds() : getFieldBounds();
+    AABB bounds = mpMesh ? mpMesh->getBounds() : getFieldBounds();
+    if (mOptions.cloudEnabled)
+    {
+        const AABB cloudBounds = mOptions.cloudBounds(mpDensityClipmap.get());
+        if (mOptions.surfaceEnabled) bounds.include(cloudBounds);
+        else bounds = cloudBounds;
+    }
     const auto& camera = mpCamera->getData();
     const float halfExtent = std::min(length(camera.cameraU), length(camera.cameraV)) / length(camera.cameraW);
     const float distance = bounds.radius() * std::sqrt(1.f + halfExtent * halfExtent) / halfExtent;
@@ -305,13 +409,17 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
         mReset |= mController.update();
     }
     const auto& camera = (mpScene ? mpScene->getCamera() : mpCamera)->getData();
-    if (mpClipmap)
+    if (mpClipmap && mOptions.surfaceEnabled)
         mpClipmap->update(context, camera.posW);
+    if (mOptions.usesDensityShader())
+        mpDensityClipmap->update(context, (camera.posW - mOptions.cloudDensityTranslation) / mOptions.cloudDensityWorldScale);
     if (!mpTrace)
     {
         DefineList defines;
         if (mpClipmap) defines.add("GPIS_MESH_CLIPMAP", "1");
         if (mpBaseColor) defines.add("GPIS_TEXTURED_MESH", "1");
+        if (mOptions.usesDualFieldShader()) defines.add("GPIS_SECOND_FIELD", "1");
+        if (mOptions.usesDensityShader()) defines.add("GPIS_DENSITY_CLIPMAP", "1");
         mpTrace = ComputePass::create(mpDevice, "RenderPasses/LatticeGPIS/LatticeGPIS.cs.slang", "main", defines);
     }
     if (mReset)
@@ -344,6 +452,24 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
     cb["gKernelRadiusInEll"] = mOptions.kernelRadiusInEll;
     cb["gStationaryRadius"] = mStationaryRadius;
     cb["gStationaryInvVariance"] = mStationaryInvVariance;
+    if (mOptions.usesDualFieldShader())
+    {
+        cb["gSurfaceEnabled"] = uint32_t(mOptions.surfaceEnabled);
+        cb["gCloudEnabled"] = uint32_t(mOptions.cloudEnabled);
+        cb["gCloudCenter"] = mOptions.cloudCenter;
+        cb["gCloudRadii"] = mOptions.cloudRadii;
+        cb["gCloudCorrelationLength"] = mOptions.cloudCorrelationLength;
+        cb["gCloudAmplitude"] = mOptions.cloudAmplitude;
+        cb["gCloudMeanOffset"] = mOptions.cloudMeanOffset;
+        cb["gCloudColor"] = mOptions.cloudColor;
+    }
+    if (mOptions.usesDensityShader())
+    {
+        cb["gDensityExtinctionScale"] = mOptions.cloudExtinctionScale;
+        cb["gDensityTranslation"] = mOptions.cloudDensityTranslation;
+        cb["gDensityWorldScale"] = mOptions.cloudDensityWorldScale;
+        mpDensityClipmap->bind(root["gDensity"]);
+    }
     root["gStationaryWeights"] = mpStationaryWeights;
     if (mpClipmap) mpClipmap->bind(root["gField"]);
     else mpField->bind(root["gField"]);
@@ -426,7 +552,7 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
         widget.text(fmt::format("Active clipmap levels: {} / {}", active, mOptions.clipmapLevels));
         widget.text(fmt::format("Finest active voxel: {:.5g} world units",
                                 std::ldexp(mpClipmap->getFinestSpacing(), int(mOptions.clipmapLevels - active))));
-        widget.text(fmt::format("SDF nodes updated this frame: {}", mpClipmap->getUpdatedVoxelCount()));
+        widget.text(fmt::format("SDF nodes updated this frame: {}", mOptions.surfaceEnabled ? mpClipmap->getUpdatedVoxelCount() : 0));
     }
 
     if (!mpScene)
@@ -441,8 +567,34 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
         }
     }
 
+    if (mOptions.cloudEnabled) renderDensitySourceUI(widget);
     Options options = mOptions;
-    bool changed = widget.dropdown("Kernel", options.kernelMode);
+    bool changed = widget.checkbox("Render surface", options.surfaceEnabled);
+    changed |= widget.checkbox("Render cloudlike GPIS", options.cloudEnabled);
+    if (options.cloudEnabled)
+    {
+        if (auto cloud = widget.group("Cloudlike GPIS parameters"))
+        {
+            if (mpDensityClipmap)
+            {
+                changed |= cloud.var("Density world scale", options.cloudDensityWorldScale, 0.f);
+                changed |= cloud.var("Density translation", options.cloudDensityTranslation);
+                changed |= cloud.var("Extinction per unit density", options.cloudExtinctionScale, 0.f);
+            }
+            else
+            {
+                changed |= cloud.var("Center", options.cloudCenter);
+                changed |= cloud.var("Radii", options.cloudRadii, 0.f);
+                changed |= cloud.var("Mean at center", options.cloudMeanOffset);
+                cloud.tooltip("Increasing the mean makes random zero crossings rarer at the same amplitude.");
+            }
+            changed |= cloud.var("Correlation length", options.cloudCorrelationLength, 0.f);
+            changed |= cloud.var("Amplitude", options.cloudAmplitude, 0.f);
+            if (mpDensityClipmap) cloud.tooltip("For a density grid the mean scales with amplitude. Positive amplitudes share the same zero crossings; zero disables cloud hits.");
+            changed |= cloud.rgbColor("Albedo", options.cloudColor);
+        }
+    }
+    changed |= widget.dropdown("Kernel", options.kernelMode);
     changed |= widget.var("Correlation length", options.correlationLength, 0.f);
     changed |= widget.var("Amplitude", options.amplitude, 0.f);
     if (options.kernelMode == KernelMode::Linear)
@@ -462,7 +614,7 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
     {
         try
         {
-            applyOptions(std::move(options), getFieldBounds());
+            applyOptions(std::move(options), getFieldBounds(), mpDensityClipmap.get());
         }
         catch (const std::exception& e)
         {
@@ -485,4 +637,47 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
         widget.text(fmt::format(
             "World support width: {:.5g}", varying ? 2.0 * mOptions.kernelRadiusInEll * ellMin : 2.0 * mStationaryRadius * spacing
         ));
+}
+
+void LatticeGPISPass::renderDensitySourceUI(Gui::Widgets& widget)
+{
+    auto group = widget.group("Cloud density source");
+    if (!group) return;
+    group.textbox("Density VDB", mDensityFileInput);
+    group.tooltip("Use a fog density grid, or clear the file to use the analytic ellipsoid.");
+    group.textbox("Density grid", mDensityGridInput);
+    bool load = group.button("Browse density...");
+    if (load)
+    {
+        std::filesystem::path path;
+        load = openFileDialog({{"vdb", "OpenVDB density grid"}}, path);
+        if (load) mDensityFileInput = path.string();
+    }
+    load |= group.button("Apply density", true);
+    Properties props;
+    if (load)
+    {
+        props["cloudDensityFile"] = mDensityFileInput;
+        props["cloudDensityGrid"] = mDensityGridInput;
+    }
+    if (mpDensityClipmap)
+    {
+        bool useClipmap = mOptions.densityUseClipmap;
+        if (group.checkbox("Use density clipmap", useClipmap)) props["densityUseClipmap"] = useClipmap;
+    }
+    if (mpDensityClipmap && mOptions.densityUseClipmap)
+    {
+        const Gui::DropdownList sizes = {{9, "9"}, {17, "17"}, {33, "33"}, {65, "65"}, {129, "129"}};
+        uint32_t resolution = mOptions.densityClipmapResolution;
+        uint32_t levels = mOptions.densityClipmapLevels;
+        if (group.dropdown("Density nodes per axis", sizes, resolution)) props["densityClipmapResolution"] = resolution;
+        if (group.var("Density levels", levels, 1u, 12u)) props["densityClipmapLevels"] = levels;
+        group.text(fmt::format("Active density levels: {}   Nodes updated: {}", mpDensityClipmap->getActiveLevelCount(),
+                               mpDensityClipmap->getUpdatedVoxelCount()));
+    }
+    if (!props.empty())
+    {
+        try { setProperties(props); }
+        catch (const std::exception& e) { mError = e.what(); }
+    }
 }

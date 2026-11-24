@@ -1,0 +1,8 @@
+sceneBuilder.importScene("Ridge.obj")
+
+camera = Camera()
+camera.position = float3(0.65, 1.90, 6.3)
+camera.target = float3(0.0, 1.08, 0.0)
+camera.up = float3(0.0, 1.0, 0.0)
+camera.focalLength = 43.0
+sceneBuilder.addCamera(camera)
