@@ -31,5 +31,7 @@ private:
     Falcor::ref<Falcor::Camera> mpFallbackCamera = Falcor::Camera::create();
     Falcor::ref<Falcor::Scene> mpScene;
     Falcor::ref<Falcor::ComputePass> mpTrace;
+    Falcor::ref<Falcor::ComputePass> mpShadow;
+    Falcor::ref<Falcor::Texture> mpHitDistance;
     std::string mError;
 };

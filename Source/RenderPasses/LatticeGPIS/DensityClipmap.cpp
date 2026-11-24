@@ -23,6 +23,7 @@ using namespace Falcor;
 namespace
 {
 constexpr float kVacuumMean = 32.f;
+constexpr int kBakedBrickWidth = 8;
 constexpr double kSqrtTwoPi = 2.5066282746310005;
 
 openvdb::FloatGrid::Ptr readFloatGrid(const std::filesystem::path& path, const std::string& name)
@@ -98,8 +99,32 @@ AABB transformBox(const openvdb::math::Transform& transform, openvdb::Vec3d lo, 
     return box;
 }
 
+ref<Texture> makeBakedBricks(const ref<Device>& device, const float* nodes, uint3 dim)
+{
+    const uint3 brickDim = (dim - 1u + uint32_t(kBakedBrickWidth - 1)) / uint32_t(kBakedBrickWidth);
+    std::vector<uint8_t> mask(size_t(brickDim.x) * brickDim.y * brickDim.z);
+    size_t index = 0;
+    for (uint32_t z = 0; z < brickDim.z; ++z)
+        for (uint32_t y = 0; y < brickDim.y; ++y)
+            for (uint32_t x = 0; x < brickDim.x; ++x, ++index)
+            {
+                const uint3 lo = uint3(x, y, z) * uint32_t(kBakedBrickWidth);
+                // B trilinear cells touch B+1 nodes. A sample on a shared face,
+                // edge or corner must mark each incident brick as occupied.
+                const uint3 hi = min(lo + uint32_t(kBakedBrickWidth), dim - 1u);
+                for (uint32_t iz = lo.z; iz <= hi.z && mask[index] == 0; ++iz)
+                    for (uint32_t iy = lo.y; iy <= hi.y && mask[index] == 0; ++iy)
+                    {
+                        const float* row = nodes + (size_t(iz) * dim.y + iy) * dim.x;
+                        mask[index] = std::any_of(row + lo.x, row + hi.x + 1, [](float u) { return u != kVacuumMean; });
+                    }
+            }
+    return device->createTexture3D(brickDim.x, brickDim.y, brickDim.z, ResourceFormat::R8Uint, 1, mask.data(),
+                                   ResourceBindFlags::ShaderResource);
+}
+
 ref<Texture> uploadNativeDensity(const ref<Device>& device, const openvdb::FloatGrid& grid,
-                                 const openvdb::CoordBBox& valuesBox)
+                                 const openvdb::CoordBBox& valuesBox, ref<Texture>* bakedBricks)
 {
     const uint32_t maxDim = device->getGfxDevice()->getDeviceInfo().limits.maxTextureDimension3D;
     uint3 dim;
@@ -122,6 +147,7 @@ ref<Texture> uploadNativeDensity(const ref<Device>& device, const openvdb::Float
         openvdb::tools::Dense<float, openvdb::tools::LayoutXYZ> dense(padded);
         openvdb::tools::copyToDense(grid, dense);
         device->getRenderContext()->updateTextureData(texture.get(), dense.data());
+        if (bakedBricks) *bakedBricks = makeBakedBricks(device, dense.data(), dim);
     }
     catch (const std::exception& e)
     {
@@ -182,7 +208,7 @@ DensityClipmap::DensityClipmap(ref<Device> device, const std::filesystem::path& 
 
     if (!useClipmap)
     {
-        mpNativeValues = uploadNativeDensity(device, *grid, box);
+        mpNativeValues = uploadNativeDensity(device, *grid, box, baked ? &mpBakedBricks : nullptr);
         mWorldOrigin = toFloat3(transform.indexToWorld(lo));
         mIndexMin = float3(0.f);
         mIndexMax = toFloat3(hi - lo);
@@ -340,6 +366,11 @@ void DensityClipmap::bind(const ShaderVar& var) const
         var["clipCount"] = 0;
         var["clipFirstLevel"] = 0;
         var["clipLevels"][0] = float4(0.f, 0.f, 0.f, 1.f);
+        if (mpBakedBricks && var.hasMember("bakedBricks"))
+        {
+            var["bakedBricks"] = mpBakedBricks;
+            var["bakedBrickWidth"] = kBakedBrickWidth;
+        }
     }
     var["boundsMin"] = mTraceBounds.minPoint;
     var["boundsMax"] = mTraceBounds.maxPoint;

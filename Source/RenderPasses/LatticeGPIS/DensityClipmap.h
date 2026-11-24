@@ -33,6 +33,7 @@ private:
                    uint32_t resolution, uint32_t levelCount, bool useClipmap, bool baked);
     std::unique_ptr<MeshClipmap> mpCache;
     Falcor::ref<Falcor::Texture> mpNativeValues;
+    Falcor::ref<Falcor::Texture> mpBakedBricks;
     Falcor::AABB mBounds, mTraceBounds;
     Falcor::float4x4 mWorldToIndex;
     Falcor::float3 mWorldOrigin, mIndexMin, mIndexMax;

@@ -87,6 +87,8 @@ void BakedGPISPass::compile(RenderContext*, const CompileData& data)
 {
     mpFallbackCamera->setAspectRatio(float(data.defaultTexDims.x) / float(data.defaultTexDims.y));
     mpTrace.reset();
+    mpShadow.reset();
+    mpHitDistance.reset();
     mReset = true;
 }
 
@@ -115,30 +117,53 @@ void BakedGPISPass::execute(RenderContext* context, const RenderData& data)
         if (transmission) context->clearUAV(transmission->getUAV().get(), float4(1.f));
         return;
     }
+    const auto& output = color ? color : transmission;
+    const uint2 size(output->getWidth(), output->getHeight());
     if (!mpTrace)
     {
+        constexpr char kShader[] = "RenderPasses/LatticeGPIS/BakedGPIS.cs.slang";
         DefineList defines;
         defines.add("WRITE_RADIANCE", color ? "1" : "0");
         defines.add("WRITE_TRANSMITTANCE", transmission ? "1" : "0");
-        mpTrace = ComputePass::create(mpDevice, "RenderPasses/LatticeGPIS/BakedGPIS.cs.slang", "main", defines);
+        defines.add("SHADOW_STAGE", "0");
+        mpTrace = ComputePass::create(mpDevice, kShader, "main", defines);
+        if (color)
+        {
+            defines.add("SHADOW_STAGE", "1");
+            mpShadow = ComputePass::create(mpDevice, kShader, "main", defines);
+            mpHitDistance = mpDevice->createTexture2D(
+                size.x, size.y, ResourceFormat::R32Float, 1, 1, nullptr, ResourceBindFlags::UnorderedAccess | ResourceBindFlags::ShaderResource
+            );
+        }
     }
     const auto& camera = (mpScene ? mpScene->getCamera() : mpFallbackCamera)->getData();
-    const auto& output = color ? color : transmission;
-    const uint2 size(output->getWidth(), output->getHeight());
+    const uint32_t seed = mSeed + mFrameIndex++;
+    auto bind = [&](const ShaderVar& vars)
+    {
+        mpMean->bind(vars["gDensity"]);
+        vars["gFrameDim"] = size;
+        vars["gSeed"] = seed;
+        vars["gCameraPosition"] = camera.posW;
+        vars["gCameraU"] = camera.cameraU;
+        vars["gCameraV"] = camera.cameraV;
+        vars["gCameraW"] = camera.cameraW;
+        vars["gTranslation"] = mTranslation;
+        vars["gWorldScale"] = mpMean->getBakedWorldScale();
+        vars["gEll"] = mpMean->getBakedCorrelationLength();
+    };
     auto vars = mpTrace->getRootVar();
-    mpMean->bind(vars["gDensity"]);
-    vars["gFrameDim"] = size;
-    vars["gSeed"] = mSeed + mFrameIndex++;
-    vars["gCameraPosition"] = camera.posW;
-    vars["gCameraU"] = camera.cameraU;
-    vars["gCameraV"] = camera.cameraV;
-    vars["gCameraW"] = camera.cameraW;
-    vars["gTranslation"] = mTranslation;
-    vars["gWorldScale"] = mpMean->getBakedWorldScale();
-    vars["gEll"] = mpMean->getBakedCorrelationLength();
-    if (color) vars["gColor"] = color;
+    bind(vars);
+    if (color) vars["gHitDistanceOutput"] = mpHitDistance;
     if (transmission) vars["gTransmission"] = transmission;
     mpTrace->execute(context, uint3(size, 1));
+    if (color)
+    {
+        auto shadow = mpShadow->getRootVar();
+        bind(shadow);
+        shadow["gHitDistanceInput"] = mpHitDistance;
+        shadow["gColor"] = color;
+        mpShadow->execute(context, uint3(size, 1));
+    }
 }
 
 void BakedGPISPass::renderUI(Gui::Widgets& widget)

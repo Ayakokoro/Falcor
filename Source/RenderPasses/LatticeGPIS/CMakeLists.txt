@@ -25,6 +25,7 @@ target_sources(LatticeGPISPass PRIVATE
     BakedGPISPass.cpp
     BakedGPISPass.h
     BakedGPIS.cs.slang
+    BakedLatticeNoise.slang
     LatticeNoise.slang
     Intersection.slang
     CloudGPIS.slang
