@@ -6,6 +6,11 @@ target_sources(LatticeGPISPass PRIVATE
     LatticeGPIS.cs.slang
     LatticeNoise.slang
     Intersection.slang
+    MeshClipmap.h
+    MeshClipmap.cpp
+    UploadMeshClipmap.cs.slang
+    MeshDistanceField.h
+    MeshDistanceField.cpp
     SdfField.h
     SdfField.cpp
     SdfField.slang

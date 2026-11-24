@@ -5,6 +5,17 @@ one sample to the linear HDR average before filmic tone mapping. The default
 field is the original knob formula baked at 0.01 world units on the GPU.
 For an external OpenVDB float grid, pass sdfFile and gridName to the factory.
 
+For a closed static triangle mesh, open GPIS > Browse and choose an OBJ, PLY
+or glTF file. Alternatively set meshFile when creating the graph:
+    graph = render_graph_LatticeGPIS(meshFile=r"D:/models/relief.obj",
+                                     clipmapResolution=33, clipmapLevels=8)
+The coarsest level covers the model. Finer levels follow the camera and halve
+the voxel width at each step. The panel reports the finest active voxel width
+in model units. Increase the level count to resolve smaller details up close
+without increasing the cost of each grid. Supported grids have 9, 17, 33, 65
+or 129 nodes per axis, and 1 to 12 levels. Set amplitude to 0 to inspect the
+mesh geometry alone; the noise lattice spacing is independent of SDF resolution.
+
 Both kernel modes accept latticeSpacingInEll (default 0.5) and
 kernelRadiusInEll (default 3.0). Spacing is measured in units of the
 shortest correlation length and support radius in units of the local length.

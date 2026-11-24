@@ -2,6 +2,8 @@
 #include "Falcor.h"
 #include "Core/Pass/ComputePass.h"
 #include "RenderGraph/RenderPass.h"
+#include "MeshClipmap.h"
+#include "MeshDistanceField.h"
 #include "SdfField.h"
 
 using namespace Falcor;
@@ -34,6 +36,9 @@ private:
     struct Options
     {
         std::filesystem::path sdfFile;
+        std::filesystem::path meshFile;
+        uint32_t clipmapResolution = 33;
+        uint32_t clipmapLevels = 8;
         std::string gridName = "sdf";
         KernelMode kernelMode = KernelMode::Stationary;
         float correlationLength = 0.2f;
@@ -53,8 +58,12 @@ private:
 
     void applyOptions(Options options, const AABB& bounds);
     void updateStationaryWeights(const Options& options);
+    AABB getFieldBounds() const;
+    void frameField();
     Options mOptions;
     std::unique_ptr<SdfField> mpField;
+    std::shared_ptr<const MeshDistanceField> mpMesh;
+    std::unique_ptr<MeshClipmap> mpClipmap;
     ref<ComputePass> mpTrace;
     ref<Buffer> mpStationaryWeights;
     float mStationarySpacingInEll = 0.f;
@@ -65,6 +74,7 @@ private:
     FirstPersonCameraController mController{mpCamera};
     uint32_t mFrameIndex = 0;
     bool mReset = true;
+    float3 mSpeedSamplePosition = float3(0.f);
     std::string mFileInput, mGridInput, mError;
 };
 

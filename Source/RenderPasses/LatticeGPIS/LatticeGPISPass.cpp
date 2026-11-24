@@ -32,6 +32,13 @@ void LatticeGPISPass::setProperties(const Properties& props)
 
     Options options = mOptions;
     props.getTo("sdfFile", options.sdfFile);
+    props.getTo("meshFile", options.meshFile);
+    props.getTo("clipmapResolution", options.clipmapResolution);
+    props.getTo("clipmapLevels", options.clipmapLevels);
+    FALCOR_CHECK(!(props.has("sdfFile") && props.has("meshFile") && !options.sdfFile.empty() && !options.meshFile.empty()),
+                 "Choose a single geometry source, either meshFile or sdfFile.");
+    if (props.has("sdfFile") && !options.sdfFile.empty()) options.meshFile.clear();
+    if (props.has("meshFile") && !options.meshFile.empty()) options.sdfFile.clear();
     props.getTo("gridName", options.gridName);
     props.getTo("kernelMode", options.kernelMode);
     props.getTo("correlationLength", options.correlationLength);
@@ -43,22 +50,48 @@ void LatticeGPISPass::setProperties(const Properties& props)
     props.getTo("kernelRadiusInEll", options.kernelRadiusInEll);
     props.getTo("seed", options.seed);
 
-    std::unique_ptr<SdfField> newField;
-    const bool reloadFile = !options.sdfFile.empty() && props.has("sdfFile");
-    if (!mpField || reloadFile || options.sdfFile != mOptions.sdfFile || options.gridName != mOptions.gridName)
+    auto resolve = [](const std::filesystem::path& file)
     {
-        std::filesystem::path path;
-        if (!options.sdfFile.empty())
-        {
-            path = AssetResolver::getDefaultResolver().resolvePath(options.sdfFile);
-            FALCOR_CHECK(!path.empty(), "Cannot find SDF file '{}'.", options.sdfFile);
-        }
+        auto path = AssetResolver::getDefaultResolver().resolvePath(file);
+        FALCOR_CHECK(!path.empty(), "Cannot find geometry file '{}'.", file);
+        return path;
+    };
+
+    const bool useMesh = !options.meshFile.empty();
+    const bool modeChanged = useMesh != bool(mpClipmap);
+    auto mesh = mpMesh;
+    std::unique_ptr<MeshClipmap> newClipmap;
+    std::unique_ptr<SdfField> newField;
+    if (useMesh)
+    {
+        const bool reloadMesh = !mesh || props.has("meshFile");
+        if (reloadMesh) mesh = std::make_shared<MeshDistanceField>(resolve(options.meshFile));
+        if (reloadMesh || options.clipmapResolution != mOptions.clipmapResolution || options.clipmapLevels != mOptions.clipmapLevels)
+            newClipmap = std::make_unique<MeshClipmap>(mpDevice, mesh, options.clipmapResolution, options.clipmapLevels);
+    }
+    else if (!mpField || (!options.sdfFile.empty() && props.has("sdfFile")) ||
+             options.sdfFile != mOptions.sdfFile || options.gridName != mOptions.gridName)
+    {
+        auto path = options.sdfFile.empty() ? std::filesystem::path() : resolve(options.sdfFile);
         newField = std::make_unique<SdfField>(mpDevice, path, options.gridName);
     }
-    applyOptions(std::move(options), (newField ? newField : mpField)->getBounds());
-    if (newField)
-        mpField = std::move(newField);
-    mFileInput = mOptions.sdfFile.string();
+    const auto bounds = newClipmap ? newClipmap->getBounds() : (newField ? newField->getBounds() : getFieldBounds());
+    applyOptions(std::move(options), bounds);
+    if (modeChanged) mpTrace = nullptr;
+    if (useMesh)
+    {
+        mpField.reset();
+        mpMesh = std::move(mesh);
+        if (newClipmap) mpClipmap = std::move(newClipmap);
+        if (!mpScene && (modeChanged || props.has("meshFile"))) frameField();
+    }
+    else
+    {
+        mpClipmap.reset();
+        mpMesh.reset();
+        if (newField) mpField = std::move(newField);
+    }
+    mFileInput = (useMesh ? mOptions.meshFile : mOptions.sdfFile).string();
     mGridInput = mOptions.gridName;
 }
 
@@ -152,6 +185,9 @@ Properties LatticeGPISPass::getProperties() const
 {
     Properties props;
     props["sdfFile"] = mOptions.sdfFile;
+    props["meshFile"] = mOptions.meshFile;
+    props["clipmapResolution"] = mOptions.clipmapResolution;
+    props["clipmapLevels"] = mOptions.clipmapLevels;
     props["gridName"] = mOptions.gridName;
     props["kernelMode"] = mOptions.kernelMode;
     props["correlationLength"] = mOptions.correlationLength;
@@ -178,8 +214,6 @@ RenderPassReflection LatticeGPISPass::reflect(const CompileData& compileData)
 void LatticeGPISPass::compile(RenderContext* context, const CompileData& compileData)
 {
     mpCamera->setAspectRatio(float(compileData.defaultTexDims.x) / float(compileData.defaultTexDims.y));
-    if (!mpTrace)
-        mpTrace = ComputePass::create(mpDevice, "RenderPasses/LatticeGPIS/LatticeGPIS.cs.slang");
     mReset = true;
 }
 
@@ -200,10 +234,46 @@ bool LatticeGPISPass::onKeyEvent(const KeyboardEvent& event)
     return !mpScene && mController.onKeyEvent(event);
 }
 
+AABB LatticeGPISPass::getFieldBounds() const
+{
+    return mpClipmap ? mpClipmap->getBounds() : mpField->getBounds();
+}
+
+void LatticeGPISPass::frameField()
+{
+    const AABB bounds = mpMesh ? mpMesh->getBounds() : getFieldBounds();
+    const auto& camera = mpCamera->getData();
+    const float halfExtent = std::min(length(camera.cameraU), length(camera.cameraV)) / length(camera.cameraW);
+    const float distance = bounds.radius() * std::sqrt(1.f + halfExtent * halfExtent) / halfExtent;
+    mpCamera->setPosition(bounds.center() - normalize(camera.cameraW) * distance);
+    mpCamera->setTarget(bounds.center());
+    mReset = true;
+}
+
 void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderData)
 {
     if (!mpScene)
+    {
+        // Scale navigation to the distance from the mesh so fine detail remains approachable on large models.
+        if (mpMesh && (mReset || any(mpCamera->getPosition() != mSpeedSamplePosition)))
+        {
+            mSpeedSamplePosition = mpCamera->getPosition();
+            const float distance = std::abs(mpMesh->signedDistance(mSpeedSamplePosition));
+            mController.setCameraSpeed(std::max(2.f * mpClipmap->getFinestSpacing(), distance));
+        }
+        else if (!mpMesh)
+            mController.setCameraSpeed(1.f);
         mReset |= mController.update();
+    }
+    const auto& camera = (mpScene ? mpScene->getCamera() : mpCamera)->getData();
+    if (mpClipmap)
+        mpClipmap->update(context, camera.posW);
+    if (!mpTrace)
+    {
+        DefineList defines;
+        if (mpClipmap) defines.add("GPIS_MESH_CLIPMAP", "1");
+        mpTrace = ComputePass::create(mpDevice, "RenderPasses/LatticeGPIS/LatticeGPIS.cs.slang", "main", defines);
+    }
     if (mReset)
     {
         auto& dict = renderData.getDictionary();
@@ -217,7 +287,6 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
     uint2 dims(output->getWidth(), output->getHeight());
     auto root = mpTrace->getRootVar();
     auto cb = root["CB"];
-    const auto& camera = (mpScene ? mpScene->getCamera() : mpCamera)->getData();
     cb["gCameraPosition"] = camera.posW;
     cb["gCameraU"] = camera.cameraU;
     cb["gCameraV"] = camera.cameraV;
@@ -236,7 +305,8 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
     cb["gStationaryRadius"] = mStationaryRadius;
     cb["gStationaryInvVariance"] = mStationaryInvVariance;
     root["gStationaryWeights"] = mpStationaryWeights;
-    mpField->bind(root["gField"]);
+    if (mpClipmap) mpClipmap->bind(root["gField"]);
+    else mpField->bind(root["gField"]);
     root["gOutput"] = output;
     mpTrace->execute(context, uint3(dims, 1));
     ++mFrameIndex;
@@ -244,13 +314,24 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
 
 void LatticeGPISPass::renderUI(Gui::Widgets& widget)
 {
-    widget.textbox("SDF file", mFileInput);
-    widget.tooltip("Leave empty to render the reference shaderball.");
-    widget.textbox("Grid name", mGridInput);
-    if (widget.button("Load SDF"))
+    widget.textbox("Geometry file", mFileInput);
+    widget.tooltip("Choose a closed triangle mesh or an OpenVDB field. Leave empty for the reference shaderball.");
+    bool load = widget.button("Browse...");
+    if (load)
+    {
+        std::filesystem::path file;
+        load = openFileDialog({{"obj", "Wavefront mesh"}, {"ply", "PLY mesh"}, {"gltf", "glTF mesh"}, {"glb", "Binary glTF mesh"},
+                               {"vdb", "OpenVDB field"}}, file);
+        if (load) mFileInput = file.string();
+    }
+    load |= widget.button("Load geometry", true);
+    const bool meshInput = !mFileInput.empty() && !hasExtension(mFileInput, "vdb");
+    if (!meshInput) widget.textbox("Grid name", mGridInput);
+    if (load)
     {
         Properties props;
-        props["sdfFile"] = mFileInput;
+        props["meshFile"] = meshInput ? mFileInput : "";
+        props["sdfFile"] = meshInput ? "" : mFileInput;
         props["gridName"] = mGridInput;
         try
         {
@@ -262,18 +343,31 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
         }
     }
 
+    if (mpClipmap)
+    {
+        uint32_t levels = mOptions.clipmapLevels;
+        uint32_t resolution = mOptions.clipmapResolution;
+        const Gui::DropdownList resolutions = {{9, "9"}, {17, "17"}, {33, "33"}, {65, "65"}, {129, "129"}};
+        bool changed = widget.dropdown("Clipmap nodes per axis", resolutions, resolution);
+        changed |= widget.var("Clipmap levels", levels, 1u, 12u);
+        if (changed)
+        {
+            Properties props;
+            props["clipmapResolution"] = resolution;
+            props["clipmapLevels"] = levels;
+            try { setProperties(props); }
+            catch (const std::exception& e) { mError = e.what(); }
+        }
+        const uint32_t active = mpClipmap->getActiveLevelCount();
+        widget.text(fmt::format("Active clipmap levels: {} / {}", active, mOptions.clipmapLevels));
+        widget.text(fmt::format("Finest active voxel: {:.5g} world units",
+                                std::ldexp(mpClipmap->getFinestSpacing(), int(mOptions.clipmapLevels - active))));
+        widget.text(fmt::format("SDF nodes updated this frame: {}", mpClipmap->getUpdatedVoxelCount()));
+    }
+
     if (!mpScene)
     {
-        if (widget.button("Frame SDF"))
-        {
-            const AABB bounds = mpField->getBounds();
-            const auto& camera = mpCamera->getData();
-            const float halfExtent = std::min(length(camera.cameraU), length(camera.cameraV)) / length(camera.cameraW);
-            float distance = bounds.radius() * std::sqrt(1.f + halfExtent * halfExtent) / halfExtent;
-            mpCamera->setPosition(bounds.center() - normalize(camera.cameraW) * distance);
-            mpCamera->setTarget(bounds.center());
-            mReset = true;
-        }
+        if (widget.button("Frame SDF")) frameField();
         if (widget.button("Shaderball camera", true))
         {
             mpCamera->setPosition(kReferenceEye);
@@ -304,7 +398,7 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
     {
         try
         {
-            applyOptions(std::move(options), mpField->getBounds());
+            applyOptions(std::move(options), getFieldBounds());
         }
         catch (const std::exception& e)
         {

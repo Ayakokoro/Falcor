@@ -1,6 +1,4 @@
 #include "SdfField.slang"
-
-uniform SdfField gField;
 #include "Intersection.slang"
 
 RWTexture2D<float4> gOutput;
@@ -42,10 +40,16 @@ bool clipBox(float3 origin, float3 direction, float3 lower, float3 upper, inout 
     return span.x < span.y;
 }
 
-// Tungsten's shaderball uses a one-sided 5 x 5 quad rotated 160 degrees about X.
-// It specifies emitted power, which is converted to radiance for both emitters.
 float3 incidentLight(float3 origin, float3 direction, out float lightDistance)
 {
+#if GPIS_MESH_CLIPMAP
+    // A distant light and sky preserve their angular size at every mesh scale.
+    lightDistance = 1.e30f;
+    float sky = saturate(0.5f + 0.5f * direction.y);
+    float key = pow(saturate(dot(direction, normalize(float3(-0.55f, 0.8f, 0.3f)))), 16.f);
+    return lerp(float3(0.09f, 0.08f, 0.07f), float3(0.55f, 0.68f, 0.86f), sky) + key * float3(3.f, 2.8f, 2.5f);
+#else
+    // The reference shaderball uses a one-sided 5 x 5 quad rotated 160 degrees about X.
     static const float invPi = 0.31830988618f;
     static const float3 lightCenter = float3(0.f, 5.f, 2.01f);
     static const float3 lightNormal = float3(0.f, -0.93969262f, 0.34202014f);
@@ -63,6 +67,7 @@ float3 incidentLight(float3 origin, float3 direction, out float lightDistance)
     }
     lightDistance = 1.e30f;
     return float3(2.5f, 2.5f, 1.5f) * (0.25f * invPi);
+#endif
 }
 
 float tentSample(uint bits)
