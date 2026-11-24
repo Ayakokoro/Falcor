@@ -1,0 +1,18 @@
+sceneBuilder.importScene("UVSphere.obj")
+
+camera = Camera()
+camera.position = float3(0.0, 0.18, 3.2)
+camera.target = float3(0.0, 0.0, 0.0)
+camera.up = float3(0.0, 1.0, 0.0)
+camera.focalLength = 30.0
+sceneBuilder.addCamera(camera)
+
+key = DirectionalLight("Key")
+key.direction = float3(0.45, -0.60, -0.66)
+key.intensity = float3(2.4, 2.4, 2.4)
+sceneBuilder.addLight(key)
+
+fill = DirectionalLight("Fill")
+fill.direction = float3(-0.77, 0.26, -0.58)
+fill.intensity = float3(0.75, 0.75, 0.75)
+sceneBuilder.addLight(fill)

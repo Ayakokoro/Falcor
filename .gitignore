@@ -38,7 +38,9 @@
 /LargeSceneVoxelization/build/
 /LargeSceneVoxelization/tmp*/
 
-/Scene/
+/Scene/*
+!/Scene/UVSphere/
+!/Scene/UVSphere/UVSphere.obj
 
 /plans/
 

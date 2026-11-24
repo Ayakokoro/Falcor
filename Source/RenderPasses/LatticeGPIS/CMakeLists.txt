@@ -11,6 +11,7 @@ target_sources(LatticeGPISPass PRIVATE
     UploadMeshClipmap.cs.slang
     MeshDistanceField.h
     MeshDistanceField.cpp
+    MeshSurfaceUV.slang
     SdfField.h
     SdfField.cpp
     SdfField.slang
@@ -18,6 +19,6 @@ target_sources(LatticeGPISPass PRIVATE
 )
 
 # OpenVDB's float-grid codec uses Imath's half conversion table.
-target_link_libraries(LatticeGPISPass PRIVATE OpenVDB OpenEXR)
+target_link_libraries(LatticeGPISPass PRIVATE OpenVDB OpenEXR assimp)
 target_copy_shaders(LatticeGPISPass RenderPasses/LatticeGPIS)
 target_source_group(LatticeGPISPass "RenderPasses")

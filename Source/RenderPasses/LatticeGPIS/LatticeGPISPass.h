@@ -37,6 +37,7 @@ private:
     {
         std::filesystem::path sdfFile;
         std::filesystem::path meshFile;
+        std::filesystem::path baseColorTexture;
         uint32_t clipmapResolution = 33;
         uint32_t clipmapLevels = 8;
         std::string gridName = "sdf";
@@ -63,6 +64,9 @@ private:
     Options mOptions;
     std::unique_ptr<SdfField> mpField;
     std::shared_ptr<const MeshDistanceField> mpMesh;
+    MeshDistanceField::SurfaceUVBuffers mSurfaceUV;
+    ref<Texture> mpBaseColor;
+    ref<Sampler> mpMeshSampler;
     std::unique_ptr<MeshClipmap> mpClipmap;
     ref<ComputePass> mpTrace;
     ref<Buffer> mpStationaryWeights;
@@ -75,7 +79,7 @@ private:
     uint32_t mFrameIndex = 0;
     bool mReset = true;
     float3 mSpeedSamplePosition = float3(0.f);
-    std::string mFileInput, mGridInput, mError;
+    std::string mFileInput, mGridInput, mTextureInput, mError;
 };
 
 FALCOR_ENUM_REGISTER(LatticeGPISPass::KernelMode);

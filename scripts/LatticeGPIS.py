@@ -16,6 +16,12 @@ without increasing the cost of each grid. Supported grids have 9, 17, 33, 65
 or 129 nodes per axis, and 1 to 12 levels. Set amplitude to 0 to inspect the
 mesh geometry alone; the noise lattice spacing is independent of SDF resolution.
 
+For meshes with UVs, GPIS can use an external base-color texture shared by
+the triangles (for OBJ, the material's map_Kd). Override it with the
+baseColorTexture property or GPIS > Browse texture. At each hit the pass
+projects onto the nearest source triangle and interpolates its corner UVs.
+Open Scene/UVSphere/RenderGPIS.py in Mogwai for a textured example.
+
 Both kernel modes accept latticeSpacingInEll (default 0.5) and
 kernelRadiusInEll (default 3.0). Spacing is measured in units of the
 shortest correlation length and support radius in units of the local length.

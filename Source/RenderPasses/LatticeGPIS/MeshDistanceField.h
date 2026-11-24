@@ -1,4 +1,5 @@
 #pragma once
+#include "Core/API/Buffer.h"
 #include "Utils/Math/AABB.h"
 #include <filesystem>
 #include <vector>
@@ -7,9 +8,19 @@
 class MeshDistanceField
 {
 public:
-    explicit MeshDistanceField(const std::filesystem::path& path);
+    explicit MeshDistanceField(const std::filesystem::path& path, bool retainTexCoords = false);
     Falcor::AABB getBounds() const { return mNodes.front().bounds; }
     float signedDistance(Falcor::float3 worldPosition) const;
+    /** UVs are retained for a common base-color map, or when explicitly requested for a texture override. */
+    bool hasTexCoords() const { return !mTexCoords.empty(); }
+    const std::filesystem::path& getBaseColorTexturePath() const { return mBaseColorTexturePath; }
+
+    struct SurfaceUVBuffers
+    {
+        Falcor::ref<Falcor::Buffer> nodes, triangles;
+        void bind(const Falcor::ShaderVar& root) const;
+    };
+    SurfaceUVBuffers createSurfaceUVBuffers(Falcor::ref<Falcor::Device> device) const;
 
     /** Evaluate consecutive samples along +X from an indexed grid origin. Splitting a row into slabs preserves each sample position. */
     void sampleRow(Falcor::float3 rowOrigin, float voxelSize, int count, float* result, int firstXIndex = 0) const;
@@ -18,6 +29,7 @@ private:
     struct Triangle
     {
         Falcor::float3 a, b, c;
+        uint32_t uvIndex = 0; // Keeps per-corner UVs associated with this face through BVH reordering.
         double distanceSquared(Falcor::float3 p) const;
         bool intersectX(float y, float z, double& x) const;
     };
@@ -33,4 +45,7 @@ private:
 
     std::vector<Triangle> mTriangles;
     std::vector<Node> mNodes;
+    struct TexCoords { Falcor::float2 a, b, c; };
+    std::vector<TexCoords> mTexCoords;
+    std::filesystem::path mBaseColorTexturePath;
 };

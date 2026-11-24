@@ -1,7 +1,13 @@
 #include "MeshDistanceField.h"
+#include "Core/API/Device.h"
 #include "Core/Error.h"
-#include "Scene/TriangleMesh.h"
+#include "Core/Platform/OS.h"
+#include "Core/Program/ShaderVar.h"
 #include "Utils/StringFormatters.h"
+#include <assimp/DefaultIOSystem.h>
+#include <assimp/Importer.hpp>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -35,6 +41,66 @@ double edgeDistanceSquared(Vec3d edge, Vec3d delta)
 bool ownsEdge(float3 a, float3 b)
 {
     return a.z < b.z || (a.z == b.z && a.y > b.y);
+}
+
+// Assimp returns map_Kd as written in the MTL, without its source library path.
+// Capture the library directory during the ordinary OBJ import (including OBJ.GZ).
+class ObjMaterialIO : public Assimp::DefaultIOSystem
+{
+public:
+    explicit ObjMaterialIO(std::filesystem::path directory) : mDirectory(std::move(directory)) {}
+
+    bool Exists(const char* file) const override
+    {
+        return DefaultIOSystem::Exists((mDirectory / std::filesystem::u8path(file)).u8string().c_str());
+    }
+
+    Assimp::IOStream* Open(const char* file, const char* mode = "rb") override
+    {
+        const auto path = (mDirectory / std::filesystem::u8path(file)).lexically_normal();
+        auto* stream = DefaultIOSystem::Open(path.u8string().c_str(), mode);
+        if (stream && hasExtension(path, "mtl"))
+        {
+            if (mLibraryDirectory.empty()) mLibraryDirectory = path.parent_path();
+            else if (mLibraryDirectory != path.parent_path()) mMultipleDirectories = true;
+        }
+        return stream;
+    }
+
+    std::filesystem::path texturePath(const std::filesystem::path& texture) const
+    {
+        if (texture.is_absolute()) return texture.lexically_normal();
+        // Assimp does not say which library owns a merged material. An explicit texture override
+        // remains available when libraries in different directories could mean different files.
+        if (mMultipleDirectories) return {};
+        auto fromObj = (mDirectory / texture).lexically_normal();
+        if (mLibraryDirectory.empty() || mLibraryDirectory == mDirectory) return fromObj;
+        auto fromMtl = (mLibraryDirectory / texture).lexically_normal();
+        return std::filesystem::is_regular_file(fromMtl) || !std::filesystem::is_regular_file(fromObj) ? fromMtl : fromObj;
+    }
+
+private:
+    std::filesystem::path mDirectory, mLibraryDirectory;
+    bool mMultipleDirectories = false;
+};
+
+std::filesystem::path baseColorMap(const aiScene& scene, const aiMesh& mesh, const std::filesystem::path& directory,
+                                   const ObjMaterialIO* objIO)
+{
+    if (mesh.mMaterialIndex >= scene.mNumMaterials) return {};
+    const aiMaterial& material = *scene.mMaterials[mesh.mMaterialIndex];
+    const auto type = material.GetTextureCount(aiTextureType_BASE_COLOR) ? aiTextureType_BASE_COLOR : aiTextureType_DIFFUSE;
+    aiString texture;
+    aiTextureMapping mapping = aiTextureMapping_UV;
+    unsigned int uvSet = 0;
+    if (material.GetTextureCount(type) != 1 ||
+        material.GetTexture(type, 0, &texture, &mapping, &uvSet) != AI_SUCCESS ||
+        mapping != aiTextureMapping_UV || uvSet != 0 || !texture.length || scene.GetEmbeddedTexture(texture.C_Str()))
+        return {};
+    std::string textureName = texture.C_Str();
+    std::replace(textureName.begin(), textureName.end(), '\\', '/');
+    const auto texturePath = std::filesystem::u8path(textureName);
+    return objIO ? objIO->texturePath(texturePath) : (directory / texturePath).lexically_normal();
 }
 }
 
@@ -80,25 +146,113 @@ bool MeshDistanceField::Triangle::intersectX(float y, float z, double& x) const
     return true;
 }
 
-MeshDistanceField::MeshDistanceField(const std::filesystem::path& path)
+MeshDistanceField::MeshDistanceField(const std::filesystem::path& path, bool retainTexCoords)
 {
-    auto mesh = TriangleMesh::createFromFile(path);
-    FALCOR_CHECK(mesh, "LatticeGPIS: could not read triangle mesh '{}'.", path);
-    const auto& vertices = mesh->getVertices();
-    const auto& indices = mesh->getIndices();
-    FALCOR_CHECK(indices.size() / 3 <= std::numeric_limits<uint32_t>::max(), "LatticeGPIS: too many mesh triangles in '{}'.", path);
-    mTriangles.reserve(indices.size() / 3);
-    for (size_t i = 0; i < indices.size(); i += 3)
+    // Match Falcor's TriangleMesh coordinate and texture conventions while retaining source material/UV information.
+    Assimp::Importer importer;
+    const auto flags = aiProcess_Triangulate | aiProcess_PreTransformVertices | aiProcess_FlipUVs;
+    const auto absolutePath = std::filesystem::absolute(path).lexically_normal();
+    const auto directory = absolutePath.parent_path();
+    const bool compressed = hasExtension(path, "gz");
+    const bool obj = hasExtension(compressed ? path.stem() : path, "obj");
+    ObjMaterialIO* objIO = nullptr;
+    if (obj)
     {
-        Triangle tri{vertices[indices[i]].position, vertices[indices[i + 1]].position, vertices[indices[i + 2]].position};
-        Vec3d normal = cross(Vec3d(tri.b) - Vec3d(tri.a), Vec3d(tri.c) - Vec3d(tri.a));
-        double areaSquared = dot(normal, normal);
-        FALCOR_CHECK(std::isfinite(areaSquared), "LatticeGPIS: mesh '{}' has a non-finite position.", path);
-        if (areaSquared > 0.0) mTriangles.push_back(tri);
+        objIO = new ObjMaterialIO(directory);
+        importer.SetIOHandler(objIO); // The importer owns the handler.
+    }
+    const aiScene* scene;
+    if (compressed)
+    {
+        const auto data = decompressFile(path);
+        scene = importer.ReadFileFromMemory(data.data(), data.size(), flags, obj ? "obj" : "");
+    }
+    else scene = importer.ReadFile(absolutePath.u8string(), flags);
+    FALCOR_CHECK(scene, "LatticeGPIS: could not read triangle mesh '{}': {}", path, importer.GetErrorString());
+
+    size_t faceCount = 0;
+    bool hasUV = true, commonMap = true;
+    for (size_t i = 0; i < scene->mNumMeshes; ++i)
+    {
+        const auto& mesh = *scene->mMeshes[i];
+        if (!mesh.mNumFaces) continue;
+        const auto map = baseColorMap(*scene, mesh, directory, objIO);
+        if (faceCount == 0) mBaseColorTexturePath = map;
+        else if (map != mBaseColorTexturePath) commonMap = false;
+        faceCount += mesh.mNumFaces;
+        hasUV &= mesh.HasTextureCoords(0);
+    }
+    FALCOR_CHECK(faceCount <= std::numeric_limits<uint32_t>::max(), "LatticeGPIS: too many mesh triangles in '{}'.", path);
+    if (!commonMap || !hasUV) mBaseColorTexturePath.clear();
+    const bool keepUV = hasUV && (retainTexCoords || !mBaseColorTexturePath.empty());
+    if (keepUV) mTexCoords.reserve(faceCount);
+    mTriangles.reserve(faceCount);
+    for (size_t i = 0; i < scene->mNumMeshes; ++i)
+    {
+        const auto& mesh = *scene->mMeshes[i];
+        for (size_t j = 0; j < mesh.mNumFaces; ++j)
+        {
+            const aiFace& face = mesh.mFaces[j];
+            FALCOR_CHECK(face.mNumIndices == 3, "LatticeGPIS: mesh '{}' contains a non-triangular primitive.", path);
+            auto position = [&](int corner) {
+                const auto& p = mesh.mVertices[face.mIndices[corner]];
+                return float3(p.x, p.y, p.z);
+            };
+            Triangle tri{position(0), position(1), position(2), uint32_t(mTexCoords.size())};
+            Vec3d normal = cross(Vec3d(tri.b) - Vec3d(tri.a), Vec3d(tri.c) - Vec3d(tri.a));
+            double areaSquared = dot(normal, normal);
+            FALCOR_CHECK(std::isfinite(areaSquared), "LatticeGPIS: mesh '{}' has a non-finite position.", path);
+            if (areaSquared == 0.0) continue;
+            mTriangles.push_back(tri);
+            if (keepUV)
+            {
+                auto uv = [&](int corner) {
+                    const auto& t = mesh.mTextureCoords[0][face.mIndices[corner]];
+                    FALCOR_CHECK(std::isfinite(t.x) && std::isfinite(t.y), "LatticeGPIS: mesh '{}' has a non-finite UV.", path);
+                    return float2(t.x, t.y);
+                };
+                mTexCoords.push_back({uv(0), uv(1), uv(2)});
+            }
+        }
     }
     FALCOR_CHECK(!mTriangles.empty(), "LatticeGPIS: no nondegenerate triangles in '{}'.", path);
-    mesh.reset();
+    importer.FreeScene();
     buildNode(0, uint32_t(mTriangles.size()));
+}
+
+MeshDistanceField::SurfaceUVBuffers MeshDistanceField::createSurfaceUVBuffers(ref<Device> device) const
+{
+    FALCOR_CHECK(hasTexCoords(), "LatticeGPIS: applying a texture requires UV coordinates on every submesh.");
+    // MeshSurfaceUV.slang uses the same layout. Keep the three UVs face-local so a shared
+    // position can belong to different UV charts on its neighboring faces.
+    struct SurfaceNode { float3 lower; uint32_t first; float3 upper; uint32_t count; };
+    struct SurfaceTriangle { float4 a, ab, ac, uvEdges; };
+    static_assert(sizeof(SurfaceNode) == 32 && sizeof(SurfaceTriangle) == 64);
+    std::vector<SurfaceNode> nodes;
+    nodes.reserve(mNodes.size());
+    for (const auto& node : mNodes)
+        nodes.push_back({node.bounds.minPoint, node.first, node.bounds.maxPoint, node.count});
+    std::vector<SurfaceTriangle> faces;
+    faces.reserve(mTriangles.size());
+    for (const auto& tri : mTriangles)
+    {
+        const auto& uv = mTexCoords[tri.uvIndex];
+        const float3 ab = tri.b - tri.a, ac = tri.c - tri.a;
+        const auto extent = max(abs(ab), abs(ac));
+        float scale = std::max({extent.x, extent.y, extent.z});
+        faces.push_back({float4(tri.a, uv.a.x), float4(ab, uv.a.y), float4(ac, scale),
+                         float4(uv.b.x - uv.a.x, uv.b.y - uv.a.y, uv.c.x - uv.a.x, uv.c.y - uv.a.y)});
+    }
+    return {
+        device->createStructuredBuffer(sizeof(SurfaceNode), uint32_t(nodes.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, nodes.data()),
+        device->createStructuredBuffer(sizeof(SurfaceTriangle), uint32_t(faces.size()), ResourceBindFlags::ShaderResource, MemoryType::DeviceLocal, faces.data())
+    };
+}
+
+void MeshDistanceField::SurfaceUVBuffers::bind(const ShaderVar& root) const
+{
+    root["gSurfaceUVNodes"] = nodes;
+    root["gSurfaceUVTriangles"] = triangles;
 }
 
 uint32_t MeshDistanceField::buildNode(uint32_t begin, uint32_t end)

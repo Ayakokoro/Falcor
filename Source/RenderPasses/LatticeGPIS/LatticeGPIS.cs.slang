@@ -1,6 +1,43 @@
 #include "SdfField.slang"
 #include "Intersection.slang"
 
+#ifndef GPIS_TEXTURED_MESH
+#define GPIS_TEXTURED_MESH 0
+#endif
+#if GPIS_TEXTURED_MESH
+import Utils.Math.MathHelpers;
+#include "MeshSurfaceUV.slang"
+
+Texture2D<float4> gMeshBaseColor;
+SamplerState gMeshSampler;
+
+float3 meshAlbedo(float3 hit, float3 ray, float3 normal, float pixelWidth)
+{
+    MeshSurfaceUV surface = meshSurfaceUV(hit);
+    // Project the ray cone onto the hit tangent plane. Explicit UV derivatives
+    // also avoid a mip discontinuity at a wrapping seam between adjacent pixels.
+    float3 dx, dy;
+    branchlessONB(ray, dx, dy);
+    float cosTheta = min(dot(ray, normal), -1.e-4f);
+    dx = pixelWidth * (dx - ray * (dot(dx, normal) / cosTheta));
+    dy = pixelWidth * (dy - ray * (dot(dy, normal) / cosTheta));
+    float2 duvdx = float2(dot(surface.gradU, dx), dot(surface.gradV, dx));
+    float2 duvdy = float2(dot(surface.gradU, dy), dot(surface.gradV, dy));
+    return gMeshBaseColor.SampleGrad(gMeshSampler, surface.uv, duvdx, duvdy).rgb;
+}
+
+float3 sampleMeshDiffuse(float3 normal, uint key)
+{
+    uint2 bits = uint2(latticeHash(key), latticeHash(key ^ 0x27d4eb2fu));
+    float2 u = (float2(bits >> 9) + 0.5f) / 8388608.f;
+    float pdf;
+    float3 local = sample_cosine_hemisphere_concentric(u, pdf);
+    float3 tangent, bitangent;
+    branchlessONB(normal, tangent, bitangent);
+    return normalize(tangent * local.x + bitangent * local.y + normal * local.z);
+}
+#endif
+
 RWTexture2D<float4> gOutput;
 
 struct PassParameters
@@ -85,7 +122,12 @@ void main(uint3 threadID : SV_DispatchThreadID)
     float2 jitter = float2(tentSample(latticeHash(seed)), tentSample(latticeHash(seed + 1u)));
     float2 ndc = (float2(pixel) + 0.5f + jitter) / float2(CB.gFrameDim) * 2.f - 1.f;
     float3 origin = CB.gCameraPosition;
-    float3 direction = normalize(CB.gCameraW + ndc.x * CB.gCameraU - ndc.y * CB.gCameraV);
+    float3 cameraRay = CB.gCameraW + ndc.x * CB.gCameraU - ndc.y * CB.gCameraV;
+    float3 direction = normalize(cameraRay);
+#if GPIS_TEXTURED_MESH
+    float pixelAngle = 2.f * max(length(CB.gCameraU) / CB.gFrameDim.x, length(CB.gCameraV) / CB.gFrameDim.y) / length(cameraRay);
+    float pathLength = 0.f;
+#endif
 
     LatticeKernel kernel;
     kernel.nonstationary = CB.gKernelMode;
@@ -123,8 +165,17 @@ void main(uint3 threadID : SV_DispatchThreadID)
         origin += distance * direction;
         float n2 = dot(gradient, gradient);
         if (!(n2 > 0.f)) break;
+#if GPIS_TEXTURED_MESH
+        pathLength += distance;
+        float3 normal = gradient * rsqrt(n2);
+        if (dot(normal, direction) > 0.f) normal = -normal;
+        // Cosine sampling cancels Lambert's cosine / pi term in the path weight.
+        throughput *= meshAlbedo(origin, direction, normal, pathLength * pixelAngle);
+        direction = sampleMeshDiffuse(normal, seed ^ ((bounce + 1u) * 0x165667b1u));
+#else
         direction = normalize(reflect(direction, gradient * rsqrt(n2)));
         throughput *= float3(0.15f, 0.8f, 0.5f);
+#endif
     }
     gOutput[pixel] = float4(radiance, 1.f);
 }

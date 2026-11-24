@@ -1,6 +1,7 @@
 #include "LatticeGPISPass.h"
 #include "Core/AssetResolver.h"
 #include "RenderGraph/RenderPassStandardFlags.h"
+#include "Utils/Image/Bitmap.h"
 
 namespace
 {
@@ -39,6 +40,9 @@ void LatticeGPISPass::setProperties(const Properties& props)
                  "Choose a single geometry source, either meshFile or sdfFile.");
     if (props.has("sdfFile") && !options.sdfFile.empty()) options.meshFile.clear();
     if (props.has("meshFile") && !options.meshFile.empty()) options.sdfFile.clear();
+    if (options.meshFile != mOptions.meshFile) options.baseColorTexture.clear();
+    props.getTo("baseColorTexture", options.baseColorTexture);
+    FALCOR_CHECK(options.baseColorTexture.empty() || !options.meshFile.empty(), "A base-color texture requires a mesh file.");
     props.getTo("gridName", options.gridName);
     props.getTo("kernelMode", options.kernelMode);
     props.getTo("correlationLength", options.correlationLength);
@@ -53,19 +57,49 @@ void LatticeGPISPass::setProperties(const Properties& props)
     auto resolve = [](const std::filesystem::path& file)
     {
         auto path = AssetResolver::getDefaultResolver().resolvePath(file);
-        FALCOR_CHECK(!path.empty(), "Cannot find geometry file '{}'.", file);
+        FALCOR_CHECK(!path.empty(), "Cannot find asset '{}'.", file);
         return path;
     };
 
     const bool useMesh = !options.meshFile.empty();
     const bool modeChanged = useMesh != bool(mpClipmap);
     auto mesh = mpMesh;
+    auto texture = mpBaseColor;
+    auto surfaceUV = mSurfaceUV;
     std::unique_ptr<MeshClipmap> newClipmap;
     std::unique_ptr<SdfField> newField;
     if (useMesh)
     {
-        const bool reloadMesh = !mesh || props.has("meshFile");
-        if (reloadMesh) mesh = std::make_shared<MeshDistanceField>(resolve(options.meshFile));
+        const bool explicitTexture = !options.baseColorTexture.empty();
+        const bool reloadMesh = !mesh || props.has("meshFile") || (explicitTexture && !mesh->hasTexCoords());
+        if (reloadMesh) mesh = std::make_shared<MeshDistanceField>(resolve(options.meshFile), explicitTexture);
+        if (reloadMesh || props.has("baseColorTexture"))
+        {
+            if (reloadMesh) surfaceUV = {};
+            auto path = mesh->getBaseColorTexturePath();
+            if (explicitTexture)
+            {
+                FALCOR_CHECK(mesh->hasTexCoords(), "The mesh '{}' needs UV coordinates to apply a base-color texture.", options.meshFile);
+                path = resolve(resolve(options.meshFile).parent_path() / options.baseColorTexture);
+            }
+            texture = nullptr;
+            if (!path.empty() && mesh->hasTexCoords())
+            {
+                texture = Texture::createFromFile(mpDevice, path, true, true);
+                if (!texture || texture->getType() != Resource::Type::Texture2D || texture->getArraySize() != 1)
+                {
+                    FALCOR_CHECK(!explicitTexture, "Could not load '{}' as a 2D base-color texture.", path);
+                    logWarning("Lattice GPIS could not load mesh base-color texture '{}'.", path);
+                    texture = nullptr;
+                }
+            }
+            if (texture)
+            {
+                if (!surfaceUV.nodes) surfaceUV = mesh->createSurfaceUVBuffers(mpDevice);
+                if (!mpMeshSampler) mpMeshSampler = mpDevice->createSampler(Sampler::Desc());
+            }
+            else surfaceUV = {};
+        }
         if (reloadMesh || options.clipmapResolution != mOptions.clipmapResolution || options.clipmapLevels != mOptions.clipmapLevels)
             newClipmap = std::make_unique<MeshClipmap>(mpDevice, mesh, options.clipmapResolution, options.clipmapLevels);
     }
@@ -77,7 +111,10 @@ void LatticeGPISPass::setProperties(const Properties& props)
     }
     const auto bounds = newClipmap ? newClipmap->getBounds() : (newField ? newField->getBounds() : getFieldBounds());
     applyOptions(std::move(options), bounds);
-    if (modeChanged) mpTrace = nullptr;
+    if (!useMesh) { texture = nullptr; surfaceUV = {}; }
+    if (modeChanged || bool(texture) != bool(mpBaseColor)) mpTrace = nullptr;
+    mpBaseColor = std::move(texture);
+    mSurfaceUV = std::move(surfaceUV);
     if (useMesh)
     {
         mpField.reset();
@@ -93,6 +130,7 @@ void LatticeGPISPass::setProperties(const Properties& props)
     }
     mFileInput = (useMesh ? mOptions.meshFile : mOptions.sdfFile).string();
     mGridInput = mOptions.gridName;
+    mTextureInput = mOptions.baseColorTexture.string();
 }
 
 void LatticeGPISPass::Options::validate(const AABB& bounds) const
@@ -186,6 +224,7 @@ Properties LatticeGPISPass::getProperties() const
     Properties props;
     props["sdfFile"] = mOptions.sdfFile;
     props["meshFile"] = mOptions.meshFile;
+    props["baseColorTexture"] = mOptions.baseColorTexture;
     props["clipmapResolution"] = mOptions.clipmapResolution;
     props["clipmapLevels"] = mOptions.clipmapLevels;
     props["gridName"] = mOptions.gridName;
@@ -272,6 +311,7 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
     {
         DefineList defines;
         if (mpClipmap) defines.add("GPIS_MESH_CLIPMAP", "1");
+        if (mpBaseColor) defines.add("GPIS_TEXTURED_MESH", "1");
         mpTrace = ComputePass::create(mpDevice, "RenderPasses/LatticeGPIS/LatticeGPIS.cs.slang", "main", defines);
     }
     if (mReset)
@@ -307,6 +347,12 @@ void LatticeGPISPass::execute(RenderContext* context, const RenderData& renderDa
     root["gStationaryWeights"] = mpStationaryWeights;
     if (mpClipmap) mpClipmap->bind(root["gField"]);
     else mpField->bind(root["gField"]);
+    if (mpBaseColor)
+    {
+        mSurfaceUV.bind(root);
+        root["gMeshBaseColor"] = mpBaseColor;
+        root["gMeshSampler"] = mpMeshSampler;
+    }
     root["gOutput"] = output;
     mpTrace->execute(context, uint3(dims, 1));
     ++mFrameIndex;
@@ -345,6 +391,24 @@ void LatticeGPISPass::renderUI(Gui::Widgets& widget)
 
     if (mpClipmap)
     {
+        widget.textbox("Base-color texture", mTextureInput);
+        widget.tooltip("An empty override uses the mesh material's shared base-color map. Relative paths use the mesh folder.");
+        bool applyTexture = widget.button("Browse texture...");
+        if (applyTexture)
+        {
+            std::filesystem::path path;
+            applyTexture = openFileDialog(Bitmap::getFileDialogFilters(), path);
+            if (applyTexture) mTextureInput = path.string();
+        }
+        applyTexture |= widget.button("Apply texture", true);
+        if (applyTexture)
+        {
+            Properties props;
+            props["baseColorTexture"] = mTextureInput;
+            try { setProperties(props); }
+            catch (const std::exception& e) { mError = e.what(); }
+        }
+        if (mpBaseColor) widget.text(fmt::format("Using texture: {}", mpBaseColor->getSourcePath().filename().string()));
         uint32_t levels = mOptions.clipmapLevels;
         uint32_t resolution = mOptions.clipmapResolution;
         const Gui::DropdownList resolutions = {{9, "9"}, {17, "17"}, {33, "33"}, {65, "65"}, {129, "129"}};
